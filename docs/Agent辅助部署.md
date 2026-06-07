@@ -67,7 +67,7 @@
 3. **生成配置**：`cp .v2ex_env.example ~/.v2ex_env`，但**保留占位符不填真实值**。
 4. **安装依赖**：在 `reader/` 执行 `npm install` 与 `npx playwright install chromium`。
 5. **干跑验证**：`cd reader && node main.js --dry-run`，确认流程无报错。
-6. **配置定时任务**：写入 crontab（见 `部署指南.md`）。
+6. **配置定时任务**：运行 `sudo bash scripts/install-systemd.sh` 安装 systemd timer（推荐；无 systemd 时回退 crontab，见 `部署指南.md`）。
 7. **交还给你手动完成**（敏感步骤，Agent 不接触）：
    - 你本人把真实 `TG_TOKEN` / `TG_CHAT_ID` 填入 `~/.v2ex_env`；
    - 你本人执行 `V2EX_COOKIE="..." node checkin/v2ex-checkin.js --save-cookie` 保存 Cookie。

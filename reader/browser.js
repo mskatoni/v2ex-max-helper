@@ -1,13 +1,30 @@
 'use strict';
 // ========== Playwright 浏览器控制 ==========
-const fs     = require('fs');
-const path   = require('path');
-const os     = require('os');
-const logger = require('./logger');
+const fs          = require('fs');
+const path        = require('path');
+const os          = require('os');
+const logger      = require('./logger');
+const fingerprint = require('./fingerprint');
 
-const COOKIE_FILE    = process.env.COOKIE_FILE || path.join(os.homedir(), '.v2ex_cookie');
-const USER_DATA_DIR  = path.join(__dirname, 'data', 'chrome-profile');
-const HOST           = 'www.v2ex.com';
+// ===== 多账号 / 指纹隔离 =====
+// 通过 V2EX_PROFILE（或默认 'default'）区分账号。每个 profile 拥有：
+//   - 独立 Cookie 文件：~/.v2ex_cookie（default）或 ~/.v2ex_cookie.<profile>
+//   - 独立 Chrome 用户数据目录：data/chrome-profile/<profile>
+//   - 独立且确定性的浏览器指纹（基于 profile 名做种子）
+const PROFILE = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
+const HOST    = 'www.v2ex.com';
+
+// Cookie 文件：显式 COOKIE_FILE 优先；否则按 profile 区分
+function resolveCookieFile() {
+  if (process.env.COOKIE_FILE) return process.env.COOKIE_FILE;
+  const base = path.join(os.homedir(), '.v2ex_cookie');
+  return PROFILE === 'default' ? base : `${base}.${PROFILE}`;
+}
+const COOKIE_FILE   = resolveCookieFile();
+const USER_DATA_DIR = path.join(__dirname, 'data', 'chrome-profile', PROFILE);
+
+// 为当前 profile 生成确定性指纹
+const FP = fingerprint.generate(PROFILE);
 
 // Cookie 字符串 → Playwright cookies 数组
 function parseCookieString(str) {
@@ -61,7 +78,8 @@ async function launch(dryRun = false) {
   // 确保 Chrome profile 目录存在
   fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 
-  logger.info('浏览器启动中...');
+  logger.info(`浏览器启动中... (profile=${PROFILE})`);
+  logger.info(`指纹: ${FP.platform} | Chrome ${FP.majorVersion} | ${FP.viewport.width}x${FP.viewport.height} | ${FP.timezoneId} | ${FP.locale}`);
 
   ctx = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
@@ -71,17 +89,27 @@ async function launch(dryRun = false) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      `--lang=${FP.locale}`,
     ],
     ignoreHTTPSErrors: false,
-    locale: 'zh-CN',
-    timezoneId: 'Asia/Shanghai',
-    viewport: { width: 1280, height: 800 },
+    userAgent:  FP.userAgent,
+    locale:     FP.locale,
+    timezoneId: FP.timezoneId,
+    viewport:   FP.viewport,
+    deviceScaleFactor: 1,
+    extraHTTPHeaders: {
+      'Accept-Language': FP.acceptLanguage,
+    },
   });
 
-  // 注入 JS 隐藏 webdriver 标志
-  await ctx.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    window.chrome = { runtime: {} };
+  // 注入指纹隔离脚本（webdriver 隐藏 + navigator/WebGL 伪装）
+  await ctx.addInitScript(fingerprint.buildInitScript(FP), {
+    navPlatform:         FP.navPlatform,
+    hardwareConcurrency: FP.hardwareConcurrency,
+    deviceMemory:        FP.deviceMemory,
+    languages:           FP.languages,
+    webglVendor:         FP.webglVendor,
+    webglRenderer:       FP.webglRenderer,
   });
 
   // 注入 Cookies
@@ -96,7 +124,7 @@ async function launch(dryRun = false) {
   logger.ok('浏览器已就绪');
 }
 
-// 读取一篇帖子（15秒 ± 随机抖动）
+// 读取一篇帖子（随机偏态停留 + 随机滚动 + 帖子间随机间隔）
 async function readPost(url) {
   if (isDryRun) {
     logger.info(`[DRY-RUN] → ${url}`);
@@ -123,17 +151,77 @@ async function readPost(url) {
       return false;
     }
 
-    // 随机停留 12~18 秒（均值 15）
-    const delay = 12000 + Math.floor(Math.random() * 6000);
-    await sleep(delay);
+    // 随机停留时长（偏态分布：多数偏短，偶尔长读）
+    const dwell = randomDwellMs();
+    logger.info(`停留 ${(dwell / 1000).toFixed(1)}s`);
+    // 停留期间穿插随机滚动，模拟真实阅读
+    await dwellWithScroll(dwell);
 
     // 同步 Cookie（cf_clearance 可能已刷新）
     await syncCookies();
+
+    // 帖子之间的随机间隔（模拟切换 / 思考），让节奏更自然
+    await sleep(randomBetweenMs());
 
     return true;
   } catch (e) {
     logger.warn(`读帖失败: ${e.message} → ${url}`);
     return false;
+  }
+}
+
+// ===== 随机化参数（可用环境变量覆盖，单位毫秒）=====
+const DWELL_MIN   = intEnv('READ_DWELL_MIN',   8000);   // 单篇停留最短
+const DWELL_MAX   = intEnv('READ_DWELL_MAX',   22000);  // 单篇停留最长（常规）
+const DWELL_LONG  = intEnv('READ_DWELL_LONG',  45000);  // 偶尔长读上限
+const LONG_CHANCE = floatEnv('READ_LONG_CHANCE', 0.15); // 触发长读的概率
+// 帖子间间隔：除了拟人化，也给 Chromium 留出 GC 回收上一页内存的时间，
+// 降低低内存机器（如 1GB）快速翻页时的 OOM 风险。最短不低于 8 秒。
+const GAP_MIN     = Math.max(8000, intEnv('READ_GAP_MIN', 8000));   // 帖子间间隔最短（≥8s）
+const GAP_MAX     = intEnv('READ_GAP_MAX',     15000);  // 帖子间间隔最长
+
+function intEnv(name, def) {
+  const v = parseInt(process.env[name], 10);
+  return Number.isFinite(v) && v >= 0 ? v : def;
+}
+function floatEnv(name, def) {
+  const v = parseFloat(process.env[name]);
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : def;
+}
+function randInt(min, max) {
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+// 单篇停留时长：偏态分布。多数落在 [MIN, MAX]，小概率拉长到 [MAX, LONG]
+function randomDwellMs() {
+  if (Math.random() < LONG_CHANCE) {
+    return randInt(DWELL_MAX, DWELL_LONG);
+  }
+  // 用两次随机取较小值，使分布偏向短停留（更像快速浏览）
+  const a = randInt(DWELL_MIN, DWELL_MAX);
+  const b = randInt(DWELL_MIN, DWELL_MAX);
+  return Math.min(a, b);
+}
+
+// 帖子之间的随机间隔（保证上限不小于下限）
+function randomBetweenMs() {
+  return randInt(GAP_MIN, Math.max(GAP_MIN, GAP_MAX));
+}
+
+// 停留期间分多次随机向下滚动，模拟阅读时的视线移动
+async function dwellWithScroll(totalMs) {
+  const steps = randInt(2, 5);
+  let remaining = totalMs;
+  for (let i = 0; i < steps; i++) {
+    const slice = i === steps - 1 ? remaining : Math.floor(remaining / (steps - i)) + randInt(-300, 300);
+    const wait = Math.max(300, slice);
+    remaining -= wait;
+    await sleep(wait);
+    try {
+      const dy = randInt(150, 600);
+      await page.evaluate((y) => window.scrollBy({ top: y, behavior: 'smooth' }), dy);
+    } catch (_) { /* 滚动失败不影响停留 */ }
+    if (remaining <= 0) break;
   }
 }
 
@@ -205,4 +293,8 @@ async function close() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-module.exports = { launch, readPost, getCurrentCookie, syncCookies, close };
+function getProfileInfo() {
+  return { profile: PROFILE, cookieFile: COOKIE_FILE, fingerprint: FP };
+}
+
+module.exports = { launch, readPost, getCurrentCookie, syncCookies, close, getProfileInfo };

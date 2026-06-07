@@ -11,7 +11,7 @@
  *     10 1 * * * /usr/bin/node /path/to/v2ex-checkin.js >> /var/log/v2ex.log 2>&1
  *
  *   保活心跳，每6小时访问一次（防 Session 过期）：
- *     0 */6 * * *  node /path/to/v2ex-checkin.js --ping
+ *     0 0,6,12,18 * * *  node /path/to/v2ex-checkin.js --ping
  *
  * 推送告警（Cookie 失效时通知）：
  *   Bark:     BARK_URL="https://api.day.app/你的KEY" node v2ex-checkin.js
@@ -32,8 +32,17 @@ const url   = require('url');
 // ========== 配置 ==========
 const SCRIPT_VERSION = 'v1.3.0';
 const HOST           = 'www.v2ex.com';
-const COOKIE_FILE    = process.env.COOKIE_FILE || path.join(os.homedir(), '.v2ex_cookie');
 const MAX_RETRY      = 3;
+
+// 多账号：通过 V2EX_PROFILE 区分账号的 Cookie 文件
+//   default      → ~/.v2ex_cookie
+//   <profile>    → ~/.v2ex_cookie.<profile>
+//   COOKIE_FILE 环境变量显式指定时优先生效
+const PROFILE = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
+const COOKIE_FILE = process.env.COOKIE_FILE
+  || (PROFILE === 'default'
+      ? path.join(os.homedir(), '.v2ex_cookie')
+      : path.join(os.homedir(), `.v2ex_cookie.${PROFILE}`));
 
 // 推送配置（从环境变量读取，不硬编码）
 const BARK_URL       = process.env.BARK_URL    || '';   // e.g. https://api.day.app/YOUR_KEY
@@ -67,28 +76,85 @@ function writeCookie(cookie) {
   }
 }
 
+// 把 "a=1; b=2" 解析成 Map
+function cookieToMap(str) {
+  const map = new Map();
+  for (const part of (str || '').split(';')) {
+    const s = part.trim();
+    if (!s) continue;
+    const i = s.indexOf('=');
+    if (i < 0) continue;
+    map.set(s.slice(0, i).trim(), s.slice(i + 1).trim());
+  }
+  return map;
+}
+
+// 把服务端响应的 Set-Cookie 数组合并进现有 cookie 字符串（新值覆盖同名旧值）。
+// 这正是「自动刷新登录态」的核心：V2EX 的 A2 登录 cookie 会滑动续期，
+// 只要把每次响应里下发的新 A2 写回，登录态就能持续延长、无需重新登录。
+function mergeSetCookies(currentCookie, setCookieArr) {
+  if (!setCookieArr || setCookieArr.length === 0) return { cookie: currentCookie, changed: false };
+  const map = cookieToMap(currentCookie);
+  let changed = false;
+  for (const sc of setCookieArr) {
+    // 每条 Set-Cookie 形如 "A2=xxx; Path=/; Expires=...; HttpOnly"
+    const first = sc.split(';')[0];
+    const i = first.indexOf('=');
+    if (i < 0) continue;
+    const name = first.slice(0, i).trim();
+    const value = first.slice(i + 1).trim();
+    if (!name) continue;
+    // 删除型 set-cookie（值为空或 deleted）跳过，避免把登录态清掉
+    if (value === '' || value === 'deleted') continue;
+    if (map.get(name) !== value) {
+      map.set(name, value);
+      changed = true;
+    }
+  }
+  const merged = Array.from(map.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+  return { cookie: merged, changed };
+}
+
+// 用响应的 Set-Cookie 刷新本地 cookie 文件（仅在有变化时写盘）
+function refreshCookieFromResponse(currentCookie, setCookieArr) {
+  const { cookie, changed } = mergeSetCookies(currentCookie, setCookieArr);
+  if (changed) {
+    writeCookie(cookie);
+    log('🔄 登录态已自动续期（Set-Cookie 已写回）');
+  }
+  return cookie;
+}
+
 // ========== HTTP 请求 ==========
-function fetchUrl(reqUrl, cookie) {
+// 完整版：返回 { body, setCookies }。会累积重定向链路上每一跳的 Set-Cookie。
+function fetchUrlFull(reqUrl, cookie, _redirects = 0, _acc = []) {
   return new Promise((resolve, reject) => {
     const headers = Object.assign({}, COMMON_HEADERS, { Cookie: cookie });
     const parsed  = new url.URL(reqUrl);
     const lib     = parsed.protocol === 'https:' ? https : http;
     const req = lib.get(reqUrl, { headers }, (res) => {
+      const sc = res.headers['set-cookie'] || [];
+      const acc = _acc.concat(sc);
       // 跟随重定向（最多3次）
-      if ([301, 302, 303].includes(res.statusCode) && res.headers.location) {
+      if ([301, 302, 303].includes(res.statusCode) && res.headers.location && _redirects < 3) {
         const loc = res.headers.location.startsWith('http')
           ? res.headers.location
           : `https://${HOST}${res.headers.location}`;
         res.resume();
-        return fetchUrl(loc, cookie).then(resolve).catch(reject);
+        return fetchUrlFull(loc, cookie, _redirects + 1, acc).then(resolve).catch(reject);
       }
       let body = '';
       res.on('data', c => body += c);
-      res.on('end', () => resolve(body));
+      res.on('end', () => resolve({ body, setCookies: acc }));
     });
     req.on('error', reject);
     req.setTimeout(20000, () => req.destroy(new Error('请求超时')));
   });
+}
+
+// 兼容旧调用：只取 body
+function fetchUrl(reqUrl, cookie) {
+  return fetchUrlFull(reqUrl, cookie).then(r => r.body);
 }
 
 // ========== 推送通知 ==========
@@ -134,9 +200,11 @@ function parseLoginStatus(html) {
 }
 
 async function getOnce(cookie) {
-  const html = await fetchUrl('https://www.v2ex.com/mission/daily', cookie);
+  const { body: html, setCookies } = await fetchUrlFull('https://www.v2ex.com/mission/daily', cookie);
   const status = parseLoginStatus(html);
   if (!status.logged_in) return { once: '', logged_in: false, already: false, days: '?' };
+  // 签到访问也会触发登录态续期，写回刷新后的 Cookie
+  refreshCookieFromResponse(cookie, setCookies);
   const days = (html.match(/已连续登录\s*(\d+)\s*天/) || [])[1] || '?';
   if (html.includes('每日登录奖励已领取')) return { once: '', logged_in: true, already: true, days };
   const once = (html.match(/once=(\d+)/) || [])[1] || '';
@@ -171,13 +239,15 @@ async function doPing() {
     return;
   }
   try {
-    const html = await fetchUrl('https://www.v2ex.com/', cookie);
+    const { body: html, setCookies } = await fetchUrlFull('https://www.v2ex.com/', cookie);
     const status = parseLoginStatus(html);
     if (!status.logged_in) {
       log('❌ Cookie 已失效（保活检测）');
       await notify('V2EX ⚠️ Cookie 失效', '请重新登录 V2EX 并更新 Cookie，签到将中断！');
       log('📢 告警已发送（如已配置推送）');
     } else {
+      // 关键：把服务端下发的续期 Cookie 写回，实现登录态自动刷新
+      refreshCookieFromResponse(cookie, setCookies);
       log('✅ Session 正常，保活成功');
     }
   } catch (e) {
