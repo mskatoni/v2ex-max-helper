@@ -224,6 +224,25 @@ if [[ $INSTALL_BOT -eq 1 ]]; then
   systemctl enable --now "${UNIT_BOT}.service"
 fi
 
+# =============================================================================
+# 配置 logrotate（防止日志无限增长）
+# =============================================================================
+LOGROTATE_CONF="/etc/logrotate.d/v2ex"
+if [[ ! -f "$LOGROTATE_CONF" ]] && command -v logrotate >/dev/null 2>&1; then
+  cat > "$LOGROTATE_CONF" <<'LOGEOF'
+/var/log/v2ex.log /var/log/v2ex-reader.log /var/log/v2ex-bot.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+LOGEOF
+  info "已创建日志轮转配置 ${LOGROTATE_CONF}"
+fi
+
 echo
 ok "安装完成（profile=${PROFILE}）"
 echo
@@ -235,4 +254,8 @@ echo "  journalctl -u ${UNIT_PING} -f               # 实时保活日志"
 [[ $INSTALL_BOT -eq 1 ]]    && echo "  systemctl status ${UNIT_BOT}                 # Bot 状态"
 echo "  sudo bash $0 --uninstall ${PROFILE:+--profile $PROFILE}   # 卸载"
 echo
-warn "提示：请确认已配置 ~/.v2ex_env 与 ~/.v2ex_cookie（对应运行用户 ${RUN_USER} 的家目录）。"
+warn "提示：请确认运行用户 ${RUN_USER} 的家目录下已保存 Cookie（~/.v2ex_cookie 或 .<profile>）。"
+warn "      签到推送（Telegram/Bark）需在 ${UNIT_CHECKIN}.service 里加 Environment= 传入，"
+warn "      签到脚本不会读取 ~/.v2ex_env；Bot 则会读取 ~/.v2ex_env。"
+info "日志：systemd timer 任务默认输出到 journald（自带轮转）。"
+info "      若改用 crontab + 文件重定向，logrotate 配置已就绪（${LOGROTATE_CONF:-/etc/logrotate.d/v2ex}）。"

@@ -1,7 +1,13 @@
 # Agent 辅助部署方案
 
-本项目结构清晰、依赖极少，非常适合交给 **AI 编程助手（Agent）** 半自动部署。
-你只需准备两样东西：**V2EX Cookie** + **一台能联网的 VPS**，剩下的命令可让 Agent 代为执行。
+本项目结构清晰、依赖极少，非常适合交给 **AI 编程助手（Agent）** 部署：
+**Agent 负责所有不涉及敏感信息的环节**（装环境、装依赖、干跑验证、配置定时任务），
+**你本人只在最后手动完成两个敏感步骤**（填入 Telegram Token、保存 V2EX Cookie）。
+
+你需要准备：
+
+- 一台能访问 `www.v2ex.com` 的 VPS；
+- 一个已登录 V2EX 的 Cookie 字符串（仅最后一步用到，不交给 Agent）。
 
 ---
 
@@ -12,18 +18,18 @@
 
 原因：
 
-- **数据会被第四方截留**：中转站位于你和官方 API 之间，你发给 Agent 的所有内容
-  （包括 **V2EX Cookie、Telegram Token、服务器 IP、SSH 信息**）都会明文流经中转站服务器，
-  随时可能被记录、转售或泄露给未知的第四方。
-- **Cookie 等同账号控制权**：V2EX Cookie 一旦泄露，他人可直接登录你的账号。
-  本项目把 Cookie 存在你自己的服务器（`~/.v2ex_cookie`，权限 600），
-  绝不要让它经过任何不可信的中转环节。
+- **中转站会截留你的数据**：中转站位于你和官方 API 之间，你发给 Agent 的所有内容
+  （包括 **服务器 IP、SSH 信息**等）都会明文流经它的服务器。中转站随时可能记录这些内容，
+  再转售或泄露给未知的第四方。
+- **敏感凭证一旦泄露后果严重**：V2EX Cookie 等同账号控制权，Telegram Token 等同 Bot 控制权。
+  正因如此，本项目把 Cookie 存在你自己的服务器（`~/.v2ex_cookie`，权限 600），
+  并要求这些凭证**全程不经过 Agent**，自然也就不会经过中转站。
 - **无法审计、无可追责**：中转站普遍不公开日志策略，出事无从追查。
 
 ✅ **正确做法**：
-- 用官方 API Key 直连，或在本地运行可信的开源模型；
-- 把 Cookie 这类敏感值**手动**粘进服务器，而不是发给联网的 Agent；
-- 如必须让 Agent 看到敏感值，先用占位符代替，部署到最后一步再由你本人替换。
+- 用 AI 服务商的官方 API 直连（见下方推荐工具）；
+- 把 Cookie、Token 这类敏感值**手动**粘进服务器，而不是发给联网的 Agent；
+- 让 Agent 看到的配置文件只含占位符，真实值在最后一步由你本人替换。
 
 ### 推荐的官方 Agent 工具
 
@@ -32,13 +38,13 @@
 | **Claude Pro**（推荐） | 付费订阅 | Anthropic 官方，Claude Code / 网页端直连官方 API，稳定可靠，适合长期使用 |
 | **Antigravity（Google Antigravity）** | **免费** | Google 官方 Agentic 编程工具，**用 Google 账号在 Free 计划下即可使用 Claude Opus 4.6 等模型**，零成本起步 |
 
-- **付费首选 Claude Pro**：官方直连，无中转风险。
-- **想免费部署**：用 **Antigravity（Google Antigravity）**，官网 <https://antigravity.google> ，
-  仅需 Google 账号登录，Free 计划即可调用 Claude Opus 4.6 等顶级模型完成本项目部署，
-  全程走 Google / Anthropic 官方链路，**不经过任何第三方中转站**。
+两者都是**官方直连、不经中转站**，区别只在费用：
 
-> 无论选哪个，关键都是：**走官方直连、不用中转站**。Antigravity 让「免费 + 安全」同时成立，
-> 是预算有限又想避免中转站泄露风险时的最佳选择。
+- **预算充足 → Claude Pro**：付费订阅，长期使用稳定省心。
+- **想零成本 → Antigravity（Google Antigravity）**：官网 <https://antigravity.google> ，
+  仅需 Google 账号登录，Free 计划即可调用 Claude Opus 4.6 等顶级模型完成本项目部署。
+
+> 关键不在于选哪个，而在于**走官方直连**。两者都满足这一点，按预算选即可。
 
 ---
 
@@ -46,15 +52,14 @@
 
 本项目对资源和网络要求都很轻：
 
-| 需要的东西 | 最低要求 |
-|------------|----------|
-| **V2EX Cookie** | 一段登录后的 Cookie 字符串（必备，账号凭证） |
+| 项目 | 最低要求 |
+|------|----------|
 | **网络带宽** | **5 Mbps 即可**（签到是纯文本 HTTP；阅读也只是加载网页文本，无大流量） |
-| **VPS 配置** | 签到 512 MB 内存；阅读 1 GB 内存 + 1 GB Swap（详见 README） |
-| **公网要求** | 能正常访问 `www.v2ex.com` 和 `api.telegram.org` 即可 |
+| **内存（仅签到）** | 512 MB |
+| **内存（含自动阅读）** | 1 GB + 1 GB Swap（阅读需启动 Chromium，详见 README） |
+| **公网连通性** | 能访问 `www.v2ex.com`；用 Telegram 推送时还需能访问 `api.telegram.org` |
 
-> 换句话说：**只要 Cookie 有效 + 网络能连上 V2EX（5Mbps 足矣），就能跑起来。**
-> 不需要高带宽、不需要大流量、不需要昂贵机器。
+不需要高带宽、不需要大流量、不需要昂贵机器——一台普通低配小鸡即可长期挂机。
 
 ---
 
@@ -77,18 +82,21 @@
 ```
 请帮我在这台 Linux VPS 上部署 v2ex-max-helper 项目（代码已在 ~/v2ex-max-helper）。
 要求：
-1. 只用官方直连 API，禁止经过任何第三方中转站。
-2. 不要向你/任何外部服务发送我的真实 Cookie、Telegram Token 或服务器密钥。
-3. 完成环境检查、依赖安装、playwright chromium 安装、dry-run 验证、crontab 配置。
-4. 涉及真实 Cookie 和 Token 的步骤，请生成命令模板并停下，由我本人手动执行。
+1. 不要向你/任何外部服务发送我的真实 Cookie、Telegram Token 或服务器密钥。
+2. 完成以下环节：环境检查（Node.js 18+）、安装依赖、playwright chromium 安装、
+   dry-run 验证、用 scripts/install-systemd.sh 配置定时任务。
+3. 涉及真实 Cookie 和 Token 的步骤，只生成命令模板并停下，由我本人手动执行。
 参考文档：docs/部署指南.md、docs/配置说明.md。
 ```
+
+> 注意：模板里没有「禁用中转站」这一条，因为 Agent 自己无法知道、也无法控制它背后接的是不是
+> 中转站——这是**你启动 Agent 时选择 API 的责任**，而非能下达给 Agent 的指令。请在自己这端确保用官方直连。
 
 ---
 
 ## 小结
 
-- 🚫 不要用中转站 API 跑部署 Agent，避免 Cookie 等数据被第四方泄露；
-- ✅ 推荐 **Claude Pro**（付费）或 **Antigravity / Google Antigravity**（免费，Google 账号 Free 计划即可用 Claude Opus 4.6）官方直连；
-- 🔑 Cookie 始终留在你自己的服务器上，敏感步骤由你本人手动完成；
-- 🪶 只需 Cookie + 5 Mbps 网络即可部署，门槛极低。
+- 🚫 启动 Agent 时务必用官方直连 API，不要经过第三方中转站；
+- ✅ 官方直连工具任选：**Claude Pro**（付费）或 **Antigravity**（免费，Google 账号 Free 计划即可用 Claude Opus 4.6）；
+- 🔑 Cookie、Token 全程不交给 Agent，由你本人在最后手动写入服务器；
+- 🪶 一台普通低配小鸡 + 约 5 Mbps 网络即可长期挂机，门槛极低。
