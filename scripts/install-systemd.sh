@@ -13,7 +13,8 @@
 #   sudo bash scripts/install-systemd.sh --no-reader     # 不安装阅读 timer
 #   sudo bash scripts/install-systemd.sh --bot           # 同时安装 Bot service
 #
-# 时间默认按服务器本地时区解析（OnCalendar）。
+# 签到 / 保活时间默认按服务器本地时区解析。
+# 阅读模块默认使用显式 UTC 时间，避免 UTC 时区 VPS 错过 reader/main.js 的 UTC 06:00 截止窗口。
 # =============================================================================
 set -euo pipefail
 
@@ -114,7 +115,7 @@ fi
 # 时间配置
 read -rp "签到时间 OnCalendar [*-*-* 09:10:00]: " T_CHECKIN; T_CHECKIN="${T_CHECKIN:-*-*-* 09:10:00}"
 read -rp "保活时间 OnCalendar [*-*-* 00/6:00:00]: " T_PING;   T_PING="${T_PING:-*-*-* 00/6:00:00}"
-read -rp "阅读时间 OnCalendar [*-*-* 09:15:00]: " T_READER; T_READER="${T_READER:-*-*-* 09:15:00}"
+read -rp "阅读时间 OnCalendar [*-*-* 01:15:00 UTC]: " T_READER; T_READER="${T_READER:-*-*-* 01:15:00 UTC}"
 
 # 环境变量：V2EX_PROFILE（非 default 才注入）
 PROFILE_ENV=""

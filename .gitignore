@@ -4,12 +4,17 @@ package-lock.json
 
 # 敏感数据 —— 切勿提交
 .v2ex_env
+.v2ex_env.*
+!.v2ex_env.example
 .v2ex_cookie
+.v2ex_cookie.*
 *.cookie
 
 # 运行时数据
 reader/data/
 data/
+!reader/data/
+!reader/data/.gitkeep
 *.db
 *.sqlite
 balance_log.json

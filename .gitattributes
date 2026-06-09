@@ -1,0 +1,6 @@
+*.sh text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.example text eol=lf
+*.gitignore text eol=lf

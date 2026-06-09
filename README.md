@@ -60,7 +60,7 @@ flowchart TD
     end
 
     subgraph 阅读模块
-        J[阅读 timer 触发<br/>每日 09:15] --> K[启动 Playwright]
+        J[阅读 timer 触发<br/>每日 01:15 UTC<br/>约北京时间 09:15] --> K[启动 Playwright]
         K --> L[注入指纹 + Cookie]
         L --> M[从队列取帖子]
         M --> N[读帖<br/>随机停留+滚动]
