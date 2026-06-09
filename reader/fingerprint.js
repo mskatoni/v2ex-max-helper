@@ -60,15 +60,14 @@ const VIEWPORTS = [
   { width: 1920, height: 1080 },
 ];
 
-// 语言（V2EX 受众，以中文为主，少量英文优先）
+// 语言（美区环境，以英文为主，少量中文辅助）
 const LANGUAGES = [
-  { locale: 'zh-CN', accept: 'zh-CN,zh;q=0.9,en;q=0.8', langs: ['zh-CN', 'zh', 'en'] },
-  { locale: 'zh-CN', accept: 'zh-CN,zh;q=0.9', langs: ['zh-CN', 'zh'] },
+  { locale: 'en-US', accept: 'en-US,en;q=0.9', langs: ['en-US', 'en'] },
   { locale: 'en-US', accept: 'en-US,en;q=0.9,zh-CN;q=0.8', langs: ['en-US', 'en', 'zh-CN'] },
 ];
 
-// 时区（与中文受众匹配，覆盖常见地区）
-const TIMEZONES = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Taipei', 'Asia/Singapore'];
+// 时区（美区常见时区）
+const TIMEZONES = ['America/New_York', 'America/Los_Angeles', 'America/Chicago', 'America/Denver', 'America/Phoenix'];
 
 // 硬件并发数（CPU 逻辑核心，常见值）
 const HW_CONCURRENCY = [4, 8, 12, 16];

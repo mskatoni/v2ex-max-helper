@@ -37,6 +37,12 @@ const READER_LOG      = process.env.READER_LOG || '/var/log/v2ex-reader.log';
 if (!TOKEN)           { console.error('TG_TOKEN 未设置'); process.exit(1); }
 if (!ALLOWED_CHAT_ID) { console.error('TG_CHAT_ID 未设置'); process.exit(1); }
 
+function maskId(id) {
+  const s = String(id || '');
+  if (s.length <= 4) return '****';
+  return `${s.slice(0, 2)}***${s.slice(-2)}`;
+}
+
 // ========== Telegram API ==========
 function tgRequest(method, params) {
   return new Promise((resolve, reject) => {
@@ -85,12 +91,12 @@ async function handleSou() {
   const yesterdayEntry = yesterday ? log[yesterday] : null;
 
   const todayTime = todayEntry
-    ? new Date(todayEntry.lastTime).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })
+    ? new Date(todayEntry.lastTime).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false })
     : '--';
 
   let msg = `💰 <b>余额记录</b>\n`;
   msg += todayEntry
-    ? `今日 (${today})：<b>${todayEntry.last} 铜币</b>  最后查询 ${todayTime} 北京时间\n`
+    ? `今日 (${today})：<b>${todayEntry.last} 铜币</b>  最后查询 ${todayTime} EST\n`
     : `今日：暂无记录\n`;
   msg += yesterdayEntry
     ? `昨日 (${yesterday})：${yesterdayEntry.last} 铜币`
@@ -160,7 +166,7 @@ async function poll() {
 
       // 硬锁：只响应授权 chat_id
       if (String(msg.chat.id) !== ALLOWED_CHAT_ID) {
-        console.log(`[BOT] 忽略非授权消息来自 ${msg.chat.id}`);
+        console.log('[BOT] 忽略非授权消息');
         continue;
       }
 
@@ -184,7 +190,7 @@ async function poll() {
 }
 
 // 主循环
-console.log(`[BOT] V2EX Bot 启动，授权 Chat ID: ${ALLOWED_CHAT_ID}`);
+console.log(`[BOT] V2EX Bot 启动，授权 Chat ID: ${maskId(ALLOWED_CHAT_ID)}`);
 (async () => {
   // 先清空历史消息（offset 设为最新）
   try {

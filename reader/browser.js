@@ -78,8 +78,8 @@ async function launch(dryRun = false) {
   // 确保 Chrome profile 目录存在
   fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 
-  logger.info(`浏览器启动中... (profile=${PROFILE})`);
-  logger.info(`指纹: ${FP.platform} | Chrome ${FP.majorVersion} | ${FP.viewport.width}x${FP.viewport.height} | ${FP.timezoneId} | ${FP.locale}`);
+  logger.info('浏览器启动中...');
+  logger.info('浏览器指纹已按当前 profile 注入');
 
   ctx = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
