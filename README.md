@@ -99,11 +99,11 @@ flowchart TD
 
 让 AI 编程助手代你完成部署：**Agent 负责装环境 / 依赖 / 配置，你只在最后手动填 Token、存 Cookie**。
 
-- 门槛极低：一台能访问 V2EX 的普通小鸡 + 约 5 Mbps 网络即可。
+- 门槛极低：一台能访问 V2EX 的普通小鸡 + 约 5 Mbps 网络即可，直接把 GitHub 项目链接 https://github.com/mskatoni/v2ex-max-helper 丢给 agent 并命令其开始部署即可。
 - ✅ **推荐工具**：付费首选 **Claude Pro**；想免费用 **Antigravity（Google Antigravity，<https://antigravity.google>）**，Google 账号 Free 计划即可调用 Claude Opus 4.6 等模型。
 - ⚠️ **安全**：启动 Agent 时用官方直连 API，不要经过第三方「中转站」；Cookie、Token 留到最后由你本人手动写入。
 
-完整流程与可复制的提示词模板见 [`docs/Agent辅助部署.md`](docs/Agent辅助部署.md)。
+模板见 [`docs/Agent辅助部署.md`](docs/Agent辅助部署.md)。
 
 ---
 
