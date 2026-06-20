@@ -82,6 +82,7 @@ async function launch(dryRun = false) {
   logger.info('浏览器指纹已按当前 profile 注入');
 
   ctx = await chromium.launchPersistentContext(USER_DATA_DIR, {
+    proxy: { server: 'http://127.0.0.1:7890' },
     headless: false,
     args: [
       '--disable-blink-features=AutomationControlled',

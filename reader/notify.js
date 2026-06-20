@@ -18,8 +18,10 @@ function loadConfig() {
       }
     }
   }
+  const webhook = process.env.FEISHU_WEBHOOK || '';
   return {
     token:  process.env.TG_TOKEN   || '',
+    webhook: process.env.FEISHU_WEBHOOK || '',
     chatId: process.env.TG_CHAT_ID || '',
   };
 }
@@ -32,6 +34,7 @@ function isConfigured() {
 }
 
 function sendMessage(text) {
+  sendFeishu(text);  // 飞书推送不阻塞主流程
   if (!isConfigured()) return Promise.resolve();
   return new Promise((resolve) => {
     const body = JSON.stringify({ chat_id: cfg.chatId, text, parse_mode: 'HTML' });
@@ -45,6 +48,24 @@ function sendMessage(text) {
       res.on('end', resolve);
     });
     req.on('error', resolve); // 推送失败不影响主流程
+    req.setTimeout(10000, () => req.destroy());
+    req.write(body);
+    req.end();
+  });
+}
+
+function sendFeishu(text) {
+  if (!cfg.webhook) return Promise.resolve();
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ msg_type: 'text', content: { text: `V2EX｜${text}` } });
+    const u = new URL(cfg.webhook);
+    const req = https.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => { res.resume(); res.on('end', resolve); });
+    req.on('error', resolve);
     req.setTimeout(10000, () => req.destroy());
     req.write(body);
     req.end();

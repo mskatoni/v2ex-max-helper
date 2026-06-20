@@ -48,6 +48,7 @@ const COOKIE_FILE = process.env.COOKIE_FILE
 const BARK_URL       = process.env.BARK_URL    || '';   // e.g. https://api.day.app/YOUR_KEY
 const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID     = process.env.TG_CHAT_ID   || '';
+const FEISHU_WEBHOOK = process.env.FEISHU_WEBHOOK || '';
 
 const COMMON_HEADERS = {
   'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -171,8 +172,28 @@ function sendTelegram(title, msg) {
   return fetchUrl(target, '').catch(() => {});
 }
 
+function sendFeishu(title, msg) {
+  if (!FEISHU_WEBHOOK) return Promise.resolve();
+  const text = `V2EX｜${title}\n${msg}`;
+  const body = JSON.stringify({ msg_type: 'text', content: { text } });
+  const u = new URL(FEISHU_WEBHOOK);
+  return new Promise((resolve) => {
+    const https = require('https');
+    const req = https.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => { res.resume(); res.on('end', resolve); });
+    req.on('error', resolve);
+    req.setTimeout(10000, () => req.destroy());
+    req.write(body);
+    req.end();
+  });
+}
+
 function notify(title, msg) {
-  return Promise.all([sendBark(title, msg), sendTelegram(title, msg)]);
+  return Promise.all([sendBark(title, msg), sendTelegram(title, msg), sendFeishu(title, msg)]);
 }
 
 // ========== 解析函数 ==========

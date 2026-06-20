@@ -1,0 +1,18 @@
+[Unit]
+Description=V2EX Feishu Interactive Bot (L2)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/v2ex-max-helper/reader
+Environment="V2EX_ENV_FILE=/root/.v2ex_env"
+Environment="READER_LOG=/var/log/v2ex-reader.log"
+ExecStart=/usr/bin/node /root/v2ex-max-helper/reader/feishu-bot.js
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

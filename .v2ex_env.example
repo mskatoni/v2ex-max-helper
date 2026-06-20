@@ -1,25 +1,21 @@
 # V2EX Max Helper 配置示例
-# 复制本文件到家目录并重命名为 .v2ex_env（即 ~/.v2ex_env），然后填入你自己的值。
-#   cp .v2ex_env.example ~/.v2ex_env
-#
-# 注意：本文件【仅 reader 模块】（bot.js / notify.js）会自动读取。
-#       签到脚本 v2ex-checkin.js 不读本文件，只认进程环境变量；
-#       给签到配推送请在命令或 systemd service 的 Environment= 里直接传 TG_BOT_TOKEN / TG_CHAT_ID / BARK_URL。
+# 复制并编辑: cp .v2ex_env.example ~/.v2ex_env
 
-# ===== Telegram（reader 模块：Bot 命令 + 阅读推送）=====
-# 向 @BotFather 申请的 Bot Token
-TG_TOKEN=<在此填入你的BotToken>
-# 你的 Telegram 数字 Chat ID（向 @userinfobot 发消息可获取）
-# Bot 只会响应该 Chat ID 的命令（硬锁）
-TG_CHAT_ID=<在此填入你的Chat_ID>
+# ===== 飞书 L1：Webhook 推送通知（简单，推荐）=====
+# 飞书群 → 设置 → 群机器人 → 自定义机器人 → Webhook 地址
+# 安全设置选「自定义关键词」，填：V2EX
+FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/你的webhook地址
 
-# ===== 阅读脚本日志路径（bot.js 的 /debug 命令读取，可选）=====
+# ===== 飞书 L2：应用机器人交互命令（可选，需额外配置）=====
+# 详见 docs/飞书应用机器人配置.md
+# FEISHU_APP_ID=cli_xxxxxxxxxxxx
+# FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxx
+# FEISHU_VERIFICATION_TOKEN=xxxxxxxxxxxxxxxx
+# FEISHU_BOT_PORT=6700
+
+# ===== Telegram Bot（可选，传统方式）=====
+# TG_TOKEN=<BotToken>
+# TG_CHAT_ID=<ChatID>
+
+# ===== 阅读日志路径 =====
 # READER_LOG=/var/log/v2ex-reader.log
-
-# ===== 以下变量仅供「签到脚本」推送使用 =====
-# 提醒：签到脚本不读取本文件！下面几行写在这里只是备忘，
-#       实际生效需通过环境变量传入，例如：
-#         TG_BOT_TOKEN="xxx" TG_CHAT_ID="xxx" node checkin/v2ex-checkin.js
-#         BARK_URL="https://api.day.app/你的KEY" node checkin/v2ex-checkin.js
-# TG_BOT_TOKEN=<签到推送用的 BotToken，与 TG_TOKEN 可相同>
-# BARK_URL=https://api.day.app/你的KEY
