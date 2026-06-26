@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     volumes:
-      - v2ex-data:/data
+      - v2ex-data:/app/data
     environment:
       - TZ=UTC
 
@@ -20,7 +20,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=512m
-      - /home/v2ex:size=200m
+      - /app/ms-playwright:size=800m   # Playwright Chromium 运行时解压空间
 
     # 内存限制（防止 Chromium 吃光宿主机）
     deploy:

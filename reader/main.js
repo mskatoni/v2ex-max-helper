@@ -93,6 +93,18 @@ async function shutdown(reason, stats) {
   if (stats.consecutiveErrors >= 3) {
     await notify.notifyReaderError(stats);
   }
+  // 退出前最后一次余额检查（保证余额日志始终最新）
+  if (!isDryRun) {
+    try {
+      const cookie = await browser.getCurrentCookie();
+      if (cookie) {
+        await balance.check(cookie);
+        logger.info('退出前余额已更新');
+      }
+    } catch (e) {
+      logger.warn(`退出前余额更新失败: ${e.message}`);
+    }
+  }
   await browser.close();
   releaseLock();
   process.exit(0);
