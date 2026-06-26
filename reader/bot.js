@@ -33,16 +33,17 @@ loadEnvFile();
 
 const TOKEN           = process.env.TG_TOKEN   || '';
 const ALLOWED_CHAT_ID = process.env.TG_CHAT_ID || '';   // 硬锁，唯一授权用户
+const DATA_DIR        = process.env.V2EX_DATA_DIR || path.join(__dirname, 'data');
 const LOCK_FILE       = path.join(os.tmpdir(), 'v2ex_reader.lock');
-const BALANCE_LOG     = path.join(__dirname, 'data', 'balance_log.json');
-const READER_LOG      = process.env.READER_LOG || '/var/log/v2ex-reader.log';
+const BALANCE_LOG     = path.join(DATA_DIR, 'balance_log.json');
+const READER_LOG      = process.env.READER_LOG || path.join(DATA_DIR, 'v2ex-reader.log');
 
 // Cookie 文件路径（与 browser.js / v2ex-checkin.js 保持一致）
 const PROFILE     = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
 const COOKIE_FILE = process.env.COOKIE_FILE
   || (PROFILE === 'default'
-      ? path.join(os.homedir(), '.v2ex_cookie')
-      : path.join(os.homedir(), `.v2ex_cookie.${PROFILE}`));
+      ? path.join(process.env.V2EX_DATA_DIR || os.homedir(), '.v2ex_cookie')
+      : path.join(process.env.V2EX_DATA_DIR || os.homedir(), `.v2ex_cookie.${PROFILE}`));
 
 // V2EX 关键 Cookie 字段白名单（按重要性排列）
 const V2EX_COOKIE_KEYS = [
@@ -410,6 +411,10 @@ function startScheduler() {
 // ========== 铁墙 HTTP 服务器（满足 Render 端口要求 + 防扫描）==========
 
 function startHttpWall() {
+  if (process.env.DISABLE_HTTP_WALL === '1') {
+    console.log('[HTTP] HTTP 铁墙服务器已被 DISABLE_HTTP_WALL=1 禁用');
+    return;
+  }
   const RENDER_PORT = process.env.PORT || 10000;
 
   const server = http.createServer((req, res) => {

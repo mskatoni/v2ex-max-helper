@@ -14,14 +14,17 @@ const fingerprint = require('./fingerprint');
 const PROFILE = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
 const HOST    = 'www.v2ex.com';
 
+const DATA_DIR = process.env.V2EX_DATA_DIR || os.homedir();
 // Cookie 文件：显式 COOKIE_FILE 优先；否则按 profile 区分
 function resolveCookieFile() {
   if (process.env.COOKIE_FILE) return process.env.COOKIE_FILE;
-  const base = path.join(os.homedir(), '.v2ex_cookie');
+  const base = path.join(DATA_DIR, '.v2ex_cookie');
   return PROFILE === 'default' ? base : `${base}.${PROFILE}`;
 }
 const COOKIE_FILE   = resolveCookieFile();
-const USER_DATA_DIR = path.join(__dirname, 'data', 'chrome-profile', PROFILE);
+const USER_DATA_DIR = process.env.V2EX_DATA_DIR 
+  ? path.join(process.env.V2EX_DATA_DIR, 'chrome-profile', PROFILE)
+  : path.join(__dirname, 'data', 'chrome-profile', PROFILE);
 
 // 为当前 profile 生成确定性指纹
 const FP = fingerprint.generate(PROFILE);
@@ -88,13 +91,20 @@ async function launch(dryRun = false) {
   }
 
   const launchOptions = {
-    headless: false,
+    executablePath: process.env.CHROME_BIN || undefined,
+    headless: process.env.HEADLESS !== 'false',
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--memory-pressure-off',
+      '--js-flags=--max-old-space-size=256',
+      '--disable-extensions',
+      '--disable-default-apps',
+      '--single-process',
       `--lang=${FP.locale}`,
     ],
     ignoreHTTPSErrors: false,

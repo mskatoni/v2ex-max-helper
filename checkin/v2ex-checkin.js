@@ -34,15 +34,13 @@ const SCRIPT_VERSION = 'v1.3.0';
 const HOST           = 'www.v2ex.com';
 const MAX_RETRY      = 3;
 
-// 多账号：通过 V2EX_PROFILE 区分账号的 Cookie 文件
-//   default      → ~/.v2ex_cookie
-//   <profile>    → ~/.v2ex_cookie.<profile>
-//   COOKIE_FILE 环境变量显式指定时优先生效
+// 多账号与目录支持：通过 V2EX_DATA_DIR / V2EX_PROFILE 区分账号的 Cookie 文件
+const DATA_DIR = process.env.V2EX_DATA_DIR || os.homedir();
 const PROFILE = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
 const COOKIE_FILE = process.env.COOKIE_FILE
   || (PROFILE === 'default'
-      ? path.join(os.homedir(), '.v2ex_cookie')
-      : path.join(os.homedir(), `.v2ex_cookie.${PROFILE}`));
+      ? path.join(DATA_DIR, '.v2ex_cookie')
+      : path.join(DATA_DIR, `.v2ex_cookie.${PROFILE}`));
 
 // 推送配置（从环境变量读取，不硬编码）
 const BARK_URL       = process.env.BARK_URL    || '';   // e.g. https://api.day.app/YOUR_KEY
@@ -60,6 +58,10 @@ const COMMON_HEADERS = {
 
 // ========== Cookie 存储 ==========
 function readCookie() {
+  // 如果 Cookie 文件不存在，但环境变量里有，则自动初始化
+  if (process.env.V2EX_COOKIE && !fs.existsSync(COOKIE_FILE)) {
+    writeCookie(process.env.V2EX_COOKIE);
+  }
   try {
     if (fs.existsSync(COOKIE_FILE)) return fs.readFileSync(COOKIE_FILE, 'utf8').trim();
   } catch (e) {}
@@ -68,7 +70,13 @@ function readCookie() {
 
 function writeCookie(cookie) {
   try {
+    const dir = path.dirname(COOKIE_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
     fs.writeFileSync(COOKIE_FILE, cookie.trim(), { mode: 0o600 });
+    // 同步更新进程内 env（跨模块复用）
+    process.env.V2EX_COOKIE = cookie;
     return true;
   } catch (e) {
     console.error('写入 Cookie 失败:', e.message);

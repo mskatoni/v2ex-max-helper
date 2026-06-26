@@ -4,13 +4,22 @@ const fs     = require('fs');
 const path   = require('path');
 const logger = require('./logger');
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'queue.db');
+const DATA_DIR = process.env.V2EX_DATA_DIR
+  ? path.join(process.env.V2EX_DATA_DIR, 'reader')
+  : path.join(__dirname, 'data');
+const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'queue.db');
 
 let db = null;
 
 async function init() {
   const initSqlJs = require('sql.js');
   const SQL = await initSqlJs();
+
+  // 确保数据库目录存在
+  const dir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 
   // 如果数据库文件已存在，加载它
   if (fs.existsSync(DB_PATH)) {

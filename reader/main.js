@@ -100,6 +100,10 @@ async function shutdown(reason, stats) {
 
 // ========== 主流程 ==========
 async function main() {
+  if (process.env.SKIP_READER === '1') {
+    logger.info('[main] SKIP_READER=1, reader scheduler disabled.');
+    process.exit(0);
+  }
   acquireLock();
 
   const stats = { read: 0, changed: 0, elapsed: '0s', consecutiveErrors: 0 };

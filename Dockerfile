@@ -1,53 +1,57 @@
-# ===== Stage 1: 安装依赖 =====
-FROM mcr.microsoft.com/playwright:v1.44.0-jammy AS builder
-
-WORKDIR /build
-COPY checkin/package*.json checkin/
-COPY reader/package*.json reader/
-
-RUN cd checkin && npm ci --omit=dev && \
-    cd ../reader && npm ci --omit=dev
-
-# ===== Stage 2: 运行环境 =====
-FROM mcr.microsoft.com/playwright:v1.44.0-jammy
-
-# xvfb 用于 VPS Docker 场景下提供虚拟桌面规避无头检测
-# Render 环境下 bot.js 内置调度器会自动检测并决定是否使用
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends xvfb && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# 创建低权限用户
-RUN groupadd -r v2ex && useradd -r -g v2ex -d /home/v2ex -s /bin/bash v2ex && \
-    mkdir -p /home/v2ex /data /app && \
-    chown -R v2ex:v2ex /home/v2ex /data /app
+FROM node:18-slim
 
 WORKDIR /app
 
-# 只复制业务代码（.dockerignore 排除了 .git, docs, scripts 等）
-COPY --chown=v2ex:v2ex checkin/ checkin/
-COPY --chown=v2ex:v2ex reader/*.js reader/
-COPY --chown=v2ex:v2ex reader/package*.json reader/
-COPY --chown=v2ex:v2ex .v2ex_env.example .v2ex_env.example
+# 安装 Chromium 和 Playwright 所需的系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
+    libasound2 \
+    libxss1 \
+    libgtk-3-0 \
+    fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
 
-# 从 builder 阶段复制已安装的 node_modules
-COPY --from=builder --chown=v2ex:v2ex /build/checkin/node_modules checkin/node_modules
-COPY --from=builder --chown=v2ex:v2ex /build/reader/node_modules reader/node_modules
+# 告诉 Playwright 使用系统 Chromium
+ENV PLAYWRIGHT_BROWSERS_PATH=/usr/bin
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV CHROME_BIN=/usr/bin/chromium
 
-# 创建数据目录并确保权限
-RUN mkdir -p /app/reader/data && chown -R v2ex:v2ex /app/reader/data
+# 复制依赖定义并安装
+COPY checkin/package*.json ./checkin/
+COPY reader/package*.json ./reader/
 
-# 数据卷：Cookie 和日志持久化
-VOLUME /data
-ENV COOKIE_FILE=/data/.v2ex_cookie
-ENV READER_LOG=/data/v2ex-reader.log
-ENV HOME=/home/v2ex
+RUN cd checkin && npm ci --omit=dev \
+ && cd ../reader && npm ci --omit=dev
 
-# 健康检查：每 60 秒检测 bot.js 是否存活
-HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
-  CMD node -e "const h=require('http');h.get('http://localhost:'+(process.env.PORT||10000)+'/',r=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"
+# 复制业务代码
+COPY checkin/ ./checkin/
+COPY reader/ ./reader/
+COPY scripts/entrypoint.sh ./entrypoint.sh
+COPY server.js ./server.js
 
-# 以低权限用户运行
+# 赋予入口脚本执行权限
+RUN chmod +x ./entrypoint.sh
+
+# 创建非 root 用户（安全）
+RUN groupadd -r v2ex && useradd -r -g v2ex -d /app v2ex \
+    && chown -R v2ex:v2ex /app
+
+# 运行时数据目录（临时，重启清空）
+RUN mkdir -p /tmp/v2ex-data && chown v2ex:v2ex /tmp/v2ex-data
+
 USER v2ex
 
-CMD ["node", "reader/bot.js"]
+# Render 会自动设置 PORT 环境变量
+EXPOSE 8080
+
+ENV NODE_ENV=production
+ENV V2EX_DATA_DIR=/tmp/v2ex-data
+ENV PLAYWRIGHT_BROWSERS_PATH=/usr/bin
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+CMD ["./entrypoint.sh"]

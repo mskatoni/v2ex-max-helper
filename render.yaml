@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: v2ex-max-helper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free                        # 免费额度
+    region: singapore                 # 建议选 Singapore（靠近 v2ex 服务器）
+    healthCheckPath: /health
+    envVars:
+      # 以下敏感变量在 Render Dashboard 的 "Environment" 中手动填入
+      - key: V2EX_COOKIE
+        sync: false
+      - key: TG_TOKEN
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
+      # 非敏感配置
+      - key: NODE_ENV
+        value: production
+      - key: V2EX_DATA_DIR
+        value: /tmp/v2ex-data
+      - key: TZ
+        value: Asia/Shanghai
+    autoDeploy: true
