@@ -309,13 +309,8 @@ async function handleRead(limitArg, messageId = null) {
     const startMsg = `⏳ 正在启动手动阅读（限制阅读 ${limit} 篇）...`;
     if (messageId) await editMsgText(messageId, startMsg);
     else await sendMsg(startMsg);
-    const hasXvfb = fs.existsSync('/usr/bin/xvfb-run');
     const args = ['main.js', '--limit', String(limit)];
-    if (hasXvfb) {
-      runScript('手动阅读', '/usr/bin/xvfb-run', ['-a', process.execPath, ...args], __dirname);
-    } else {
-      runScript('手动阅读', process.execPath, args, __dirname);
-    }
+    runScript('手动阅读', process.execPath, args, __dirname);
     return;
   }
   
@@ -604,12 +599,7 @@ function startScheduler() {
     if (h === 1 && m === 15 && doy !== lastReadDOY) {
       lastReadDOY = doy;
       // Render 环境下直接 node，VPS Docker 里可以用 xvfb-run
-      const hasXvfb = fs.existsSync('/usr/bin/xvfb-run');
-      if (hasXvfb) {
-        runScript('阅读', '/usr/bin/xvfb-run', ['-a', process.execPath, 'main.js'], __dirname);
-      } else {
-        runScript('阅读', process.execPath, ['main.js'], __dirname);
-      }
+      runScript('阅读', process.execPath, ['main.js'], __dirname);
     }
 
     // 每 6 小时保活（V2EX session 保活，非 Render 保活）
