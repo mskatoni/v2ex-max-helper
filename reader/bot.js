@@ -506,8 +506,21 @@ async function poll() {
         if      (cmd === '/sou')   await handleSou();
         else if (cmd === '/debug') await handleDebug();
         else if (cmd === '/stop')  await handleStop();
+        else if (cmd === '/checkin') {
+          await sendMsg('⏳ 正在启动手动签到...');
+          runScript('手动签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname);
+        }
+        else if (cmd === '/read') {
+          await sendMsg('⏳ 正在启动手动阅读...');
+          const hasXvfb = fs.existsSync('/usr/bin/xvfb-run');
+          if (hasXvfb) {
+            runScript('手动阅读', '/usr/bin/xvfb-run', ['-a', process.execPath, 'main.js'], __dirname);
+          } else {
+            runScript('手动阅读', process.execPath, ['main.js'], __dirname);
+          }
+        }
         else if (cmd.startsWith('/')) {
-          await sendMsg('可用命令：\n/sou — 余额记录\n/debug — 最新报错\n/stop — 停止阅读脚本\n\n💡 直接粘贴 Cookie 文本即可自动识别导入');
+          await sendMsg('可用命令：\n/sou — 余额记录\n/debug — 最新报错\n/stop — 停止阅读脚本\n/checkin — 运行手动签到\n/read — 运行手动阅读\n\n💡 直接粘贴 Cookie 文本即可自动识别导入');
         } else {
           // 非命令消息：尝试智能识别 Cookie
           const handled = await handleCookieImport(text);
@@ -588,7 +601,7 @@ console.log(`[BOT] V2EX Bot 启动，授权 Chat ID: ${maskId(ALLOWED_CHAT_ID)}`
   } else {
     startupMsg += '\n✅ Cookie 文件已就绪';
   }
-  startupMsg += '\n\n可用命令：\n/sou — 余额记录\n/debug — 最新报错\n/stop — 停止阅读脚本';
+  startupMsg += '\n\n可用命令：\n/sou — 余额记录\n/debug — 最新报错\n/stop — 停止阅读脚本\n/checkin — 运行手动签到\n/read — 运行手动阅读';
 
   await sendMsg(startupMsg);
 
