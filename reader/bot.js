@@ -87,6 +87,16 @@ function maskId(id) {
   return `${s.slice(0, 2)}***${s.slice(-2)}`;
 }
 
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+
 // ========== Telegram API（含重启容错）==========
 function tgRequest(method, params) {
   return new Promise((resolve, reject) => {
@@ -127,7 +137,86 @@ function sendMsg(text) {
   });
 }
 
+function sendMsgWithKeyboard(text, replyMarkup) {
+  return tgRequest('sendMessage', {
+    chat_id:      ALLOWED_CHAT_ID,
+    text,
+    parse_mode:   'HTML',
+    reply_markup: replyMarkup,
+  });
+}
+
+function editMsgText(messageId, text, replyMarkup) {
+  const params = {
+    chat_id:    ALLOWED_CHAT_ID,
+    message_id: messageId,
+    text,
+    parse_mode: 'HTML',
+  };
+  if (replyMarkup) params.reply_markup = replyMarkup;
+  return tgRequest('editMessageText', params);
+}
+
 // ========== 命令处理 ==========
+
+async function handleStart() {
+  const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n欢迎回来！我是你的专属 V2EX 助手。我已成功与你的账户绑定并验证通过。\n\n你可以通过直接粘贴 Cookie 导入登录态，也可以使用下方的键盘快捷运行任务或管理设置：`;
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        { text: '✅ 运行签到', callback_data: 'run_checkin' },
+        { text: '📖 运行阅读', callback_data: 'run_read_panel' }
+      ],
+      [
+        { text: '💰 余额查询', callback_data: 'query_balance' },
+        { text: '⚙️ 日志级别', callback_data: 'config_debug' }
+      ],
+      [
+        { text: '📦 任务状态', callback_data: 'query_tasks' },
+        { text: '🛑 停止运行', callback_data: 'stop_task' }
+      ]
+    ]
+  };
+  return sendMsgWithKeyboard(text, replyMarkup);
+}
+
+async function handleHelp() {
+  const text = `ℹ️ <b>V2EX Max Helper 命令帮助说明</b>\n\n` +
+               `🤖 <b>主控制面板</b>: \n` +
+               `- <code>/start</code>: 打开主交互遥控面板\n` +
+               `- <code>/help</code>: 显示当前命令说明\n\n` +
+               `💰 <b>数据与状态</b>: \n` +
+               `- <code>/sou</code>: 查询今日与昨日的 V2EX 余额记录\n` +
+               `- <code>/tasks</code>: 实时查询后台签到 / 阅读的运行状态\n\n` +
+               `⚙️ <b>脚本控制</b>: \n` +
+               `- <code>/checkin</code>: 立刻开跑手动签到测试\n` +
+               `- <code>/read [数量]</code>: 触发手动阅读测试（默认 5 篇）\n` +
+               `- <code>/stop</code>: 紧急打断正在运行中的阅读/签到任务\n\n` +
+               `🔧 <b>日志与设置</b>: \n` +
+               `- <code>/debug [级别]</code>: 查看/修改日志级别（OFF / ERROR / WARN / INFO）\n` +
+               `- <code>/cookie [内容]</code>: 手动识别并导入新的 V2EX Cookie\n\n` +
+               `💡 <b>小提示</b>：你也可以直接把含有 Cookie 的文本粘贴给我，我会自动智能识别并合并导入。`;
+  return sendMsg(text);
+}
+
+async function handleTasks() {
+  if (!fs.existsSync(LOCK_FILE)) {
+    return sendMsg('ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)');
+  }
+  try {
+    const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+    if (!pid || isNaN(pid)) return sendMsg('⚠️ 发现残留锁文件，但 PID 无效');
+    const alive = isProcessAlive(pid);
+    if (alive) {
+      return sendMsg(`ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 运行进程 PID: <code>${pid}</code>\n- 你可以使用 <code>/stop</code> 命令强制打断当前任务。`);
+    } else {
+      try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+      return sendMsg('ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (已清理残留锁文件)');
+    }
+  } catch (e) {
+    return sendMsg(`❌ 状态查询失败: ${e.message}`);
+  }
+}
 
 // /sou — 从本地余额记录读取，不做实时请求
 async function handleSou() {
@@ -159,20 +248,98 @@ async function handleSou() {
 }
 
 // /debug — 修改日志级别，默认不产生日志，一共四个级别
-async function handleDebug(levelArg) {
+async function handleDebug(levelArg, messageId = null) {
   const levels = ['OFF', 'ERROR', 'WARN', 'INFO'];
-  if (!levelArg) {
-    return sendMsg(`🔍 <b>当前日志级别</b>: <code>${currentLogLevel}</code>\n\n可用级别（共 4 个）：\n- <code>OFF</code> (默认，不产生日志)\n- <code>ERROR</code> (只记录 ERROR)\n- <code>WARN</code> (记录 ERROR 和 WARN)\n- <code>INFO</code> (记录所有日志)\n\n💡 用法：<code>/debug [级别]</code>`);
+  if (levelArg) {
+    const targetLevel = levelArg.toUpperCase();
+    if (!levels.includes(targetLevel)) {
+      const errorMsg = `❌ 无效的级别 <code>${levelArg}</code>。请选择以下之一：<code>OFF</code>, <code>ERROR</code>, <code>WARN</code>, <code>INFO</code>`;
+      if (messageId) return editMsgText(messageId, errorMsg);
+      return sendMsg(errorMsg);
+    }
+    currentLogLevel = targetLevel;
+    try {
+      fs.writeFileSync(LOG_LEVEL_FILE, currentLogLevel, 'utf8');
+    } catch (_) {}
+    if (messageId) {
+      return renderDebugKeyboard(messageId);
+    }
+    return sendMsg(`✅ 日志级别已成功更改为: <code>${currentLogLevel}</code>`);
   }
-  const targetLevel = levelArg.toUpperCase();
-  if (!levels.includes(targetLevel)) {
-    return sendMsg(`❌ 无效的级别 <code>${levelArg}</code>。请选择以下之一：<code>OFF</code>, <code>ERROR</code>, <code>WARN</code>, <code>INFO</code>`);
+  
+  if (messageId) {
+    return renderDebugKeyboard(messageId);
+  } else {
+    const text = `⚙️ <b>日志级别配置</b>\n\n当前设置: <code>${currentLogLevel}</code>\n\n请点击下方按钮快速切换日志输出等级：`;
+    const replyMarkup = getDebugKeyboardMarkup();
+    return sendMsgWithKeyboard(text, replyMarkup);
   }
-  currentLogLevel = targetLevel;
-  try {
-    fs.writeFileSync(LOG_LEVEL_FILE, currentLogLevel, 'utf8');
-  } catch (_) {}
-  return sendMsg(`✅ 日志级别已成功更改为: <code>${currentLogLevel}</code>`);
+}
+
+function getDebugKeyboardMarkup() {
+  const checked = (level) => currentLogLevel === level ? ' 🔹' : '';
+  return {
+    inline_keyboard: [
+      [
+        { text: `OFF${checked('OFF')}`, callback_data: 'set_debug_off' },
+        { text: `ERROR${checked('ERROR')}`, callback_data: 'set_debug_error' }
+      ],
+      [
+        { text: `WARN${checked('WARN')}`, callback_data: 'set_debug_warn' },
+        { text: `INFO${checked('INFO')}`, callback_data: 'set_debug_info' }
+      ],
+      [
+        { text: '◀️ 返回面板', callback_data: 'go_to_start' }
+      ]
+    ]
+  };
+}
+
+async function renderDebugKeyboard(messageId) {
+  const text = `⚙️ <b>日志级别配置</b>\n\n当前设置: <code>${currentLogLevel}</code>\n\n请点击下方按钮快速切换日志输出等级：`;
+  const replyMarkup = getDebugKeyboardMarkup();
+  return editMsgText(messageId, text, replyMarkup);
+}
+
+async function handleRead(limitArg, messageId = null) {
+  if (limitArg) {
+    let limit = 5;
+    const parsed = parseInt(limitArg, 10);
+    if (parsed > 0) limit = parsed;
+    const startMsg = `⏳ 正在启动手动阅读（限制阅读 ${limit} 篇）...`;
+    if (messageId) await editMsgText(messageId, startMsg);
+    else await sendMsg(startMsg);
+    const hasXvfb = fs.existsSync('/usr/bin/xvfb-run');
+    const args = ['main.js', '--limit', String(limit)];
+    if (hasXvfb) {
+      runScript('手动阅读', '/usr/bin/xvfb-run', ['-a', process.execPath, ...args], __dirname);
+    } else {
+      runScript('手动阅读', process.execPath, args, __dirname);
+    }
+    return;
+  }
+  
+  const text = `📖 <b>手动阅读控制面板</b>\n\n日常活跃度奖励建议阅读 5 ~ 15 篇文章。\n请选择本次阅读的文章篇数：`;
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        { text: '5 篇', callback_data: 'trigger_read_5' },
+        { text: '10 篇', callback_data: 'trigger_read_10' }
+      ],
+      [
+        { text: '20 篇', callback_data: 'trigger_read_20' },
+        { text: '50 篇', callback_data: 'trigger_read_50' }
+      ],
+      [
+        { text: '◀️ 返回面板', callback_data: 'go_to_start' }
+      ]
+    ]
+  };
+  if (messageId) {
+    return editMsgText(messageId, text, replyMarkup);
+  } else {
+    return sendMsgWithKeyboard(text, replyMarkup);
+  }
 }
 
 // /stop — 向阅读脚本发送 SIGTERM
@@ -517,91 +684,226 @@ let pollRetryDelay = 1000; // 初始重试间隔 1 秒
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+async function handleMessage(msg) {
+  const text = msg.text.trim();
+  const parts = text.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const arg = parts[1];
+  
+  if (cmd === '/start') {
+    await handleStart();
+  }
+  else if (cmd === '/help') {
+    await handleHelp();
+  }
+  else if (cmd === '/sou') {
+    await handleSou();
+  }
+  else if (cmd === '/debug') {
+    await handleDebug(arg);
+  }
+  else if (cmd === '/stop') {
+    await handleStop();
+  }
+  else if (cmd === '/checkin') {
+    await sendMsg('⏳ 正在启动手动签到...');
+    runScript('手动签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname);
+  }
+  else if (cmd === '/read') {
+    await handleRead(arg);
+  }
+  else if (cmd === '/tasks') {
+    await handleTasks();
+  }
+  else if (cmd === '/cookie') {
+    const cookieText = text.slice(cmd.length).trim();
+    if (!cookieText) {
+      await sendMsg('💡 用法：<code>/cookie [粘贴你的V2EX Cookie]</code>\nBot 会自动解析并保存有效字段。');
+    } else {
+      const handled = await handleCookieImport(cookieText);
+      if (!handled) {
+        await sendMsg('❌ 未能从中识别出有效的 V2EX Cookie（如 A2 字段）。请确认格式。');
+      }
+    }
+  }
+  else if (cmd.startsWith('/')) {
+    await sendMsg('可用命令：\n/sou — 余额记录\n/debug [级别] — 修改日志级别\n/stop — 停止阅读脚本\n/checkin — 运行手动签到\n/read [数量] — 运行手动阅读\n/cookie [内容] — 导入新 Cookie\n/tasks — 任务运行状态\n/help — 显示帮助');
+  } else {
+    // 非命令消息：尝试智能识别 Cookie
+    const handled = await handleCookieImport(text);
+    if (!handled) {
+      console.log('[BOT] 未识别到有效 Cookie，忽略');
+    }
+  }
+}
+
+async function handleCallbackQuery(query) {
+  const data = query.data;
+  const messageId = query.message ? query.message.message_id : null;
+  
+  console.log(`[BOT] 收到 Callback: ${data}`);
+  await tgRequest('answerCallbackQuery', { callback_query_id: query.id });
+  
+  try {
+    if (data === 'run_checkin') {
+      await editMsgText(messageId, '⏳ 正在启动手动签到...');
+      runScript('手动签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname);
+    }
+    else if (data === 'run_read_panel') {
+      await handleRead(null, messageId);
+    }
+    else if (data.startsWith('trigger_read_')) {
+      const count = data.replace('trigger_read_', '');
+      await handleRead(count, messageId);
+    }
+    else if (data === 'query_balance') {
+      if (!fs.existsSync(BALANCE_LOG)) {
+        await editMsgText(messageId, '⚠️ 尚无余额记录，脚本至少需运行一次后才有数据。', {
+          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
+        });
+        return;
+      }
+      const log = JSON.parse(fs.readFileSync(BALANCE_LOG, 'utf8'));
+      const days = Object.keys(log).sort().reverse();
+      const today = days[0];
+      const yesterday = days[1];
+      const todayEntry = today ? log[today] : null;
+      const yesterdayEntry = yesterday ? log[yesterday] : null;
+      const todayTime = todayEntry
+        ? new Date(todayEntry.lastTime).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false })
+        : '--';
+      let msg = `💰 <b>余额记录</b>\n\n`;
+      msg += todayEntry
+        ? `今日 (${today})：<b>${todayEntry.last} 铜币</b>  最后查询 ${todayTime} EST\n`
+        : `今日：暂无记录\n`;
+      msg += yesterdayEntry
+        ? `昨日 (${yesterday})：${yesterdayEntry.last} 铜币`
+        : `昨日：暂无记录`;
+      await editMsgText(messageId, msg, {
+        inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
+      });
+    }
+    else if (data === 'config_debug') {
+      await handleDebug(null, messageId);
+    }
+    else if (data.startsWith('set_debug_')) {
+      const level = data.replace('set_debug_', '');
+      await handleDebug(level, messageId);
+    }
+    else if (data === 'query_tasks') {
+      let statusText = '';
+      let keyboard = [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]];
+      if (!fs.existsSync(LOCK_FILE)) {
+        statusText = 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)';
+      } else {
+        const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+        if (pid && isProcessAlive(pid)) {
+          statusText = `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 运行进程 PID: <code>${pid}</code>`;
+          keyboard = [
+            [{ text: '🛑 停止任务', callback_data: 'stop_task' }],
+            [{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]
+          ];
+        } else {
+          try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+          statusText = 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (已清理残留锁文件)';
+        }
+      }
+      await editMsgText(messageId, statusText, { inline_keyboard: keyboard });
+    }
+    else if (data === 'stop_task') {
+      if (!fs.existsSync(LOCK_FILE)) {
+        await editMsgText(messageId, 'ℹ️ 阅读脚本未在运行。', {
+          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
+        });
+        return;
+      }
+      const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+      if (pid && !isNaN(pid)) {
+        try {
+          process.kill(pid, 'SIGTERM');
+          await editMsgText(messageId, `🛑 已发送停止信号给 PID ${pid}。`, {
+            inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
+          });
+        } catch (e) {
+          if (e.code === 'ESRCH') {
+            try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+            await editMsgText(messageId, 'ℹ️ 进程已结束，锁文件已清理。', {
+              inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
+            });
+          } else {
+            await editMsgText(messageId, `❌ 停止失败: ${e.message}`, {
+              inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
+            });
+          }
+        }
+      }
+    }
+    else if (data === 'go_to_start') {
+      const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n欢迎回来！我是你的专属 V2EX 助手。我已成功与你的账户绑定并验证通过。\n\n你可以通过直接粘贴 Cookie 导入登录态，也可以使用下方的键盘快捷运行任务或管理设置：`;
+      const replyMarkup = {
+        inline_keyboard: [
+          [
+            { text: '✅ 运行签到', callback_data: 'run_checkin' },
+            { text: '📖 运行阅读', callback_data: 'run_read_panel' }
+          ],
+          [
+            { text: '💰 余额查询', callback_data: 'query_balance' },
+            { text: '⚙️ 日志级别', callback_data: 'config_debug' }
+          ],
+          [
+            { text: '📦 任务状态', callback_data: 'query_tasks' },
+            { text: '🛑 停止运行', callback_data: 'stop_task' }
+          ]
+        ]
+      };
+      await editMsgText(messageId, text, replyMarkup);
+    }
+  } catch (e) {
+    console.error(`[BOT] Callback 处理出错: ${e.message}`);
+  }
+}
+
 async function poll() {
   try {
-    const res = await tgRequest('getUpdates', { offset, timeout: 30, allowed_updates: ['message'] });
+    const res = await tgRequest('getUpdates', { offset, timeout: 30, allowed_updates: ['message', 'callback_query'] });
 
-    // 处理 409 冲突（Render 重启后上一个实例的连接还没断）
     if (res.conflict) {
       await sleep(pollRetryDelay);
-      pollRetryDelay = Math.min(pollRetryDelay * 2, 10000); // 指数退避，最多 10 秒
+      pollRetryDelay = Math.min(pollRetryDelay * 2, 10000);
       return;
     }
 
-    // 成功后重置重试间隔
     pollRetryDelay = 1000;
 
     if (!res.ok || !res.result) return;
 
     for (const update of res.result) {
       offset = update.update_id + 1;
-      const msg = update.message;
-      if (!msg || !msg.text) continue;
-
-      // 硬锁：只响应授权 chat_id
-      if (String(msg.chat.id) !== ALLOWED_CHAT_ID) {
-        console.log(`[BOT] 忽略非授权消息, 来源 chat_id: ${msg.chat.id}`);
-        continue;
+      
+      if (update.message) {
+        const msg = update.message;
+        if (!msg.text) continue;
+        if (String(msg.chat.id) !== ALLOWED_CHAT_ID) {
+          console.log(`[BOT] 忽略非授权消息, 来源 chat_id: ${msg.chat.id}`);
+          continue;
+        }
+        await handleMessage(msg);
       }
-
-      const text = msg.text.trim();
-      const parts = text.split(/\s+/);
-      const cmd = parts[0].toLowerCase();
-      const arg = parts[1];
-      console.log(`[BOT] 收到消息: ${cmd}`);
-
-      try {
-        if      (cmd === '/sou')   await handleSou();
-        else if (cmd === '/debug') await handleDebug();
-        else if (cmd === '/stop')  await handleStop();
-        else if (cmd === '/checkin') {
-          await sendMsg('⏳ 正在启动手动签到...');
-          runScript('手动签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname);
+      
+      if (update.callback_query) {
+        const query = update.callback_query;
+        if (String(query.from.id) !== ALLOWED_CHAT_ID) {
+          console.log(`[BOT] 忽略非授权 CallbackQuery, 来源 user_id: ${query.from.id}`);
+          continue;
         }
-        else if (cmd === '/read') {
-          let limit = 5;
-          if (arg) {
-            const parsed = parseInt(arg, 10);
-            if (parsed > 0) limit = parsed;
-          }
-          await sendMsg(`⏳ 正在启动手动阅读（限制阅读 ${limit} 篇）...`);
-          const hasXvfb = fs.existsSync('/usr/bin/xvfb-run');
-          const args = ['main.js', '--limit', String(limit)];
-          if (hasXvfb) {
-            runScript('手动阅读', '/usr/bin/xvfb-run', ['-a', process.execPath, ...args], __dirname);
-          } else {
-            runScript('手动阅读', process.execPath, args, __dirname);
-          }
-        }
-        else if (cmd === '/cookie') {
-          const cookieText = text.slice(cmd.length).trim();
-          if (!cookieText) {
-            await sendMsg('💡 用法：<code>/cookie [粘贴你的V2EX Cookie]</code>\nBot 会自动解析并保存有效字段。');
-          } else {
-            const handled = await handleCookieImport(cookieText);
-            if (!handled) {
-              await sendMsg('❌ 未能从中识别出有效的 V2EX Cookie（如 A2 字段）。请确认格式。');
-            }
-          }
-        }
-        else if (cmd.startsWith('/')) {
-          await sendMsg('可用命令：\n/sou — 余额记录\n/debug [级别] — 修改日志级别（OFF/ERROR/WARN/INFO）\n/stop — 停止阅读脚本\n/checkin — 运行手动签到\n/read [数量] — 运行手动阅读（默认 5 篇）\n/cookie [Cookie内容] — 识别并导入新 Cookie\n\n💡 直接粘贴 Cookie 文本也可以自动识别导入');
-        } else {
-          // 非命令消息：尝试智能识别 Cookie
-          const handled = await handleCookieImport(text);
-          if (!handled) {
-            console.log('[BOT] 未识别到有效 Cookie，忽略');
-          }
-        }
-      } catch (e) {
-        console.error(`[BOT] 命令处理出错: ${e.message}`);
+        await handleCallbackQuery(query);
       }
     }
   } catch (e) {
     if (e.message !== 'timeout') {
       console.error(`[BOT] 轮询出错: ${e.message}，${pollRetryDelay / 1000}秒后重试`);
       await sleep(pollRetryDelay);
-      pollRetryDelay = Math.min(pollRetryDelay * 2, 30000); // 网络错误最多等 30 秒
+      pollRetryDelay = Math.min(pollRetryDelay * 2, 30000);
     }
   }
 }
@@ -676,7 +978,7 @@ console.log(`[BOT] V2EX Bot 启动，授权 Chat ID: ${maskId(ALLOWED_CHAT_ID)}`
   } else {
     startupMsg += '\n✅ Cookie 文件已就绪';
   }
-  startupMsg += '\n\n可用命令：\n/sou — 余额记录\n/debug [级别] — 修改日志级别（OFF/ERROR/WARN/INFO）\n/stop — 停止阅读脚本\n/checkin — 运行手动签到\n/read [数量] — 运行手动阅读（默认 5 篇）\n/cookie [Cookie内容] — 识别并导入新 Cookie';
+  startupMsg += '\n\n💡 发送 /start 打开交互遥控中心\n可用命令：/start, /help, /sou, /tasks, /stop, /checkin, /read [数量], /debug [级别], /cookie [内容]';
 
   await sendMsg(startupMsg);
 
