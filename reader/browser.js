@@ -84,11 +84,8 @@ async function launch(dryRun = false) {
   logger.info('浏览器启动中...');
   logger.info('浏览器指纹已按当前 profile 注入');
 
-  // 动态代理检测：如果环境变量设置了代理，或者通过 --require 加载了 preload-proxy.js，则启用代理
-  let proxyServer = process.env.HTTP_PROXY || process.env.http_proxy || '';
-  if (!proxyServer && require.cache[path.resolve(__dirname, 'preload-proxy.js')]) {
-    proxyServer = 'http://127.0.0.1:7890';
-  }
+  // 动态代理检测：如果环境变量设置了代理，则启用代理。
+  const proxyServer = process.env.HTTP_PROXY || process.env.http_proxy || '';
 
   const launchOptions = {
     executablePath: process.env.CHROME_BIN || undefined,

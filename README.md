@@ -225,7 +225,6 @@ systemctl status v2ex-bot                     # 查看状态
 v2ex-max-helper/
 ├── checkin/                 # 签到模块
 │   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.3.1）
-│   ├── preload-proxy.js     # 可选代理预加载
 │   └── package.json
 ├── reader/                  # 自动阅读 + Bot 模块
 │   ├── main.js              # 阅读主调度器（支持 --dry-run / --limit）
@@ -238,7 +237,6 @@ v2ex-max-helper/
 │   ├── fingerprint.js       # 浏览器指纹隔离（多账号确定性指纹）
 │   ├── logger.js            # 日志
 │   ├── inspect_balance.js   # 余额调试工具（手动排查用）
-│   ├── preload-proxy.js     # 可选代理预加载
 │   ├── data/                # 运行时数据（已被 gitignore）
 │   └── package.json
 ├── scripts/                 # 运维脚本
@@ -252,9 +250,6 @@ v2ex-max-helper/
 │   ├── 部署指南.md          # 手动部署完整流程
 │   ├── Agent辅助部署.md     # AI 助手部署 + 安全须知
 │   ├── 多账号与指纹隔离.md  # 多账号管理 + 指纹隔离
-│   ├── 代理配置说明.md      # 国内 / 代理环境说明
-│   ├── 国内服务器部署指南.md # 国内服务器部署注意事项
-│   ├── 快速上手.md          # 精简上手流程
 │   ├── 配置说明.md          # 环境变量 / 参数一览
 │   └── 常见问题.md          # FAQ
 ├── .v2ex_env.example        # 配置示例
@@ -345,4 +340,3 @@ rm -f ~/.v2ex_cookie ~/.v2ex_env
 - ©️ 须保留原作者署名并标明改动。
 
 > 注：因含「禁止商用」条款，本许可证非 OSI 认证的开源许可证，仅限个人、学习与非商业自动化使用。
-
