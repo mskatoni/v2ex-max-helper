@@ -4,7 +4,7 @@
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.3.0-blue)
+![Version](https://img.shields.io/badge/version-v1.3.1-blue)
 
 纯 Node.js 实现，可部署在任意 VPS 上挂机运行。包含两个相互独立、可单独使用的模块：
 
@@ -202,7 +202,7 @@ systemctl status v2ex-bot                     # 查看状态
 ```
 v2ex-max-helper/
 ├── checkin/                 # 签到模块
-│   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.3.0）
+│   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.3.1）
 │   └── package.json
 ├── reader/                  # 自动阅读 + Bot 模块
 │   ├── main.js              # 阅读主调度器（支持 --dry-run / --limit）
