@@ -139,6 +139,8 @@ SKIP_READER=1
 
 Render 免费实例可能休眠，Bot 内置自保活逻辑会在配置 `RENDER_EXTERNAL_URL` 时定期访问自身；稳定性要求更高时建议使用付费实例或外部 pinger。
 
+Render Blueprint 默认把运行时数据写到 `/app/data`。免费实例文件系统不保证长期持久，重建后建议重新私聊绑定 Bot 或重新粘贴 Cookie；需要强持久化时可改用 Docker/VPS，或在付费实例上挂载 Render Disk。
+
 ---
 
 ### 方式三：AI Agent 辅助部署
@@ -183,7 +185,7 @@ journalctl -u v2ex-checkin -n 50      # 查看签到日志
 > [!WARNING]
 > **签到脚本（`checkin/v2ex-checkin.js`）不读取 `~/.v2ex_env` 文件**，只认进程环境变量。
 > 想给签到配 Telegram/Bark 推送，需要在 systemd service 的 `Environment=` 里直接传入
-> `TG_BOT_TOKEN`/`TG_CHAT_ID`/`BARK_URL`，或在命令行前缀传入。
+> `TG_TOKEN`（或兼容旧名 `TG_BOT_TOKEN`）/`TG_CHAT_ID`/`BARK_URL`，或在命令行前缀传入。
 > 阅读模块（`reader/`）才会自动读取 `~/.v2ex_env`。详见 [`docs/配置说明.md`](docs/配置说明.md)。
 
 ---
@@ -207,7 +209,7 @@ node main.js --dry-run
 # 阅读：限制只读 5 篇（真实浏览器，快速验证）
 node main.js --limit 5
 
-# 余额调试：打印 /balance 页面解析结果
+# 余额调试：打印 /balance 请求状态、诊断结果与解析片段
 node inspect_balance.js
 ```
 
@@ -263,7 +265,7 @@ v2ex-max-helper/
 │   ├── notify.js            # 推送通知（Telegram / Bark）
 │   ├── browser.js           # Playwright 浏览器控制 + 拟人随机化
 │   ├── fetcher.js           # 帖子 URL 多源抓取（/recent 多页 + 分区）
-│   ├── balance.js           # 余额监控 + 变化检测
+│   ├── balance.js           # 余额监控 + 变化检测 + 失败诊断
 │   ├── queue.js             # SQLite 去重队列（每帖最多读 3 次）
 │   ├── fingerprint.js       # 浏览器指纹隔离（多账号确定性指纹）
 │   ├── logger.js            # 日志
@@ -316,7 +318,7 @@ bash ~/v2ex-max-helper/scripts/install.sh --update
 
 ```bash
 cd ~/v2ex-max-helper
-git pull origin main                          # git clone 安装的
+git pull origin mskatoni-patch-beta           # git clone 安装 beta 分支的
 cd reader && npm install                      # 更新依赖
 ```
 

@@ -15,7 +15,7 @@
  *
  * 推送告警（Cookie 失效时通知）：
  *   Bark:     BARK_URL="https://api.day.app/你的KEY" node v2ex-checkin.js
- *   Telegram: TG_BOT_TOKEN="xxx" TG_CHAT_ID="xxx" node v2ex-checkin.js
+ *   Telegram: TG_TOKEN="xxx" TG_CHAT_ID="xxx" node v2ex-checkin.js
  *
  * Cookie 存储位置：~/.v2ex_cookie（或 COOKIE_FILE 环境变量）
  */
@@ -44,7 +44,7 @@ const COOKIE_FILE = process.env.COOKIE_FILE
 
 // 推送配置（从环境变量读取，不硬编码）
 const BARK_URL       = process.env.BARK_URL    || '';   // e.g. https://api.day.app/YOUR_KEY
-const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN || '';
+const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN || '';
 const TG_CHAT_ID     = process.env.TG_CHAT_ID   || '';
 
 const COMMON_HEADERS = {

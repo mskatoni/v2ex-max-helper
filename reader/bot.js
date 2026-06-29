@@ -37,6 +37,7 @@ const SETUP_CODE      = process.env.TG_SETUP_CODE || '';
 const DATA_DIR        = process.env.V2EX_DATA_DIR || path.join(__dirname, 'data');
 const LOCK_FILE       = path.join(os.tmpdir(), 'v2ex_reader.lock');
 const BALANCE_LOG     = path.join(DATA_DIR, 'balance_log.json');
+const BALANCE_STATUS  = path.join(DATA_DIR, 'balance_status.json');
 const READER_LOG      = process.env.READER_LOG || path.join(DATA_DIR, 'v2ex-reader.log');
 const AUTH_CHAT_FILE  = path.join(DATA_DIR, '.telegram_chat_id');
 
@@ -264,13 +265,34 @@ function formatCoins(entry, bold = true) {
   return parts.join(', ');
 }
 
-// /sou — 从本地余额记录读取，不做实时请求
-async function handleSou() {
-  if (!fs.existsSync(BALANCE_LOG)) {
-    return sendMsg('⚠️ 尚无余额记录，脚本至少需运行一次后才有数据');
+function readJsonFile(file) {
+  try {
+    if (!fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_) {
+    return null;
   }
-  const log  = JSON.parse(fs.readFileSync(BALANCE_LOG, 'utf8'));
-  const days = Object.keys(log).sort().reverse(); // 最新的在前
+}
+
+function formatBalanceStatus(status) {
+  if (!status) return '';
+  const ok = status.ok ? '成功' : '失败';
+  const time = status.time ? new Date(status.time).toLocaleString('zh-CN', { hour12: false }) : '--';
+  const detail = status.message || status.code || '未知状态';
+  const http = status.statusCode ? ` / HTTP ${status.statusCode}` : '';
+  return `\n\n最近一次余额检查：<b>${ok}</b>${http}\n时间：<code>${escapeHtml(time)}</code>\n状态：${escapeHtml(detail)}`;
+}
+
+function buildBalanceMessage() {
+  const status = readJsonFile(BALANCE_STATUS);
+  const log = readJsonFile(BALANCE_LOG);
+  const days = log
+    ? Object.keys(log).filter(k => /^\d{4}-\d{2}-\d{2}$/.test(k)).sort().reverse()
+    : [];
+
+  if (!log || days.length === 0) {
+    return '⚠️ 尚无余额记录，脚本至少需成功读取一次余额后才有数据' + formatBalanceStatus(status);
+  }
 
   const today    = days[0];
   const yesterday = days[1];
@@ -290,7 +312,16 @@ async function handleSou() {
     ? `昨日 (${yesterday})：${formatCoins(yesterdayEntry, false)}`
     : `昨日：暂无记录`;
 
-  return sendMsg(msg);
+  if (status && !status.ok) {
+    msg += formatBalanceStatus(status);
+  }
+
+  return msg;
+}
+
+// /sou — 从本地余额记录读取，不做实时请求
+async function handleSou() {
+  return sendMsg(buildBalanceMessage());
 }
 
 // /debug — 修改日志级别，默认不产生日志，一共四个级别
@@ -403,7 +434,7 @@ async function handleStop() {
 }
 
 function escapeHtml(str) {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ========== Cookie 智能识别导入 ==========
@@ -793,29 +824,7 @@ async function handleCallbackQuery(query) {
       await handleRead(count, messageId);
     }
     else if (data === 'query_balance') {
-      if (!fs.existsSync(BALANCE_LOG)) {
-        await editMsgText(messageId, '⚠️ 尚无余额记录，脚本至少需运行一次后才有数据。', {
-          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
-        });
-        return;
-      }
-      const log = JSON.parse(fs.readFileSync(BALANCE_LOG, 'utf8'));
-      const days = Object.keys(log).sort().reverse();
-      const today = days[0];
-      const yesterday = days[1];
-      const todayEntry = today ? log[today] : null;
-      const yesterdayEntry = yesterday ? log[yesterday] : null;
-      const todayTime = todayEntry
-        ? new Date(todayEntry.lastTime).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false })
-        : '--';
-      let msg = `💰 <b>余额记录</b>\n\n`;
-      msg += todayEntry
-        ? `今日 (${today})：${formatCoins(todayEntry, true)}  最后查询 ${todayTime} EST\n`
-        : `今日：暂无记录\n`;
-      msg += yesterdayEntry
-        ? `昨日 (${yesterday})：${formatCoins(yesterdayEntry, false)}`
-        : `昨日：暂无记录`;
-      await editMsgText(messageId, msg, {
+      await editMsgText(messageId, buildBalanceMessage(), {
         inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
       });
     }

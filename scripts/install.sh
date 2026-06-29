@@ -8,7 +8,7 @@
 #   → （可选）安装 Telegram Bot 常驻服务
 #
 # 用法（在 VPS 上以 root 执行）：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/mskatoni/v2ex-max-helper/main/scripts/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/mskatoni/v2ex-max-helper/mskatoni-patch-beta/scripts/install.sh)
 # 或先下载再运行：
 #   bash scripts/install.sh
 # 更新已有安装：
@@ -21,11 +21,14 @@
 #   V2EX_PROFILE=acc2     为指定多账号 profile 部署
 #   INSTALL_DIR=/opt/v2ex 自定义安装目录（默认 ~/v2ex-max-helper）
 #   SKIP_READER=1         只装签到+保活，不装自动阅读
+#   BRANCH=main           指定下载分支（默认 mskatoni-patch-beta）
 # =============================================================================
 set -euo pipefail
 
-REPO_RAW="https://github.com/mskatoni/v2ex-max-helper"
-ZIP_URL="${REPO_RAW}/archive/refs/heads/main.zip"
+REPO_NAME="v2ex-max-helper"
+REPO_RAW="https://github.com/mskatoni/${REPO_NAME}"
+BRANCH="${BRANCH:-mskatoni-patch-beta}"
+ZIP_URL="${REPO_RAW}/archive/refs/heads/${BRANCH}.zip"
 PROFILE="${V2EX_PROFILE:-default}"
 
 # ---------- 参数解析 ----------
@@ -138,15 +141,19 @@ else
         ( cd "$PROJ_DIR" && git pull --ff-only ) || warn "git pull 失败，继续使用当前版本"
         SUMMARY_COMPONENTS+=("项目代码（git pull 更新）")
       else
-        info "重新下载最新代码..."
+        info "重新下载最新代码（分支：${BRANCH}）..."
         tmp="$(mktemp -d)"
-        curl -fsSL "$ZIP_URL" -o "${tmp}/main.zip" || { warn "下载失败，继续使用当前版本"; rm -rf "$tmp"; }
-        if [[ -f "${tmp}/main.zip" ]]; then
-          unzip -q "${tmp}/main.zip" -d "$tmp"
+        curl -fsSL "$ZIP_URL" -o "${tmp}/source.zip" || { warn "下载失败，继续使用当前版本"; rm -rf "$tmp"; }
+        if [[ -f "${tmp}/source.zip" ]]; then
+          unzip -q "${tmp}/source.zip" -d "$tmp"
+          src_dir="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          [[ -n "$src_dir" ]] || { warn "解压后未找到项目目录，继续使用当前版本"; rm -rf "$tmp"; }
           # 保留用户数据目录，只更新代码文件
-          rsync -a --exclude='node_modules' --exclude='.git' \
-            "${tmp}/v2ex-max-helper-main/" "$PROJ_DIR/" 2>/dev/null \
-            || cp -a "${tmp}/v2ex-max-helper-main/"* "$PROJ_DIR/" 2>/dev/null || true
+          if [[ -n "${src_dir:-}" ]]; then
+            rsync -a --exclude='node_modules' --exclude='.git' \
+              "${src_dir}/" "$PROJ_DIR/" 2>/dev/null \
+              || cp -a "${src_dir}/"* "$PROJ_DIR/" 2>/dev/null || true
+          fi
           rm -rf "$tmp"
           SUMMARY_COMPONENTS+=("项目代码（zip 重新下载）")
         fi
@@ -157,13 +164,15 @@ else
       SUMMARY_COMPONENTS+=("项目代码")
     fi
   else
-    info "下载到 ${PROJ_DIR}"
+    info "下载分支 ${BRANCH} 到 ${PROJ_DIR}"
     tmp="$(mktemp -d)"
-    curl -fsSL "$ZIP_URL" -o "${tmp}/main.zip" || die "下载失败，请检查网络或手动 git clone"
-    unzip -q "${tmp}/main.zip" -d "$tmp"
+    curl -fsSL "$ZIP_URL" -o "${tmp}/source.zip" || die "下载失败，请检查网络或手动 git clone"
+    unzip -q "${tmp}/source.zip" -d "$tmp"
+    src_dir="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+    [[ -n "$src_dir" ]] || die "解压后未找到项目目录"
     mkdir -p "$(dirname "$PROJ_DIR")"
     rm -rf "$PROJ_DIR"
-    mv "${tmp}/v2ex-max-helper-main" "$PROJ_DIR"
+    mv "$src_dir" "$PROJ_DIR"
     rm -rf "$tmp"
     ok "项目就绪：${PROJ_DIR}"
     SUMMARY_COMPONENTS+=("项目代码（全新安装）")
@@ -350,7 +359,7 @@ echo "  └───────────────────────
 
 echo
 info "下一步："
-echo "  • 用 Telegram 推送/Bot：把 TG_TOKEN/TG_CHAT_ID 写入 ~/.v2ex_env（见 .v2ex_env.example）"
+echo "  • 用 Telegram Bot：把 TG_TOKEN 写入 ~/.v2ex_env；TG_CHAT_ID 可留空后首次私聊绑定"
 if [[ $HAS_SYSTEMD -eq 1 ]]; then
   echo "  • 查看定时器：systemctl list-timers 'v2ex-*'"
   echo "  • 查看签到日志：journalctl -u v2ex-checkin -n 50"

@@ -337,7 +337,11 @@ async function getCurrentCookie() {
   if (ctx) {
     try {
       const cookies = await ctx.cookies();
-      return serializeCookies(cookies);
+      const str = serializeCookies(cookies);
+      if (str && hasCookieKey(str, 'A2')) return str;
+      if (str) {
+        logger.warn('当前浏览器上下文缺少 A2，回退读取 Cookie 文件');
+      }
     } catch (_) {}
   }
   // fallback: 直接读文件

@@ -157,13 +157,16 @@ async function main() {
 
   // 初始化余额基线（dry-run 跳过真实请求）
   if (!isDryRun) {
-    const balanceOk = await balance.init(cookie);
-    if (!balanceOk) {
-      logger.error('无法获取余额基线，Cookie 可能已失效');
+    const balanceState = await balance.init(cookie);
+    if (!balanceState.ok && balanceState.fatal) {
+      logger.error(`无法获取余额基线: ${balanceState.message}`);
       await notify.notifySessionExpired();
       await browser.close();
       releaseLock();
       process.exit(1);
+    }
+    if (!balanceState.ok) {
+      logger.warn(`余额基线暂不可用，将继续阅读并在后续检查中重试: ${balanceState.message}`);
     }
   } else {
     logger.info('[DRY-RUN] 跳过余额初始化');

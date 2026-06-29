@@ -28,6 +28,7 @@ data/*
 *.sqlite
 *.sqlite3
 balance_log.json
+balance_status.json
 
 # 浏览器配置（含登录态，严禁提交）
 chrome-profile/

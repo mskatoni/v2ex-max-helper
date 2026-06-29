@@ -20,7 +20,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: V2EX_DATA_DIR
-        value: /tmp/v2ex-data
+        value: /app/data
       - key: TZ
         value: Asia/Shanghai
-    autoDeploy: true
+    autoDeployTrigger: commit
