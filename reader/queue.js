@@ -3,13 +3,13 @@
 const fs     = require('fs');
 const path   = require('path');
 const logger = require('./logger');
+const config = require('../lib/config');
 
-const DATA_DIR = process.env.V2EX_DATA_DIR
-  ? path.join(process.env.V2EX_DATA_DIR, 'reader')
-  : path.join(__dirname, 'data');
-const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'queue.db');
+const cfg = config.getConfig();
+const DB_PATH = cfg.dbPath;
 
 let db = null;
+let dirty = false;
 
 async function init() {
   const initSqlJs = require('sql.js');
@@ -31,6 +31,7 @@ async function init() {
     logger.info(`Queue DB created: ${DB_PATH}`);
   }
 
+  const hadPostsTable = tableExists('posts');
   db.run(`
     CREATE TABLE IF NOT EXISTS posts (
       url        TEXT PRIMARY KEY,
@@ -39,28 +40,72 @@ async function init() {
       created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     );
   `);
-  save();
+  if (!hadPostsTable) {
+    dirty = true;
+    flush();
+  }
 }
 
-// 持久化到磁盘
-function save() {
+function tableExists(name) {
+  const safeName = String(name).replace(/'/g, "''");
+  const result = db.exec(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = '${safeName}'`
+  );
+  return result.length > 0 && result[0].values.length > 0;
+}
+
+// 持久化到磁盘：先写临时文件，再原子替换目标文件。
+function flush() {
+  if (!dirty || !db) return false;
   const dir = path.dirname(DB_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const data = db.export();
-  fs.writeFileSync(DB_PATH, Buffer.from(data));
+  const tmp = `${DB_PATH}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    const data = db.export();
+    fs.writeFileSync(tmp, Buffer.from(data));
+    fs.renameSync(tmp, DB_PATH);
+    dirty = false;
+    logger.info(`Queue DB saved: ${DB_PATH}`);
+    return true;
+  } catch (e) {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+    logger.error(`Queue DB save failed: ${e.message}`);
+    throw e;
+  }
+}
+
+function withTransaction(fn) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    const changed = fn();
+    db.run('COMMIT');
+    if (changed) {
+      dirty = true;
+      flush();
+    }
+    return changed;
+  } catch (e) {
+    try { db.run('ROLLBACK'); } catch (_) {}
+    throw e;
+  }
 }
 
 // 批量插入新帖（已存在则忽略）
 function add(urls) {
-  let added = 0;
-  const stmt = db.prepare('INSERT OR IGNORE INTO posts (url) VALUES (?)');
-  for (const u of urls) {
-    stmt.run([u]);
-    if (db.getRowsModified() > 0) added++;
-  }
-  stmt.free();
+  let added = withTransaction(() => {
+    let count = 0;
+    const stmt = db.prepare('INSERT OR IGNORE INTO posts (url) VALUES (?)');
+    try {
+      for (const u of urls) {
+        stmt.run([u]);
+        if (db.getRowsModified() > 0) count++;
+      }
+    } finally {
+      stmt.free();
+    }
+    return count;
+  });
   if (added > 0) {
-    save();
     logger.info(`Queue +${added} new posts (total available: ${size()})`);
   }
 }
@@ -76,20 +121,24 @@ function pop() {
 
 // 读取计数 +1
 function increment(url) {
-  db.run(
-    "UPDATE posts SET read_count = read_count + 1, last_read = strftime('%s','now') WHERE url = ?",
-    [url]
-  );
-  save();
+  withTransaction(() => {
+    db.run(
+      "UPDATE posts SET read_count = read_count + 1, last_read = strftime('%s','now') WHERE url = ?",
+      [url]
+    );
+    return db.getRowsModified() > 0;
+  });
 }
 
 // 失败帖标记为已读满，避免同一个异常 URL 连续触发停机
 function skip(url) {
-  db.run(
-    "UPDATE posts SET read_count = 3, last_read = strftime('%s','now') WHERE url = ?",
-    [url]
-  );
-  save();
+  withTransaction(() => {
+    db.run(
+      "UPDATE posts SET read_count = 3, last_read = strftime('%s','now') WHERE url = ?",
+      [url]
+    );
+    return db.getRowsModified() > 0;
+  });
 }
 
 // 当前可读条数
@@ -101,10 +150,11 @@ function size() {
 // 清理 read_count >= 3 且超过7天的旧记录
 function cleanup() {
   const threshold = Math.floor(Date.now() / 1000) - 7 * 86400;
-  db.run('DELETE FROM posts WHERE read_count >= 3 AND last_read < ?', [threshold]);
-  const changed = db.getRowsModified();
+  const changed = withTransaction(() => {
+    db.run('DELETE FROM posts WHERE read_count >= 3 AND last_read < ?', [threshold]);
+    return db.getRowsModified();
+  });
   if (changed > 0) {
-    save();
     logger.info(`Queue cleanup: removed ${changed} old records`);
   }
 }
@@ -117,4 +167,12 @@ function stats() {
   return { total, readable, exhausted };
 }
 
-module.exports = { init, add, pop, increment, skip, size, cleanup, stats };
+function close() {
+  flush();
+  if (db && typeof db.close === 'function') {
+    db.close();
+  }
+  db = null;
+}
+
+module.exports = { init, add, pop, increment, skip, size, cleanup, stats, flush, close };

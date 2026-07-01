@@ -15,12 +15,12 @@ env | grep -v 'no_proxy' | grep -v 'HOSTNAME' >> /etc/environment
 echo "Starting cron daemon..."
 service cron start
 
-# 检查 Bot Token。TG_CHAT_ID 可留空，Bot 首次私聊后自动绑定。
+# 检查 Bot Token。授权需要 TG_CHAT_ID，或 TG_SETUP_CODE + /bind 绑定。
 if [ -z "$TG_TOKEN" ]; then
     echo "[WARNING] TG_TOKEN is not set."
     echo "[WARNING] Telegram Bot will not be able to start correctly."
 else
-    echo "Telegram Bot token configured. TG_CHAT_ID is optional."
+    echo "Telegram Bot token configured. Set TG_CHAT_ID or TG_SETUP_CODE before binding."
 fi
 
 echo "================================================="

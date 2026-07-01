@@ -6,7 +6,7 @@
 TG_TOKEN=<在此填入你的BotToken>
 # 方式 A：直接填写你的 Telegram 数字 Chat ID（向 @userinfobot 发消息可获取）
 # TG_CHAT_ID=<在此填入你的Chat_ID>
-# 方式 B：留空 TG_CHAT_ID，首次私聊 Bot 自动绑定；建议设置绑定口令
+# 方式 B：留空 TG_CHAT_ID 时必须设置绑定口令，首次私聊 Bot 发送 /bind <口令>
 # TG_SETUP_CODE=<自定义一次性绑定口令>
 
 # ===== Bark 推送（可选，仅签到脚本支持）=====

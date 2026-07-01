@@ -2,17 +2,11 @@
 // 调试工具：抓取 /balance 页面，打印活跃度/奖励相关的 HTML 片段
 // 用于排查铜币解析正则是否匹配，正常运行不需要它。
 const fs    = require('fs');
-const os    = require('os');
-const path  = require('path');
 const balance = require('./balance');
+const config = require('../lib/config');
 
-const PROFILE = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
-const DATA_DIR = process.env.V2EX_DATA_DIR || os.homedir();
-const COOKIE_FILE = process.env.COOKIE_FILE
-  || (PROFILE === 'default'
-      ? path.join(DATA_DIR, '.v2ex_cookie')
-      : path.join(DATA_DIR, `.v2ex_cookie.${PROFILE}`));
-const cookie = fs.readFileSync(COOKIE_FILE, 'utf8').trim();
+const cfg = config.getConfig();
+const cookie = fs.readFileSync(cfg.cookieFile, 'utf8').trim();
 
 balance.fetchBalance(cookie).then(resp => {
   const issue = balance.diagnoseResponse(resp);

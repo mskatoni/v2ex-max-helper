@@ -42,6 +42,7 @@ RUN cd checkin && npm install --omit=dev --no-audit --no-fund \
 # 复制业务代码
 COPY checkin/ ./checkin/
 COPY reader/ ./reader/
+COPY lib/ ./lib/
 COPY scripts/entrypoint.sh ./entrypoint.sh
 COPY server.js ./server.js
 

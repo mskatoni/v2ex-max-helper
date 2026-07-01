@@ -21,15 +21,19 @@ const fetcher = require('./fetcher');
 const balance = require('./balance');
 const browser = require('./browser');
 const notify  = require('./notify');
+const behavior = require('./behavior');
+const config  = require('../lib/config');
 
 // ========== 配置 ==========
 const MAX_READ_COUNT    = 1000;   // 每日阅读上限（安全兜底）
 const MIN_READ_COUNT    = 250;    // 每日最低阅读量（且需两次余额变化才退出）
 const MAX_CHANGE_COUNT  = 2;      // 余额变化上限（活跃度两次）
-const BALANCE_CHECK_INTERVAL = 50; // 每读多少篇检查一次余额
 const QUEUE_REFILL_THRESHOLD = 150;// 队列低于此数时补充
 // UTC 06:00 = 北京 14:00，超时强制退出
 const DEADLINE_UTC_HOUR = 6;
+const cfg = config.getConfig();
+const BEHAVIOR = behavior.resolve(cfg.profile);
+const BALANCE_CHECK_INTERVAL = BEHAVIOR.balanceCheckInterval; // 每读多少篇检查一次余额
 
 const isDryRun = process.argv.includes('--dry-run');
 
@@ -108,6 +112,7 @@ async function shutdown(reason, stats) {
     }
   }
   await browser.close();
+  try { queue.close(); } catch (e) { logger.warn(`Queue close failed: ${e.message}`); }
   releaseLock();
   process.exit(0);
 }
@@ -134,6 +139,10 @@ async function main() {
   logger.sep();
   logger.info(`🚀 V2EX Reader 启动 (dry-run=${isDryRun})`);
   logger.info(`限制: 最低 ${MIN_READ_COUNT} 篇且余额变化 ${MAX_CHANGE_COUNT} 次退出 | 最多 ${EFFECTIVE_LIMIT} 篇 | 截止 UTC ${DEADLINE_UTC_HOUR}:00`);
+  logger.info(`行为参数: profile=${cfg.profile} balanceInterval=${BALANCE_CHECK_INTERVAL} humanGap=${BEHAVIOR.humanGapMin}-${BEHAVIOR.humanGapMax}ms memorySettle=${BEHAVIOR.memorySettleMs}ms`);
+  if (BEHAVIOR.usesLegacyGap) {
+    logger.warn('检测到 READ_GAP_MIN/MAX 旧变量，已按 READ_HUMAN_GAP_MIN/MAX 兼容处理');
+  }
   logger.sep();
 
   const startTime = Date.now();
@@ -151,6 +160,8 @@ async function main() {
   if (!cookie) {
     logger.error('无法获取 Cookie，退出');
     await notify.notifySessionExpired();
+    await browser.close();
+    try { queue.close(); } catch (e) { logger.warn(`Queue close failed: ${e.message}`); }
     releaseLock();
     process.exit(1);
   }
@@ -162,6 +173,7 @@ async function main() {
       logger.error(`无法获取余额基线: ${balanceState.message}`);
       await notify.notifySessionExpired();
       await browser.close();
+      try { queue.close(); } catch (e) { logger.warn(`Queue close failed: ${e.message}`); }
       releaseLock();
       process.exit(1);
     }
@@ -322,6 +334,7 @@ main().catch(async (e) => {
   logger.error(`未捕获错误: ${e.message}`);
   logger.error(e.stack || '');
   try { await browser.close(); } catch (_) {}
+  try { queue.close(); } catch (closeErr) { logger.warn(`Queue close failed: ${closeErr.message}`); }
   releaseLock();
   process.exit(1);
 });

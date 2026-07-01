@@ -2,13 +2,14 @@
 // ========== 余额监控 ==========
 const https  = require('https');
 const fs     = require('fs');
-const path   = require('path');
 const logger = require('./logger');
 const notify = require('./notify');
+const config = require('../lib/config');
 
-const DATA_DIR = process.env.V2EX_DATA_DIR || path.join(__dirname, 'data');
-const BALANCE_LOG = path.join(DATA_DIR, 'balance_log.json');
-const BALANCE_STATUS = path.join(DATA_DIR, 'balance_status.json');
+const cfg = config.getConfig();
+const DATA_DIR = cfg.readerDataDir;
+const BALANCE_LOG = cfg.balanceLog;
+const BALANCE_STATUS = cfg.balanceStatus;
 
 const HOST = 'www.v2ex.com';
 

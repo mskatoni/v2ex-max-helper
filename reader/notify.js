@@ -1,51 +1,22 @@
 'use strict';
 // ========== Telegram 推送通知 ==========
 const https  = require('https');
-const fs     = require('fs');
-const path   = require('path');
-const logger = require('./logger');
+const config = require('../lib/config');
 
-// 从环境变量或 ~/.v2ex_env 文件读取配置
-function loadConfig() {
-  // 先尝试读取 env 文件
-  const envFile = path.join(require('os').homedir(), '.v2ex_env');
-  if (fs.existsSync(envFile)) {
-    const lines = fs.readFileSync(envFile, 'utf8').split('\n');
-    for (const line of lines) {
-      const m = line.match(/^([A-Z_]+)=(.+)$/);
-      if (m && !process.env[m[1]]) {
-        process.env[m[1]] = m[2].trim();
-      }
-    }
-  }
-  const dataDir = process.env.V2EX_DATA_DIR || path.join(__dirname, 'data');
-  const authChatFile = path.join(dataDir, '.telegram_chat_id');
-  let chatId = process.env.TG_CHAT_ID || '';
-  if (!chatId && fs.existsSync(authChatFile)) {
-    try {
-      chatId = fs.readFileSync(authChatFile, 'utf8').trim();
-    } catch (_) {}
-  }
-  return {
-    token: process.env.TG_TOKEN || '',
-    chatId,
-  };
-}
-
-const cfg = loadConfig();
+const cfg = config.getConfig();
 
 function isConfigured() {
   // 未配置 Token / Chat ID 时静默跳过推送，不影响主流程
-  return Boolean(cfg.token && cfg.chatId);
+  return Boolean(cfg.telegram.token && cfg.telegram.chatId);
 }
 
 function sendMessage(text) {
   if (!isConfigured()) return Promise.resolve();
   return new Promise((resolve) => {
-    const body = JSON.stringify({ chat_id: cfg.chatId, text, parse_mode: 'HTML' });
+    const body = JSON.stringify({ chat_id: cfg.telegram.chatId, text, parse_mode: 'HTML' });
     const req = https.request({
       hostname: 'api.telegram.org',
-      path:     `/bot${cfg.token}/sendMessage`,
+      path:     `/bot${cfg.telegram.token}/sendMessage`,
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {

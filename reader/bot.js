@@ -9,9 +9,9 @@
 //
 // 配置（环境变量或 ~/.v2ex_env 文件）：
 //   TG_TOKEN    — Telegram Bot Token
-//   TG_CHAT_ID  — 唯一授权用户的 Chat ID（可选；未设置时首次私聊自动绑定）
-//   TG_SETUP_CODE — 可选绑定口令；设置后首次绑定需发送 /bind <code>
-//   READER_LOG  — 阅读脚本日志路径（默认 /var/log/v2ex-reader.log）
+//   TG_CHAT_ID  — 唯一授权用户的 Chat ID（推荐直接配置）
+//   TG_SETUP_CODE — 绑定口令；未配置 TG_CHAT_ID 时必须设置并发送 /bind <code>
+//   READER_LOG  — 阅读脚本日志路径（默认运行时数据目录下的 v2ex-reader.log）
 
 const https  = require('https');
 const http   = require('http');
@@ -19,27 +19,18 @@ const fs     = require('fs');
 const path   = require('path');
 const os     = require('os');
 const { spawn } = require('child_process');
+const config = require('../lib/config');
 
-// ========== 加载配置 ==========
-// 从 ~/.v2ex_env 加载键值对到 process.env（不覆盖已有变量）
-function loadEnvFile() {
-  const envFile = path.join(os.homedir(), '.v2ex_env');
-  if (!fs.existsSync(envFile)) return;
-  for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
-    const m = line.match(/^([A-Z_]+)=(.+)$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
-  }
-}
-loadEnvFile();
-
-const TOKEN           = process.env.TG_TOKEN   || '';
-const SETUP_CODE      = process.env.TG_SETUP_CODE || '';
-const DATA_DIR        = process.env.V2EX_DATA_DIR || path.join(__dirname, 'data');
+// ========== 配置 ==========
+const cfg            = config.getConfig();
+const TOKEN          = cfg.telegram.token;
+const SETUP_CODE     = cfg.telegram.setupCode;
+const DATA_DIR       = cfg.readerDataDir;
 const LOCK_FILE       = path.join(os.tmpdir(), 'v2ex_reader.lock');
-const BALANCE_LOG     = path.join(DATA_DIR, 'balance_log.json');
-const BALANCE_STATUS  = path.join(DATA_DIR, 'balance_status.json');
-const READER_LOG      = process.env.READER_LOG || path.join(DATA_DIR, 'v2ex-reader.log');
-const AUTH_CHAT_FILE  = path.join(DATA_DIR, '.telegram_chat_id');
+const BALANCE_LOG     = cfg.balanceLog;
+const BALANCE_STATUS  = cfg.balanceStatus;
+const READER_LOG      = cfg.readerLog;
+const AUTH_CHAT_FILE  = cfg.authChatFile;
 
 let ALLOWED_CHAT_ID = loadAuthorizedChatId();   // 硬锁，唯一授权用户
 
@@ -66,7 +57,7 @@ function shouldWriteLog(lineLevel) {
 }
 
 function loadAuthorizedChatId() {
-  if (process.env.TG_CHAT_ID) return process.env.TG_CHAT_ID.trim();
+  if (cfg.telegram.chatIdSource === 'env') return cfg.telegram.chatId;
   try {
     if (fs.existsSync(AUTH_CHAT_FILE)) {
       return fs.readFileSync(AUTH_CHAT_FILE, 'utf8').trim();
@@ -76,20 +67,12 @@ function loadAuthorizedChatId() {
 }
 
 function saveAuthorizedChatId(chatId) {
-  const id = String(chatId || '').trim();
-  if (!id) throw new Error('empty chat id');
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(AUTH_CHAT_FILE, `${id}\n`, { mode: 0o600 });
-  ALLOWED_CHAT_ID = id;
-  process.env.TG_CHAT_ID = id;
+  ALLOWED_CHAT_ID = config.saveAuthorizedChatId(chatId, cfg);
 }
 
 // Cookie 文件路径（与 browser.js / v2ex-checkin.js 保持一致）
-const PROFILE     = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
-const COOKIE_FILE = process.env.COOKIE_FILE
-  || (PROFILE === 'default'
-      ? path.join(process.env.V2EX_DATA_DIR || os.homedir(), '.v2ex_cookie')
-      : path.join(process.env.V2EX_DATA_DIR || os.homedir(), `.v2ex_cookie.${PROFILE}`));
+const PROFILE     = cfg.profile;
+const COOKIE_FILE = cfg.cookieFile;
 
 // V2EX 关键 Cookie 字段白名单（按重要性排列）
 const V2EX_COOKIE_KEYS = [
@@ -915,15 +898,22 @@ async function handleUnboundMessage(msg) {
   }
 
   const text = (msg.text || '').trim();
-  if (SETUP_CODE) {
-    const bindCommand = `/bind ${SETUP_CODE}`;
-    if (text !== SETUP_CODE && text !== bindCommand) {
-      await sendDirectMsg(
-        msg.chat.id,
-        '🔐 <b>Bot 尚未绑定授权用户</b>\n\n请发送 <code>/bind 你的绑定口令</code> 完成绑定。'
-      );
-      return;
-    }
+  if (!SETUP_CODE) {
+    await sendDirectMsg(
+      msg.chat.id,
+      '🔐 <b>Bot 尚未绑定授权用户</b>\n\n为避免被陌生人抢先绑定，已禁用无口令首次绑定。\n请先在环境变量或 <code>~/.v2ex_env</code> 中配置 <code>TG_CHAT_ID</code>，或设置 <code>TG_SETUP_CODE</code> 后重启 Bot，再发送 <code>/bind 你的绑定口令</code>。'
+    );
+    console.log(`[BOT] 拒绝无口令首次绑定尝试, 来源 chat_id: ${maskId(msg.chat.id)}`);
+    return;
+  }
+
+  const bindMatch = text.match(/^\/bind\s+(.+)$/);
+  if (!bindMatch || bindMatch[1].trim() !== SETUP_CODE) {
+    await sendDirectMsg(
+      msg.chat.id,
+      '🔐 <b>Bot 尚未绑定授权用户</b>\n\n请发送 <code>/bind 你的绑定口令</code> 完成绑定。'
+    );
+    return;
   }
 
   try {
@@ -997,7 +987,7 @@ async function poll() {
 if (ALLOWED_CHAT_ID) {
   console.log(`[BOT] V2EX Bot 启动，授权 Chat ID: ${maskId(ALLOWED_CHAT_ID)}`);
 } else {
-  console.log('[BOT] V2EX Bot 启动，尚未绑定授权 Chat ID，等待首次私聊绑定');
+  console.log('[BOT] V2EX Bot 启动，尚未绑定授权 Chat ID');
 }
 
 (async () => {
@@ -1074,7 +1064,7 @@ if (ALLOWED_CHAT_ID) {
   } else if (SETUP_CODE) {
     console.log('[BOT] 未配置 TG_CHAT_ID；请在 Telegram 私聊 Bot 发送 /bind <TG_SETUP_CODE>');
   } else {
-    console.log('[BOT] 未配置 TG_CHAT_ID；将自动绑定第一位私聊 Bot 的用户');
+    console.log('[BOT] 未配置 TG_CHAT_ID / TG_SETUP_CODE；为安全起见不会自动绑定任何用户');
   }
 
   // 启动内置调度器

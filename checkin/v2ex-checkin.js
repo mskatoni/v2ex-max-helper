@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.3.1
+ * Version: v1.3.2
  *
  * 用法：
  *   保存 Cookie：
@@ -26,26 +26,21 @@ const https = require('https');
 const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
-const os    = require('os');
 const url   = require('url');
+const config = require('../lib/config');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.3.1';
+const SCRIPT_VERSION = 'v1.3.2';
 const HOST           = 'www.v2ex.com';
 const MAX_RETRY      = 3;
 
-// 多账号与目录支持：通过 V2EX_DATA_DIR / V2EX_PROFILE 区分账号的 Cookie 文件
-const DATA_DIR = process.env.V2EX_DATA_DIR || os.homedir();
-const PROFILE = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
-const COOKIE_FILE = process.env.COOKIE_FILE
-  || (PROFILE === 'default'
-      ? path.join(DATA_DIR, '.v2ex_cookie')
-      : path.join(DATA_DIR, `.v2ex_cookie.${PROFILE}`));
+const cfg = config.getConfig();
+const COOKIE_FILE = cfg.cookieFile;
 
-// 推送配置（从环境变量读取，不硬编码）
-const BARK_URL       = process.env.BARK_URL    || '';   // e.g. https://api.day.app/YOUR_KEY
-const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN || process.env.TG_TOKEN || '';
-const TG_CHAT_ID     = process.env.TG_CHAT_ID   || '';
+// 推送配置（从环境变量或 ~/.v2ex_env 读取，不硬编码）
+const BARK_URL       = cfg.barkUrl;                 // e.g. https://api.day.app/YOUR_KEY
+const TG_BOT_TOKEN   = cfg.telegram.checkinToken;   // TG_BOT_TOKEN 优先，TG_TOKEN 兼容 fallback
+const TG_CHAT_ID     = cfg.telegram.chatId;
 
 const COMMON_HEADERS = {
   'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',

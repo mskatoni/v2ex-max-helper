@@ -359,7 +359,7 @@ echo "  └───────────────────────
 
 echo
 info "下一步："
-echo "  • 用 Telegram Bot：把 TG_TOKEN 写入 ~/.v2ex_env；TG_CHAT_ID 可留空后首次私聊绑定"
+echo "  • 用 Telegram Bot：把 TG_TOKEN 写入 ~/.v2ex_env；并配置 TG_CHAT_ID，或设置 TG_SETUP_CODE 后用 /bind 绑定"
 if [[ $HAS_SYSTEMD -eq 1 ]]; then
   echo "  • 查看定时器：systemctl list-timers 'v2ex-*'"
   echo "  • 查看签到日志：journalctl -u v2ex-checkin -n 50"
