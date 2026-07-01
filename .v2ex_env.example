@@ -15,7 +15,8 @@ TG_TOKEN=<在此填入你的BotToken>
 # ===== 阅读日志路径（可选）=====
 # READER_LOG=/var/log/v2ex-reader.log
 
-# ===== 本机代理（可选）=====
+# ===== 本机代理（可选，默认关闭）=====
 # 只允许 localhost / 127.0.0.1 / ::1，不支持远端代理
+# V2EX_PROXY_ENABLE=1
 # V2EX_PROXY=http://127.0.0.1:7890
 # V2EX_PROXY=socks5://127.0.0.1:7890
