@@ -25,7 +25,6 @@
 const https = require('https');
 const http  = require('http');
 const fs    = require('fs');
-const path  = require('path');
 const url   = require('url');
 const config = require('../lib/config');
 
@@ -65,11 +64,7 @@ function readCookie() {
 
 function writeCookie(cookie) {
   try {
-    const dir = path.dirname(COOKIE_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(COOKIE_FILE, cookie.trim(), { mode: 0o600 });
+    config.writeFileAtomic(COOKIE_FILE, cookie.trim(), { mode: 0o600 });
     // 同步更新进程内 env（跨模块复用）
     process.env.V2EX_COOKIE = cookie;
     return true;

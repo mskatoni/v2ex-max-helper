@@ -50,7 +50,8 @@ COPY server.js ./server.js
 RUN chmod +x ./entrypoint.sh
 
 # 创建非 root 用户（安全）
-RUN groupadd -r v2ex && useradd -r -g v2ex -d /app v2ex \
+RUN groupadd -r v2ex && useradd -r -g v2ex -d /app/data v2ex \
+    && mkdir -p /app/data \
     && chown -R v2ex:v2ex /app
 
 USER v2ex
@@ -58,6 +59,7 @@ USER v2ex
 EXPOSE 8080
 
 ENV NODE_ENV=production
+ENV HOME=/app/data
 ENV V2EX_DATA_DIR=/app/data
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
 

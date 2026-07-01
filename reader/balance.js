@@ -29,7 +29,7 @@ function ensureDataDir() {
 function writeBalanceStatus(status) {
   try {
     ensureDataDir();
-    fs.writeFileSync(BALANCE_STATUS, JSON.stringify({
+    config.writeFileAtomic(BALANCE_STATUS, JSON.stringify({
       time: new Date().toISOString(),
       ...status,
     }, null, 2));
@@ -184,7 +184,7 @@ function saveBalanceLog(html) {
       copper: balance.copper,
       lastTime: new Date().toISOString()
     };
-    fs.writeFileSync(BALANCE_LOG, JSON.stringify(log, null, 2));
+    config.writeFileAtomic(BALANCE_LOG, JSON.stringify(log, null, 2));
   } catch (e) {
     logger.warn(`Balance log write failed: ${e.message}`);
   }
@@ -262,10 +262,13 @@ async function check(cookie) {
       return changeCount;
     }
 
-    if (copper !== baseline) {
+    if (copper > baseline) {
       changeCount++;
       logger.ok(`Balance changed! ${baseline} → ${copper} 铜币 (变化第 ${changeCount} 次)`);
       await notify.notifyBalanceChanged(baseline, copper, changeCount);
+      baseline = copper;
+    } else if (copper < baseline) {
+      logger.warn(`Balance decreased: ${baseline} → ${copper} 铜币（更新基线，不计入活跃度变化）`);
       baseline = copper;
     } else {
       logger.info(`Balance check: ${copper} 铜币（无变化，已触发 ${changeCount} 次）`);

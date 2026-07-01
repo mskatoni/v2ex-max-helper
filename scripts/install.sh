@@ -152,7 +152,7 @@ else
           if [[ -n "${src_dir:-}" ]]; then
             rsync -a --exclude='node_modules' --exclude='.git' \
               "${src_dir}/" "$PROJ_DIR/" 2>/dev/null \
-              || cp -a "${src_dir}/"* "$PROJ_DIR/" 2>/dev/null || true
+              || cp -a "${src_dir}/." "$PROJ_DIR/" 2>/dev/null || true
           fi
           rm -rf "$tmp"
           SUMMARY_COMPONENTS+=("项目代码（zip 重新下载）")

@@ -34,7 +34,7 @@ const AUTH_CHAT_FILE  = cfg.authChatFile;
 
 let ALLOWED_CHAT_ID = loadAuthorizedChatId();   // 硬锁，唯一授权用户
 
-const LOG_LEVEL_FILE  = path.join(DATA_DIR, 'log_level.txt');
+const LOG_LEVEL_FILE  = cfg.logLevelFile;
 let currentLogLevel = 'OFF';
 try {
   if (fs.existsSync(LOG_LEVEL_FILE)) {
@@ -319,7 +319,7 @@ async function handleDebug(levelArg, messageId = null) {
     }
     currentLogLevel = targetLevel;
     try {
-      fs.writeFileSync(LOG_LEVEL_FILE, currentLogLevel, 'utf8');
+      config.writeFileAtomic(LOG_LEVEL_FILE, currentLogLevel, 'utf8');
     } catch (_) {}
     if (messageId) {
       return renderDebugKeyboard(messageId);
@@ -519,7 +519,7 @@ async function handleCookieImport(text) {
 
   // 写入文件
   try {
-    fs.writeFileSync(COOKIE_FILE, finalCookie, { mode: 0o600 });
+    config.writeFileAtomic(COOKIE_FILE, finalCookie, { mode: 0o600 });
   } catch (e) {
     await sendMsg(`❌ Cookie 写入失败: ${e.message}`);
     return true;
@@ -1019,11 +1019,7 @@ if (ALLOWED_CHAT_ID) {
   // 从环境变量 V2EX_COOKIE 初始化 Cookie 文件 (用于 Render 等临时容器持久化)
   if (process.env.V2EX_COOKIE && !fs.existsSync(COOKIE_FILE)) {
     try {
-      const cookieDir = path.dirname(COOKIE_FILE);
-      if (!fs.existsSync(cookieDir)) {
-        fs.mkdirSync(cookieDir, { recursive: true });
-      }
-      fs.writeFileSync(COOKIE_FILE, process.env.V2EX_COOKIE.trim(), { mode: 0o600 });
+      config.writeFileAtomic(COOKIE_FILE, process.env.V2EX_COOKIE.trim(), { mode: 0o600 });
       console.log('[BOT] 从环境变量 V2EX_COOKIE 初始化 Cookie 文件成功');
     } catch (e) {
       console.error(`[BOT] 从环境变量 V2EX_COOKIE 初始化 Cookie 失败: ${e.message}`);

@@ -42,7 +42,13 @@ function fetchPage(reqPath, cookie) {
     const req = https.request(opts, (res) => {
       let body = '';
       res.on('data', c => body += c);
-      res.on('end', () => resolve(body));
+      res.on('end', () => {
+        const statusCode = res.statusCode || 0;
+        if (statusCode >= 300) {
+          logger.warn(`Fetcher ${reqPath} returned HTTP ${statusCode}`);
+        }
+        resolve(body);
+      });
     });
     req.on('error', reject);
     req.setTimeout(20000, () => req.destroy(new Error('timeout')));

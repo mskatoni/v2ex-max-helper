@@ -13,6 +13,9 @@ services:
     environment:
       - TZ=UTC
 
+    mem_limit: 2g
+    mem_reservation: 512m
+
     # ===== 安全加固 =====
     security_opt:
       - no-new-privileges:true
