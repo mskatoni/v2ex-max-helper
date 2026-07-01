@@ -14,3 +14,7 @@ TG_TOKEN=<在此填入你的BotToken>
 
 # ===== 阅读日志路径（可选）=====
 # READER_LOG=/var/log/v2ex-reader.log
+
+# ===== HTTPS 代理（可选）=====
+# 只接受 https://，http:// / socks:// 会被拒绝
+# V2EX_HTTPS_PROXY=https://user:pass@proxy.example.com:8443

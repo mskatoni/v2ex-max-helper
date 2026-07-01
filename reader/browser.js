@@ -6,6 +6,7 @@ const logger      = require('./logger');
 const fingerprint = require('./fingerprint');
 const behavior    = require('./behavior');
 const config      = require('../lib/config');
+const secureProxy = require('../lib/secure-proxy');
 
 // ===== 多账号 / 指纹隔离 =====
 // 通过 V2EX_PROFILE（或默认 'default'）区分账号。每个 profile 拥有：
@@ -82,9 +83,6 @@ async function launch(dryRun = false) {
     logger.warn('检测到 READ_GAP_MIN/MAX 旧变量，已作为 READ_HUMAN_GAP_MIN/MAX 兼容处理');
   }
 
-  // 动态代理检测：如果环境变量设置了代理，则启用代理。
-  const proxyServer = process.env.HTTP_PROXY || process.env.http_proxy || '';
-
   const launchOptions = {
     executablePath: process.env.CHROME_BIN || undefined,
     headless: process.env.HEADLESS !== 'false',
@@ -113,9 +111,10 @@ async function launch(dryRun = false) {
     },
   };
 
-  if (proxyServer) {
-    launchOptions.proxy = { server: proxyServer };
-    logger.info(`浏览器启用代理: ${proxyServer}`);
+  const proxy = secureProxy.getPlaywrightProxy();
+  if (proxy) {
+    launchOptions.proxy = proxy;
+    logger.info(`浏览器启用 HTTPS 代理: ${secureProxy.redactProxyUrl(proxy.server)}`);
   }
 
   ctx = await chromium.launchPersistentContext(USER_DATA_DIR, launchOptions);

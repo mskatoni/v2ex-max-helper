@@ -104,6 +104,8 @@ Bot 作为常驻进程运行，负责远程控制和状态查询。
 | **签到 + 自动阅读** | **512 MB** | **建议 1 GB** | Chromium 峰值约 400~700 MB，**务必配 Swap** |
 | **签到 + 自动阅读（推荐）** | **2 GB** | 可不开 | 运行稳定 |
 
+需要代理时设置 `V2EX_HTTPS_PROXY=https://user:pass@host:port`；项目拒绝 `http://`、`socks://` 等明文或非 HTTPS 代理。
+
 ---
 
 ### 方式一：Docker Compose（推荐）
