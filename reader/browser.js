@@ -114,7 +114,7 @@ async function launch(dryRun = false) {
   const proxy = secureProxy.getPlaywrightProxy();
   if (proxy) {
     launchOptions.proxy = proxy;
-    logger.info(`浏览器启用 HTTPS 代理: ${secureProxy.redactProxyUrl(proxy.server)}`);
+    logger.info(`浏览器启用本机代理: ${secureProxy.redactProxyUrl(proxy.server)}`);
   }
 
   ctx = await chromium.launchPersistentContext(USER_DATA_DIR, launchOptions);
