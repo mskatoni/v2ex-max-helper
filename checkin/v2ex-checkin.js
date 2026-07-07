@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.3.2
+ * Version: v1.3.3
  *
  * 用法：
  *   保存 Cookie：
@@ -29,7 +29,7 @@ const url   = require('url');
 const config = require('../lib/config');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.3.2';
+const SCRIPT_VERSION = 'v1.3.3';
 const HOST           = 'www.v2ex.com';
 const MAX_RETRY      = 3;
 
@@ -40,6 +40,8 @@ const COOKIE_FILE = cfg.cookieFile;
 const BARK_URL       = cfg.barkUrl;                 // e.g. https://api.day.app/YOUR_KEY
 const TG_BOT_TOKEN   = cfg.telegram.checkinToken;   // TG_BOT_TOKEN 优先，TG_TOKEN 兼容 fallback
 const TG_CHAT_ID     = cfg.telegram.chatId;
+const FEISHU_ENABLED = cfg.feishu.enabled;
+const FEISHU_WEBHOOK = cfg.feishu.webhook;
 
 const COMMON_HEADERS = {
   'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -186,8 +188,41 @@ function sendTelegram(title, msg) {
   return fetchUrl(target, '').catch(() => {});
 }
 
+function sendFeishu(title, msg) {
+  if (!FEISHU_ENABLED || !FEISHU_WEBHOOK) return Promise.resolve();
+  return new Promise((resolve) => {
+    let target;
+    try {
+      target = new url.URL(FEISHU_WEBHOOK);
+    } catch (_) {
+      resolve();
+      return;
+    }
+    const body = JSON.stringify({
+      msg_type: 'text',
+      content: { text: `V2EX | ${title}\n${msg}` },
+    });
+    const req = https.request({
+      hostname: target.hostname,
+      path: `${target.pathname}${target.search}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      res.resume();
+      res.on('end', resolve);
+    });
+    req.on('error', resolve);
+    req.setTimeout(10000, () => req.destroy());
+    req.write(body);
+    req.end();
+  });
+}
+
 function notify(title, msg) {
-  return Promise.all([sendBark(title, msg), sendTelegram(title, msg)]);
+  return Promise.all([sendBark(title, msg), sendTelegram(title, msg), sendFeishu(title, msg)]);
 }
 
 // ========== 解析函数 ==========

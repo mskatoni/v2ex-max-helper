@@ -4,7 +4,7 @@
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.3.2-blue)
+![Version](https://img.shields.io/badge/version-v1.3.3-blue)
 
 纯 Node.js 实现，可部署在任意 VPS、Docker 或 Render 上挂机运行。包含两个相互独立、可单独使用的模块：
 
@@ -104,7 +104,9 @@ Bot 作为常驻进程运行，负责远程控制和状态查询。
 | **签到 + 自动阅读** | **512 MB** | **建议 1 GB** | Chromium 峰值约 400~700 MB，**务必配 Swap** |
 | **签到 + 自动阅读（推荐）** | **2 GB** | 可不开 | 运行稳定 |
 
-代理默认关闭。确实需要时设置 `V2EX_PROXY_ENABLE=1`，并指定本机代理，例如 `V2EX_PROXY=http://127.0.0.1:7890` 或 `V2EX_PROXY=socks5://127.0.0.1:7890`；项目拒绝远端代理。
+代理默认关闭。确实需要时设置 `V2EX_PROXY_ENABLE=1`，并指定本机代理，例如 `V2EX_PROXY=http://127.0.0.1:7890` 或 `V2EX_PROXY=socks5://127.0.0.1:7890`。代理服务不限定 mihomo，也可以是 xray-core、sing-box、Clash、Surge、gost 等；如果代理在局域网另一台机器上，需要额外设置 `V2EX_PROXY_ALLOW_LAN=1`，项目仍拒绝公网代理。
+
+多账号串行阅读可通过 `V2EX_PROFILE_LIST=acc1,acc2` 开启，最多读取前 6 个 profile；未配置时保持单账号行为。Telegram 面板中的“时段分块”可查看窗口并手动启动串行签到 + 阅读。飞书通知 / 交互 Bot 属于社区讨论阶段能力，默认关闭，如需调整功能或部署方式，欢迎提交 issue 或 PR。
 
 ---
 
@@ -264,7 +266,7 @@ systemctl status v2ex-bot                     # 查看状态
 ```
 v2ex-max-helper/
 ├── checkin/                 # 签到模块
-│   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.3.2）
+│   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.3.3）
 │   └── package.json
 ├── reader/                  # 自动阅读 + Bot 模块
 │   ├── main.js              # 阅读主调度器（支持 --dry-run / --limit）
@@ -381,3 +383,11 @@ rm -f ~/.v2ex_cookie ~/.v2ex_env
 - ©️ 须保留原作者署名并标明改动。
 
 > 注：因含「禁止商用」条款，本许可证非 OSI 认证的开源许可证，仅限个人、学习与非商业自动化使用。
+
+## 🙏 致谢
+
+- [zFDT](https://github.com/zFDT)：PR #3 中关于飞书与代理配置的讨论和代码参考。
+
+## ⭐ Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=mskatoni/v2ex-max-helper&type=Date)](https://www.star-history.com/#mskatoni/v2ex-max-helper&Date)

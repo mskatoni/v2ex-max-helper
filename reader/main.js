@@ -37,6 +37,14 @@ const BALANCE_CHECK_INTERVAL = BEHAVIOR.balanceCheckInterval; // 每读多少篇
 
 const isDryRun = process.argv.includes('--dry-run');
 
+function intEnv(name, fallback) {
+  const value = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const READ_MAX_RUNTIME_MS = intEnv('READ_MAX_RUNTIME_MS', 0);
+const READ_DISABLE_DEADLINE = /^(1|true|yes|on)$/i.test(String(process.env.READ_DISABLE_DEADLINE || '').trim());
+
 // --limit N 覆盖最大阅读数（测试用）
 function parseLimit() {
   const idx = process.argv.indexOf('--limit');
@@ -76,11 +84,15 @@ function isProcessAlive(pid) {
 const hasExplicitLimit = process.argv.includes('--limit');
 function isPastDeadline() {
   // dry-run 或手动指定 --limit 时不检查截止时间
-  if (isDryRun || hasExplicitLimit) return false;
+  if (READ_DISABLE_DEADLINE || isDryRun || hasExplicitLimit) return false;
   const h = new Date().getUTCHours();
   // 脚本预期 01:15 UTC 启动，06:00 UTC 截止
   // 只在 UTC 06:00~23:59 期间判定为超时（避免 00:xx~01:xx 启动前误判）
   return h >= DEADLINE_UTC_HOUR;
+}
+
+function isPastRuntime(startTime) {
+  return READ_MAX_RUNTIME_MS > 0 && Date.now() - startTime >= READ_MAX_RUNTIME_MS;
 }
 
 // ========== 优雅退出 ==========
@@ -139,6 +151,9 @@ async function main() {
   logger.sep();
   logger.info(`🚀 V2EX Reader 启动 (dry-run=${isDryRun})`);
   logger.info(`限制: 最低 ${MIN_READ_COUNT} 篇且余额变化 ${MAX_CHANGE_COUNT} 次退出 | 最多 ${EFFECTIVE_LIMIT} 篇 | 截止 UTC ${DEADLINE_UTC_HOUR}:00`);
+  if (READ_MAX_RUNTIME_MS > 0) {
+    logger.info(`运行时长上限: ${Math.round(READ_MAX_RUNTIME_MS / 60000)} 分钟`);
+  }
   logger.info(`行为参数: profile=${cfg.profile} balanceInterval=${BALANCE_CHECK_INTERVAL} humanGap=${BEHAVIOR.humanGapMin}-${BEHAVIOR.humanGapMax}ms memorySettle=${BEHAVIOR.memorySettleMs}ms`);
   if (BEHAVIOR.usesLegacyGap) {
     logger.warn('检测到 READ_GAP_MIN/MAX 旧变量，已按 READ_HUMAN_GAP_MIN/MAX 兼容处理');
@@ -200,6 +215,11 @@ async function main() {
     if (isPastDeadline()) {
       stats.elapsed = elapsed(startTime);
       await shutdown(`超过截止时间 UTC ${DEADLINE_UTC_HOUR}:00`, stats);
+    }
+
+    if (isPastRuntime(startTime)) {
+      stats.elapsed = elapsed(startTime);
+      await shutdown(`达到运行时长上限 ${Math.round(READ_MAX_RUNTIME_MS / 60000)} 分钟`, stats);
     }
 
     // 取帖子

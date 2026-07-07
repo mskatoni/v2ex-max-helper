@@ -176,9 +176,8 @@ function sendDirectMsg(chatId, text) {
 
 // ========== 命令处理 ==========
 
-async function handleStart() {
-  const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n欢迎回来！我是你的专属 V2EX 助手。我已成功与你的账户绑定并验证通过。\n\n你可以通过直接粘贴 Cookie 导入登录态，也可以使用下方的键盘快捷运行任务或管理设置：`;
-  const replyMarkup = {
+function getMainKeyboardMarkup() {
+  return {
     inline_keyboard: [
       [
         { text: '✅ 运行签到', callback_data: 'run_checkin' },
@@ -186,15 +185,26 @@ async function handleStart() {
       ],
       [
         { text: '💰 余额查询', callback_data: 'query_balance' },
+        { text: '📦 任务状态', callback_data: 'query_tasks' }
+      ],
+      [
+        { text: '🧩 时段分块', callback_data: 'show_profile_slots' },
         { text: '⚙️ 日志级别', callback_data: 'config_debug' }
       ],
       [
-        { text: '📦 任务状态', callback_data: 'query_tasks' },
-        { text: '🛑 停止运行', callback_data: 'stop_task' }
+        { text: '🛑 停止运行', callback_data: 'stop_task' },
+        { text: '🍪 导入 Cookie', callback_data: 'show_cookie_help' }
+      ],
+      [
+        { text: 'ℹ️ 命令帮助', callback_data: 'show_help' }
       ]
     ]
   };
-  return sendMsgWithKeyboard(text, replyMarkup);
+}
+
+async function handleStart() {
+  const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n欢迎回来！你可以直接使用下方按钮完成常用操作；也可以直接粘贴 Cookie 文本，Bot 会自动识别并导入。`;
+  return sendMsgWithKeyboard(text, getMainKeyboardMarkup());
 }
 
 async function handleHelp() {
@@ -208,16 +218,28 @@ async function handleHelp() {
                `⚙️ <b>脚本控制</b>: \n` +
                `- <code>/checkin</code>: 立刻开跑手动签到测试\n` +
                `- <code>/read [数量]</code>: 触发手动阅读测试（默认 5 篇）\n` +
+               `- 面板「时段分块」: 查看多账号窗口，并手动启动串行签到 + 阅读\n` +
                `- <code>/stop</code>: 紧急打断正在运行中的阅读/签到任务\n\n` +
                `🔧 <b>日志与设置</b>: \n` +
                `- <code>/debug [级别]</code>: 查看/修改日志级别（OFF / ERROR / WARN / INFO）\n` +
                `- <code>/cookie [内容]</code>: 手动识别并导入新的 V2EX Cookie\n\n` +
                `💡 <b>小提示</b>：你也可以直接把含有 Cookie 的文本粘贴给我，我会自动智能识别并合并导入。`;
-  return sendMsg(text);
+  return sendMsgWithKeyboard(text, getMainKeyboardMarkup());
+}
+
+async function handleCookieHelp(messageId = null) {
+  const text = `🍪 <b>导入 Cookie</b>\n\n请直接把完整 V2EX Cookie 文本粘贴到当前私聊，Bot 会自动识别、合并并验证登录态。\n\n也可以使用命令：<code>/cookie 你的Cookie内容</code>`;
+  const replyMarkup = { inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]] };
+  if (messageId) return editMsgText(messageId, text, replyMarkup);
+  return sendMsgWithKeyboard(text, replyMarkup);
 }
 
 async function handleTasks() {
   if (!fs.existsSync(LOCK_FILE)) {
+    if (runningTask || profileSequenceRunning) {
+      const detail = runningTask || '多账号串行队列';
+      return sendMsg(`ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 当前任务: <code>${escapeHtml(detail)}</code>`);
+    }
     return sendMsg('ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)');
   }
   try {
@@ -374,7 +396,7 @@ async function handleRead(limitArg, messageId = null) {
     return;
   }
   
-  const text = `📖 <b>手动阅读控制面板</b>\n\n日常活跃度奖励建议阅读 5 ~ 15 篇文章。\n请选择本次阅读的文章篇数：`;
+  const text = `📖 <b>手动阅读控制面板</b>\n\n请选择本次阅读的文章篇数：`;
   const replyMarkup = {
     inline_keyboard: [
       [
@@ -382,8 +404,8 @@ async function handleRead(limitArg, messageId = null) {
         { text: '10 篇', callback_data: 'trigger_read_10' }
       ],
       [
-        { text: '20 篇', callback_data: 'trigger_read_20' },
-        { text: '50 篇', callback_data: 'trigger_read_50' }
+        { text: '50 篇', callback_data: 'trigger_read_50' },
+        { text: '250 篇', callback_data: 'trigger_read_250' }
       ],
       [
         { text: '◀️ 返回面板', callback_data: 'go_to_start' }
@@ -565,28 +587,56 @@ async function handleCookieImport(text) {
 // ========== 内置调度器（替代 Docker cron，Render 友好）==========
 
 let runningTask = null; // 防止任务重叠
+let profileSequenceRunning = false;
 
-function runScript(name, command, args, cwd) {
-  if (runningTask) {
-    console.log(`[调度器] 跳过 ${name}，上一个任务 ${runningTask} 还在运行`);
-    return;
+const MAX_PROFILE_COUNT = 6;
+
+function parseProfileList() {
+  const raw = (process.env.V2EX_PROFILE_LIST || '').trim();
+  if (!raw) return [];
+  const seen = new Set();
+  const profiles = [];
+  for (const item of raw.split(',')) {
+    const profile = item.trim();
+    if (!profile || seen.has(profile)) continue;
+    seen.add(profile);
+    if (profiles.length >= MAX_PROFILE_COUNT) {
+      console.warn(`[调度器] V2EX_PROFILE_LIST 最多支持 ${MAX_PROFILE_COUNT} 个 profile，已忽略后续配置`);
+      break;
+    }
+    profiles.push(profile);
   }
+  return profiles;
+}
 
-  // 检查 Cookie 文件是否存在（无 cookie 时跳过，不崩溃）
-  if (!fs.existsSync(COOKIE_FILE)) {
-    console.log(`[调度器] 跳过 ${name}，Cookie 文件不存在，请先通过 TG 导入`);
-    return;
+const PROFILE_LIST = parseProfileList();
+const MULTI_PROFILE_MODE = PROFILE_LIST.length > 0;
+const PROFILE_TIME_SLOT_HOURS = Math.max(1, parseFloat(process.env.PROFILE_TIME_SLOT_HOURS || '4') || 4);
+const PROFILE_TIME_SLOT_MS = Math.round(PROFILE_TIME_SLOT_HOURS * 60 * 60 * 1000);
+const PROFILE_SEQUENCE_START_UTC_MINUTES = 70; // 01:10 UTC
+
+function getProfileCookieFile(profile) {
+  const base = path.join(cfg.cookieBaseDir, '.v2ex_cookie');
+  return profile === 'default' ? base : `${base}.${profile}`;
+}
+
+function childEnvForProfile(profile, extra = {}) {
+  const env = { ...process.env, ...extra, V2EX_PROFILE: profile };
+  if (MULTI_PROFILE_MODE) {
+    delete env.COOKIE_FILE;
+    delete env.V2EX_COOKIE;
   }
+  return env;
+}
 
-  console.log(`[调度器] 启动 ${name}`);
-  runningTask = name;
+function appendTaskLog(name, lineLevel, line) {
+  if (!shouldWriteLog(lineLevel)) return;
+  try {
+    fs.appendFileSync(READER_LOG, `[${new Date().toISOString()}] [${name}] [${lineLevel}] ${line}\n`);
+  } catch (_) {}
+}
 
-  const child = spawn(command, args, {
-    cwd,
-    env: { ...process.env }, // 继承所有环境变量
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
+function pipeTaskOutput(child, name) {
   child.stdout.on('data', d => {
     const dataStr = d.toString();
     const lines = dataStr.split('\n');
@@ -594,18 +644,15 @@ function runScript(name, command, args, cwd) {
       line = line.trim();
       if (!line) continue;
       console.log(`[${name}] ${line}`);
-      
+
       let lineLevel = 'INFO';
       if (line.includes('[ERROR]')) lineLevel = 'ERROR';
       else if (line.includes('[WARN ]') || line.includes('[WARN]')) lineLevel = 'WARN';
-      
-      if (shouldWriteLog(lineLevel)) {
-        try {
-          fs.appendFileSync(READER_LOG, `[${new Date().toISOString()}] [${name}] [${lineLevel}] ${line}\n`);
-        } catch (_) {}
-      }
+
+      appendTaskLog(name, lineLevel, line);
     }
   });
+
   child.stderr.on('data', d => {
     const dataStr = d.toString();
     const lines = dataStr.split('\n');
@@ -613,34 +660,259 @@ function runScript(name, command, args, cwd) {
       line = line.trim();
       if (!line) continue;
       console.error(`[${name}] ${line}`);
-      
+
       let lineLevel = 'ERROR';
       if (line.includes('[WARN ]') || line.includes('[WARN]')) lineLevel = 'WARN';
       else if (line.includes('[INFO ]') || line.includes('[INFO]')) lineLevel = 'INFO';
-      
-      if (shouldWriteLog(lineLevel)) {
-        try {
-          fs.appendFileSync(READER_LOG, `[${new Date().toISOString()}] [${name}] [${lineLevel}] ${line}\n`);
-        } catch (_) {}
-      }
+
+      appendTaskLog(name, lineLevel, line);
     }
   });
+}
 
-  child.on('close', (code) => {
-    console.log(`[调度器] ${name} 退出 (code ${code})`);
-    runningTask = null;
+function runScriptAsync(name, command, args, cwd, options = {}) {
+  if (runningTask) {
+    console.log(`[调度器] 跳过 ${name}，上一个任务 ${runningTask} 还在运行`);
+    return Promise.resolve({ skipped: true });
+  }
+  if (profileSequenceRunning && !options.partOfProfileSequence) {
+    console.log(`[调度器] 跳过 ${name}，多账号串行任务正在运行`);
+    return Promise.resolve({ skipped: true });
+  }
+
+  // 检查 Cookie 文件是否存在（无 cookie 时跳过，不崩溃）
+  const cookieFile = options.cookieFile || COOKIE_FILE;
+  if (options.requireCookie !== false && !fs.existsSync(cookieFile)) {
+    console.log(`[调度器] 跳过 ${name}，Cookie 文件不存在: ${cookieFile}`);
+    return Promise.resolve({ skipped: true });
+  }
+
+  console.log(`[调度器] 启动 ${name}`);
+  runningTask = name;
+
+  const child = spawn(command, args, {
+    cwd,
+    env: options.env || { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  child.on('error', (err) => {
-    console.error(`[调度器] ${name} 启动失败: ${err.message}`);
-    runningTask = null;
+  pipeTaskOutput(child, name);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout = null;
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      runningTask = null;
+      resolve(result);
+    }
+
+    if (options.timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        console.warn(`[调度器] ${name} 超过 ${Math.round(options.timeoutMs / 60000)} 分钟，发送 SIGTERM`);
+        try { child.kill('SIGTERM'); } catch (_) {}
+      }, options.timeoutMs);
+    }
+
+    child.on('close', (code) => {
+      console.log(`[调度器] ${name} 退出 (code ${code})`);
+      finish({ code });
+    });
+
+    child.on('error', (err) => {
+      console.error(`[调度器] ${name} 启动失败: ${err.message}`);
+      finish({ error: err });
+    });
   });
+}
+
+function runScript(name, command, args, cwd) {
+  runScriptAsync(name, command, args, cwd).catch(err => {
+    console.error(`[调度器] ${name} 执行失败: ${err.message}`);
+  });
+}
+
+async function runProfileDailySequence() {
+  if (!MULTI_PROFILE_MODE) {
+    console.log('[调度器] 跳过多账号串行，未配置 V2EX_PROFILE_LIST');
+    return { skipped: true, reason: 'no_profiles' };
+  }
+  if (profileSequenceRunning || runningTask) {
+    const busy = profileSequenceRunning ? '多账号串行任务' : runningTask;
+    console.log(`[调度器] 跳过多账号串行，当前已有任务运行: ${busy}`);
+    return { skipped: true, reason: 'busy' };
+  }
+
+  profileSequenceRunning = true;
+  const results = [];
+  try {
+    console.log(`[调度器] 多账号串行开始: ${PROFILE_LIST.join(', ')} | 每账号窗口约 ${PROFILE_TIME_SLOT_HOURS} 小时`);
+    if (process.env.COOKIE_FILE || process.env.V2EX_COOKIE) {
+      console.warn('[调度器] 多账号模式会忽略 COOKIE_FILE / V2EX_COOKIE，改用按 profile 分隔的 Cookie 文件');
+    }
+
+    for (const profile of PROFILE_LIST) {
+      const env = childEnvForProfile(profile);
+      const cookieFile = getProfileCookieFile(profile);
+      const checkin = await runScriptAsync(`签到(${profile})`, process.execPath, ['../checkin/v2ex-checkin.js'], __dirname, {
+        env,
+        cookieFile,
+        timeoutMs: 15 * 60 * 1000,
+        partOfProfileSequence: true,
+      });
+      const read = await runScriptAsync(`阅读(${profile})`, process.execPath, ['main.js'], __dirname, {
+        env: childEnvForProfile(profile, {
+          READ_DISABLE_DEADLINE: '1',
+          READ_MAX_RUNTIME_MS: String(PROFILE_TIME_SLOT_MS),
+        }),
+        cookieFile,
+        timeoutMs: PROFILE_TIME_SLOT_MS + 5 * 60 * 1000,
+        partOfProfileSequence: true,
+      });
+      results.push({ profile, checkin, read });
+    }
+    console.log('[调度器] 多账号串行结束');
+    return { profiles: PROFILE_LIST.length, results };
+  } finally {
+    profileSequenceRunning = false;
+  }
+}
+
+async function runProfilePingSequence() {
+  if (profileSequenceRunning || runningTask) {
+    console.log('[调度器] 跳过多账号保活，已有任务运行');
+    return;
+  }
+  for (const profile of PROFILE_LIST) {
+    const cookieFile = getProfileCookieFile(profile);
+    await runScriptAsync(`保活(${profile})`, process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname, {
+      env: childEnvForProfile(profile),
+      cookieFile,
+      timeoutMs: 10 * 60 * 1000,
+    });
+  }
+}
+
+function formatHours(hours) {
+  if (Number.isInteger(hours)) return String(hours);
+  return hours.toFixed(2).replace(/\.?0+$/, '');
+}
+
+function formatDayOffset(dayOffset) {
+  if (dayOffset === 0) return '';
+  return dayOffset > 0 ? `+${dayOffset}d` : `${dayOffset}d`;
+}
+
+function getUtcOffsetLabel(date = new Date()) {
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMinutes);
+  const h = String(Math.floor(abs / 60)).padStart(2, '0');
+  const m = String(abs % 60).padStart(2, '0');
+  return `UTC${sign}${h}:${m}`;
+}
+
+function getLocalTimeZoneInfo() {
+  const detected = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const label = process.env.TZ || detected || '本机时区';
+  return `${label} (${getUtcOffsetLabel()})`;
+}
+
+function formatLocalClockFromUtcMinutes(totalUtcMinutes) {
+  const now = new Date();
+  const baseMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0);
+  const base = new Date(baseMs);
+  const target = new Date(baseMs + totalUtcMinutes * 60 * 1000);
+  const baseLocalDay = new Date(base.getFullYear(), base.getMonth(), base.getDate()).getTime();
+  const targetLocalDay = new Date(target.getFullYear(), target.getMonth(), target.getDate()).getTime();
+  const dayOffset = Math.round((targetLocalDay - baseLocalDay) / 86400000);
+  const h = String(target.getHours()).padStart(2, '0');
+  const m = String(target.getMinutes()).padStart(2, '0');
+  return `${h}:${m}${formatDayOffset(dayOffset)}`;
+}
+
+function buildProfileSlotMessage() {
+  const busyText = profileSequenceRunning
+    ? '🟡 多账号串行中'
+    : runningTask
+      ? `🟡 ${escapeHtml(runningTask)} 运行中`
+      : '🟢 空闲';
+
+  if (!MULTI_PROFILE_MODE) {
+    return `🧩 <b>多账号时段分块</b>\n\n` +
+      `当前未启用多账号串行。\n\n` +
+      `配置 <code>V2EX_PROFILE_LIST=acc1,acc2</code> 后，每个 profile 会按顺序执行：签到 → 阅读 → 下一个 profile。\n` +
+      `最多支持 <b>${MAX_PROFILE_COUNT}</b> 个账户；每个账户默认窗口 <code>${formatHours(PROFILE_TIME_SLOT_HOURS)}</code> 小时，可用 <code>PROFILE_TIME_SLOT_HOURS</code> 调整。\n\n` +
+      `状态：${busyText}`;
+  }
+
+  const slotMinutes = Math.max(60, Math.round(PROFILE_TIME_SLOT_HOURS * 60));
+  const totalHours = formatHours((slotMinutes * PROFILE_LIST.length) / 60);
+  const timeZoneLabel = getLocalTimeZoneInfo();
+  const lines = PROFILE_LIST.map((profile, index) => {
+    const start = PROFILE_SEQUENCE_START_UTC_MINUTES + index * slotMinutes;
+    const end = start + slotMinutes;
+    const cookieStatus = fs.existsSync(getProfileCookieFile(profile)) ? '✅ Cookie' : '⚠️ 缺 Cookie';
+    return `${index + 1}. <code>${escapeHtml(profile)}</code> | 本机时间 ${formatLocalClockFromUtcMinutes(start)}-${formatLocalClockFromUtcMinutes(end)} | ${cookieStatus}`;
+  });
+
+  return `🧩 <b>多账号时段分块</b>\n\n` +
+    `账户：<b>${PROFILE_LIST.length}/${MAX_PROFILE_COUNT}</b>\n` +
+    `单账号窗口：<code>${formatHours(PROFILE_TIME_SLOT_HOURS)}</code> 小时\n` +
+    `总串行窗口：约 <code>${totalHours}</code> 小时\n` +
+    `本机时区：<code>${escapeHtml(timeZoneLabel)}</code>\n` +
+    `状态：${busyText}\n\n` +
+    `${lines.join('\n')}\n\n` +
+    `流程：每个 profile 依次执行 <b>签到 → 阅读</b>，同一时间只启动一个子进程。`;
+}
+
+function getProfileSlotKeyboard() {
+  const keyboard = [];
+  if (MULTI_PROFILE_MODE) {
+    keyboard.push([{ text: '▶️ 串行签到+阅读', callback_data: 'run_profile_sequence' }]);
+  }
+  keyboard.push([{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]);
+  return { inline_keyboard: keyboard };
+}
+
+async function startProfileSequenceFromPanel(messageId) {
+  if (!MULTI_PROFILE_MODE) {
+    return editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
+  }
+  if (profileSequenceRunning || runningTask) {
+    return editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
+  }
+
+  const text = `⏳ 已启动多账号串行任务。\n\n` +
+    `本次将按时段依次执行 ${PROFILE_LIST.length} 个 profile：签到 → 阅读 → 下一个 profile。\n` +
+    `单账号窗口约 ${formatHours(PROFILE_TIME_SLOT_HOURS)} 小时。`;
+  await editMsgText(messageId, text, {
+    inline_keyboard: [
+      [{ text: '📦 查看任务状态', callback_data: 'query_tasks' }],
+      [{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]
+    ]
+  });
+
+  runProfileDailySequence()
+    .then(result => {
+      if (result && result.skipped) {
+        return sendMsgWithKeyboard('ℹ️ 多账号串行任务未启动，当前配置或运行状态不满足条件。', getMainKeyboardMarkup());
+      }
+      return sendMsgWithKeyboard(`✅ 多账号串行任务已结束，共处理 ${PROFILE_LIST.length} 个 profile。`, getMainKeyboardMarkup());
+    })
+    .catch(err => {
+      console.error(`[调度器] 面板启动多账号串行失败: ${err.message}`);
+      sendMsgWithKeyboard(`❌ 多账号串行任务异常: ${escapeHtml(err.message)}`, getMainKeyboardMarkup()).catch(() => {});
+    });
 }
 
 function startScheduler() {
   // 用 day-of-year 防止同一天重复执行
   let lastCheckinDOY = -1;
   let lastReadDOY = -1;
+  let lastProfileRunDOY = -1;
 
   setInterval(() => {
     const now = new Date();
@@ -648,6 +920,18 @@ function startScheduler() {
     const m = now.getUTCMinutes();
     // day-of-year 唯一标识每天
     const doy = Math.floor((now - new Date(now.getUTCFullYear(), 0, 0)) / 86400000);
+
+    if (MULTI_PROFILE_MODE) {
+      if (h === 1 && m === 10 && doy !== lastProfileRunDOY) {
+        lastProfileRunDOY = doy;
+        runProfileDailySequence().catch(e => console.error(`[调度器] 多账号串行失败: ${e.message}`));
+      }
+
+      if ([0, 6, 12, 18].includes(h) && m === 0) {
+        runProfilePingSequence().catch(e => console.error(`[调度器] 多账号保活失败: ${e.message}`));
+      }
+      return;
+    }
 
     // 每天 UTC 01:10 签到（当天只执行一次）
     if (h === 1 && m === 10 && doy !== lastCheckinDOY) {
@@ -668,7 +952,11 @@ function startScheduler() {
     }
   }, 60 * 1000); // 每分钟检查一次
 
-  console.log('[调度器] 内置定时任务已启动 (UTC 时钟)');
+  if (MULTI_PROFILE_MODE) {
+    console.log(`[调度器] 内置定时任务已启动 (UTC 时钟，多账号串行: ${PROFILE_LIST.join(', ')})`);
+  } else {
+    console.log('[调度器] 内置定时任务已启动 (UTC 时钟)');
+  }
 }
 
 // ========== 铁墙 HTTP 服务器（满足 Render 端口要求 + 防扫描）==========
@@ -768,7 +1056,7 @@ async function handleMessage(msg) {
   else if (cmd === '/cookie') {
     const cookieText = text.slice(cmd.length).trim();
     if (!cookieText) {
-      await sendMsg('💡 用法：<code>/cookie [粘贴你的V2EX Cookie]</code>\nBot 会自动解析并保存有效字段。');
+      await handleCookieHelp();
     } else {
       const handled = await handleCookieImport(cookieText);
       if (!handled) {
@@ -777,7 +1065,7 @@ async function handleMessage(msg) {
     }
   }
   else if (cmd.startsWith('/')) {
-    await sendMsg('可用命令：\n/sou — 余额记录\n/debug [级别] — 修改日志级别\n/stop — 停止阅读脚本\n/checkin — 运行手动签到\n/read [数量] — 运行手动阅读\n/cookie [内容] — 导入新 Cookie\n/tasks — 任务运行状态\n/help — 显示帮助');
+    await sendMsgWithKeyboard('未识别命令。常用操作都在下方交互面板里，也可以发送 <code>/help</code> 查看文本命令。', getMainKeyboardMarkup());
   } else {
     // 非命令消息：尝试智能识别 Cookie
     const handled = await handleCookieImport(text);
@@ -811,8 +1099,33 @@ async function handleCallbackQuery(query) {
         inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
       });
     }
+    else if (data === 'show_profile_slots') {
+      await editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
+    }
+    else if (data === 'run_profile_sequence') {
+      await startProfileSequenceFromPanel(messageId);
+    }
     else if (data === 'config_debug') {
       await handleDebug(null, messageId);
+    }
+    else if (data === 'show_cookie_help') {
+      await handleCookieHelp(messageId);
+    }
+    else if (data === 'show_help') {
+      const text = `ℹ️ <b>V2EX Max Helper 命令帮助说明</b>\n\n` +
+                   `所有常用操作都已集成到主面板按钮；也可以继续使用文本命令：\n\n` +
+                   `<code>/start</code> 打开主面板\n` +
+                   `<code>/sou</code> 查询余额\n` +
+                   `<code>/tasks</code> 查看任务状态\n` +
+                   `<code>/checkin</code> 手动签到\n` +
+                   `<code>/read [数量]</code> 手动阅读\n` +
+                   `面板「时段分块」查看/启动多账号串行\n` +
+                   `<code>/debug [级别]</code> 日志级别\n` +
+                   `<code>/stop</code> 停止任务\n` +
+                   `<code>/cookie [内容]</code> 导入 Cookie`;
+      await editMsgText(messageId, text, {
+        inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
+      });
     }
     else if (data.startsWith('set_debug_')) {
       const level = data.replace('set_debug_', '');
@@ -822,7 +1135,12 @@ async function handleCallbackQuery(query) {
       let statusText = '';
       let keyboard = [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]];
       if (!fs.existsSync(LOCK_FILE)) {
-        statusText = 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)';
+        if (runningTask || profileSequenceRunning) {
+          const detail = runningTask || '多账号串行队列';
+          statusText = `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 当前任务: <code>${escapeHtml(detail)}</code>`;
+        } else {
+          statusText = 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)';
+        }
       } else {
         const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
         if (pid && isProcessAlive(pid)) {
@@ -867,24 +1185,8 @@ async function handleCallbackQuery(query) {
       }
     }
     else if (data === 'go_to_start') {
-      const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n欢迎回来！我是你的专属 V2EX 助手。我已成功与你的账户绑定并验证通过。\n\n你可以通过直接粘贴 Cookie 导入登录态，也可以使用下方的键盘快捷运行任务或管理设置：`;
-      const replyMarkup = {
-        inline_keyboard: [
-          [
-            { text: '✅ 运行签到', callback_data: 'run_checkin' },
-            { text: '📖 运行阅读', callback_data: 'run_read_panel' }
-          ],
-          [
-            { text: '💰 余额查询', callback_data: 'query_balance' },
-            { text: '⚙️ 日志级别', callback_data: 'config_debug' }
-          ],
-          [
-            { text: '📦 任务状态', callback_data: 'query_tasks' },
-            { text: '🛑 停止运行', callback_data: 'stop_task' }
-          ]
-        ]
-      };
-      await editMsgText(messageId, text, replyMarkup);
+      const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n常用操作都在这里。你也可以直接粘贴 Cookie 文本，Bot 会自动识别并导入。`;
+      await editMsgText(messageId, text, getMainKeyboardMarkup());
     }
   } catch (e) {
     console.error(`[BOT] Callback 处理出错: ${e.message}`);
@@ -1053,10 +1355,10 @@ if (ALLOWED_CHAT_ID) {
   } else {
     startupMsg += '\n✅ Cookie 文件已就绪';
   }
-  startupMsg += '\n\n💡 发送 /start 打开交互遥控中心\n可用命令：/start, /help, /sou, /tasks, /stop, /checkin, /read [数量], /debug [级别], /cookie [内容]';
+  startupMsg += '\n\n💡 发送 /start 打开交互遥控中心；常用操作已集成到按钮面板。';
 
   if (ALLOWED_CHAT_ID) {
-    await sendMsg(startupMsg);
+    await sendMsgWithKeyboard(startupMsg, getMainKeyboardMarkup());
   } else if (SETUP_CODE) {
     console.log('[BOT] 未配置 TG_CHAT_ID；请在 Telegram 私聊 Bot 发送 /bind <TG_SETUP_CODE>');
   } else {

@@ -5,13 +5,30 @@ const config = require('../lib/config');
 
 const cfg = config.getConfig();
 
-function isConfigured() {
+function isTelegramConfigured() {
   // 未配置 Token / Chat ID 时静默跳过推送，不影响主流程
   return Boolean(cfg.telegram.token && cfg.telegram.chatId);
 }
 
-function sendMessage(text) {
-  if (!isConfigured()) return Promise.resolve();
+function isFeishuConfigured() {
+  return Boolean(cfg.feishu.enabled && cfg.feishu.webhook);
+}
+
+function isConfigured() {
+  return isTelegramConfigured() || isFeishuConfigured();
+}
+
+function stripHtml(text) {
+  return String(text || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?(b|code|i|em|strong)>/gi, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function sendTelegram(text) {
+  if (!isTelegramConfigured()) return Promise.resolve();
   return new Promise((resolve) => {
     const body = JSON.stringify({ chat_id: cfg.telegram.chatId, text, parse_mode: 'HTML' });
     const req = https.request({
@@ -28,6 +45,44 @@ function sendMessage(text) {
     req.write(body);
     req.end();
   });
+}
+
+function sendFeishu(text) {
+  if (!isFeishuConfigured()) return Promise.resolve();
+  return new Promise((resolve) => {
+    let target;
+    try {
+      target = new URL(cfg.feishu.webhook);
+    } catch (_) {
+      resolve();
+      return;
+    }
+
+    const body = JSON.stringify({
+      msg_type: 'text',
+      content: { text: `V2EX | ${stripHtml(text)}` },
+    });
+    const req = https.request({
+      hostname: target.hostname,
+      path: `${target.pathname}${target.search}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      res.resume();
+      res.on('end', resolve);
+    });
+    req.on('error', resolve);
+    req.setTimeout(10000, () => req.destroy());
+    req.write(body);
+    req.end();
+  });
+}
+
+function sendMessage(text) {
+  return Promise.all([sendTelegram(text), sendFeishu(text)]).then(() => undefined);
 }
 
 // ========== 预定义通知模板 ==========

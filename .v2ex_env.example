@@ -15,8 +15,23 @@ TG_TOKEN=<在此填入你的BotToken>
 # ===== 阅读日志路径（可选）=====
 # READER_LOG=/var/log/v2ex-reader.log
 
-# ===== 本机代理（可选，默认关闭）=====
-# 只允许 localhost / 127.0.0.1 / ::1，不支持远端代理
+# ===== 多账号串行（可选）=====
+# 最多读取前 6 个 profile；Telegram 面板“时段分块”可查看并手动启动
+# V2EX_PROFILE_LIST=acc1,acc2
+# PROFILE_TIME_SLOT_HOURS=4
+
+# ===== 代理（可选，默认关闭）=====
+# 代理软件不限定 mihomo，也可以是 xray-core、sing-box、Clash、Surge、gost 等
 # V2EX_PROXY_ENABLE=1
+# V2EX_PROXY_ALLOW_LAN=1
 # V2EX_PROXY=http://127.0.0.1:7890
 # V2EX_PROXY=socks5://127.0.0.1:7890
+
+# ===== 飞书（实验/社区讨论，默认关闭）=====
+# FEISHU_ENABLE=1
+# FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/你的KEY
+# FEISHU_BOT_ENABLE=1
+# FEISHU_APP_ID=<飞书应用App ID>
+# FEISHU_APP_SECRET=<飞书应用App Secret>
+# FEISHU_VERIFICATION_TOKEN=<飞书事件订阅校验token>
+# FEISHU_BOT_PORT=6700
