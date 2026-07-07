@@ -148,7 +148,7 @@ TG_SETUP_CODE=首次私聊绑定口令（未填 TG_CHAT_ID 时必填）
 SKIP_READER=1
 ```
 
-Render 免费实例可能休眠，Bot 内置自保活逻辑会在配置 `RENDER_EXTERNAL_URL` 时定期访问自身；稳定性要求更高时建议使用付费实例或外部 pinger。
+Render 免费实例可能休眠，Bot 内置自保活逻辑会在配置 `RENDER_EXTERNAL_URL` 时定期访问自身；同时建议使用 [UptimeRobot](https://uptimerobot.com/) 这类外部监控服务对 Render 服务 URL 做 HTTP 保活。稳定性要求更高时建议使用付费实例。
 
 Render Blueprint 默认把运行时数据写到 `/app/data`。免费实例文件系统不保证长期持久，重建后建议重新私聊绑定 Bot 或重新粘贴 Cookie；需要强持久化时可改用 Docker/VPS，或在付费实例上挂载 Render Disk。
 
