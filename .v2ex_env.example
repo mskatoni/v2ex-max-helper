@@ -22,6 +22,7 @@ TG_TOKEN=<在此填入你的BotToken>
 
 # ===== 代理（可选，默认关闭）=====
 # 代理软件不限定 mihomo，也可以是 xray-core、sing-box、Clash、Surge、gost 等
+# HTTP(S) 可带账号密码；Playwright 浏览器仅支持无认证 SOCKS5
 # V2EX_PROXY_ENABLE=1
 # V2EX_PROXY_ALLOW_LAN=1
 # V2EX_PROXY=http://127.0.0.1:7890
@@ -34,4 +35,5 @@ TG_TOKEN=<在此填入你的BotToken>
 # FEISHU_APP_ID=<飞书应用App ID>
 # FEISHU_APP_SECRET=<飞书应用App Secret>
 # FEISHU_VERIFICATION_TOKEN=<飞书事件订阅校验token>
+# FEISHU_CHAT_ID=<唯一授权飞书会话ID>
 # FEISHU_BOT_PORT=6700

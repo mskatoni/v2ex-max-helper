@@ -789,15 +789,25 @@ async function runProfileDailySequence() {
 async function runProfilePingSequence() {
   if (profileSequenceRunning || runningTask) {
     console.log('[调度器] 跳过多账号保活，已有任务运行');
-    return;
+    return { skipped: true, reason: 'busy' };
   }
-  for (const profile of PROFILE_LIST) {
-    const cookieFile = getProfileCookieFile(profile);
-    await runScriptAsync(`保活(${profile})`, process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname, {
-      env: childEnvForProfile(profile),
-      cookieFile,
-      timeoutMs: 10 * 60 * 1000,
-    });
+
+  profileSequenceRunning = true;
+  const results = [];
+  try {
+    for (const profile of PROFILE_LIST) {
+      const cookieFile = getProfileCookieFile(profile);
+      const result = await runScriptAsync(`保活(${profile})`, process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname, {
+        env: childEnvForProfile(profile),
+        cookieFile,
+        timeoutMs: 10 * 60 * 1000,
+        partOfProfileSequence: true,
+      });
+      results.push({ profile, result });
+    }
+    return { profiles: PROFILE_LIST.length, results };
+  } finally {
+    profileSequenceRunning = false;
   }
 }
 

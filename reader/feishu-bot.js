@@ -205,9 +205,13 @@ async function sendFeishuMessage(chatId, text) {
 
 function verifyToken(body) {
   const token = cfg.feishu.verificationToken;
-  if (!token) return true;
+  if (!token) return false;
   const received = body.token || (body.header && body.header.token) || '';
   return received === token;
+}
+
+function isAuthorizedChat(chatId) {
+  return Boolean(cfg.feishu.chatId && String(chatId || '') === cfg.feishu.chatId);
 }
 
 function parseMessage(body) {
@@ -229,6 +233,11 @@ function parseMessage(body) {
 }
 
 async function handleCommand(text, chatId, senderId) {
+  if (!isAuthorizedChat(chatId)) {
+    console.log(`[feishu-bot] ignored unauthorized chat: ${maskId(chatId)}`);
+    return { skipped: 'unauthorized_chat' };
+  }
+
   const command = String(text || '').split(/\s+/)[0].toLowerCase();
   const prefix = senderId ? `@${maskId(senderId)}\n` : '';
   switch (command) {
@@ -316,17 +325,21 @@ function main() {
     console.log('[feishu-bot] disabled. Set FEISHU_BOT_ENABLE=1 to start the experimental Feishu bot.');
     return;
   }
-  if (!cfg.feishu.appId || !cfg.feishu.appSecret) {
-    console.error('[feishu-bot] FEISHU_APP_ID / FEISHU_APP_SECRET required when FEISHU_BOT_ENABLE=1');
+  const required = [
+    ['FEISHU_APP_ID', cfg.feishu.appId],
+    ['FEISHU_APP_SECRET', cfg.feishu.appSecret],
+    ['FEISHU_VERIFICATION_TOKEN', cfg.feishu.verificationToken],
+    ['FEISHU_CHAT_ID', cfg.feishu.chatId],
+  ];
+  const missing = required.filter(([, value]) => !value).map(([name]) => name);
+  if (missing.length > 0) {
+    console.error(`[feishu-bot] missing required config when FEISHU_BOT_ENABLE=1: ${missing.join(', ')}`);
     process.exit(1);
-  }
-  if (!cfg.feishu.verificationToken) {
-    console.warn('[feishu-bot] FEISHU_VERIFICATION_TOKEN not set; callback token verification is disabled.');
   }
 
   const server = createServer();
   server.listen(cfg.feishu.port, '0.0.0.0', () => {
-    console.log(`[feishu-bot] listening on :${cfg.feishu.port} (callback path: /feishu/callback)`);
+    console.log(`[feishu-bot] listening on :${cfg.feishu.port} for chat ${maskId(cfg.feishu.chatId)} (callback path: /feishu/callback)`);
   });
 }
 
@@ -337,6 +350,7 @@ if (require.main === module) {
 module.exports = {
   createServer,
   parseMessage,
+  isAuthorizedChat,
   buildBalanceText,
   buildStatusText,
 };

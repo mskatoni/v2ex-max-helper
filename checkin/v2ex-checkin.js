@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.3.4
+ * Version: v1.3.5
  *
  * 用法：
  *   保存 Cookie：
@@ -29,7 +29,7 @@ const url   = require('url');
 const config = require('../lib/config');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.3.4';
+const SCRIPT_VERSION = 'v1.3.5';
 const HOST           = 'www.v2ex.com';
 const COOKIE_ORIGIN  = `https://${HOST}`;
 const MAX_RETRY      = 3;
