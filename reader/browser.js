@@ -23,6 +23,7 @@ const USER_DATA_DIR = cfg.chromeProfileDir;
 // 为当前 profile 生成确定性指纹
 const FP = fingerprint.generate(PROFILE);
 const BEHAVIOR = behavior.resolve(PROFILE);
+const HTTP_ONLY_COOKIES = new Set(['A2', 'PB3_SESSION', 'cf_clearance']);
 
 // Cookie 字符串 → Playwright cookies 数组
 function parseCookieString(str) {
@@ -36,7 +37,7 @@ function parseCookieString(str) {
       value,
       domain: `.${HOST}`,
       path:   '/',
-      httpOnly: false,
+      httpOnly: HTTP_ONLY_COOKIES.has(name),
       secure: true,
       sameSite: 'Lax',
     };
@@ -58,17 +59,17 @@ let isDryRun = false;
 async function launch(dryRun = false) {
   isDryRun = dryRun;
 
-  // 检查 Cookie 文件（dry-run 也需要读取用于 fetcher/balance）
+  if (dryRun) {
+    logger.info('[DRY-RUN] 跳过 Cookie 读取和浏览器启动');
+    return;
+  }
+
+  // 正式运行前检查 Cookie 文件。
   const cookieStr = fs.existsSync(COOKIE_FILE)
     ? fs.readFileSync(COOKIE_FILE, 'utf8').trim()
     : '';
   if (!cookieStr) {
     throw new Error(`Cookie 文件不存在或为空: ${COOKIE_FILE}`);
-  }
-
-  if (dryRun) {
-    logger.info('[DRY-RUN] 跳过浏览器启动');
-    return;
   }
 
   const { chromium } = require('playwright');

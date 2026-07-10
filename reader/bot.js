@@ -31,6 +31,7 @@ const BALANCE_LOG     = cfg.balanceLog;
 const BALANCE_STATUS  = cfg.balanceStatus;
 const READER_LOG      = cfg.readerLog;
 const AUTH_CHAT_FILE  = cfg.authChatFile;
+const INTERNAL_SCHEDULER_DISABLED = config.boolEnv('V2EX_DISABLE_INTERNAL_SCHEDULER');
 
 let ALLOWED_CHAT_ID = loadAuthorizedChatId();   // 硬锁，唯一授权用户
 
@@ -279,6 +280,11 @@ function readJsonFile(file) {
   }
 }
 
+function localDateKey(date = new Date()) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function formatBalanceStatus(status) {
   if (!status) return '';
   const ok = status.ok ? '成功' : '失败';
@@ -291,27 +297,27 @@ function formatBalanceStatus(status) {
 function buildBalanceMessage() {
   const status = readJsonFile(BALANCE_STATUS);
   const log = readJsonFile(BALANCE_LOG);
-  const days = log
-    ? Object.keys(log).filter(k => /^\d{4}-\d{2}-\d{2}$/.test(k)).sort().reverse()
-    : [];
+  const days = log ? Object.keys(log).filter(k => /^\d{4}-\d{2}-\d{2}$/.test(k)) : [];
 
   if (!log || days.length === 0) {
     return '⚠️ 尚无余额记录，脚本至少需成功读取一次余额后才有数据' + formatBalanceStatus(status);
   }
 
-  const today    = days[0];
-  const yesterday = days[1];
+  const now = new Date();
+  const previousDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const today = localDateKey(now);
+  const yesterday = localDateKey(previousDay);
 
-  const todayEntry     = today     ? log[today]     : null;
-  const yesterdayEntry = yesterday ? log[yesterday] : null;
+  const todayEntry = log[today] || null;
+  const yesterdayEntry = log[yesterday] || null;
 
   const todayTime = todayEntry
-    ? new Date(todayEntry.lastTime).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false })
+    ? new Date(todayEntry.lastTime).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
     : '--';
 
   let msg = `💰 <b>余额记录</b>\n`;
   msg += todayEntry
-    ? `今日 (${today})：${formatCoins(todayEntry, true)}  最后查询 ${todayTime} EST\n`
+    ? `今日 (${today})：${formatCoins(todayEntry, true)}  最后查询 ${todayTime}（本机时间）\n`
     : `今日：暂无记录\n`;
   msg += yesterdayEntry
     ? `昨日 (${yesterday})：${formatCoins(yesterdayEntry, false)}`
@@ -613,7 +619,7 @@ const PROFILE_LIST = parseProfileList();
 const MULTI_PROFILE_MODE = PROFILE_LIST.length > 0;
 const PROFILE_TIME_SLOT_HOURS = Math.max(1, parseFloat(process.env.PROFILE_TIME_SLOT_HOURS || '4') || 4);
 const PROFILE_TIME_SLOT_MS = Math.round(PROFILE_TIME_SLOT_HOURS * 60 * 60 * 1000);
-const PROFILE_SEQUENCE_START_UTC_MINUTES = 70; // 01:10 UTC
+const PROFILE_SEQUENCE_START_LOCAL_MINUTES = 9 * 60 + 10;
 
 function getProfileCookieFile(profile) {
   const base = path.join(cfg.cookieBaseDir, '.v2ex_cookie');
@@ -820,16 +826,11 @@ function getLocalTimeZoneInfo() {
   return `${label} (${getUtcOffsetLabel()})`;
 }
 
-function formatLocalClockFromUtcMinutes(totalUtcMinutes) {
-  const now = new Date();
-  const baseMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0);
-  const base = new Date(baseMs);
-  const target = new Date(baseMs + totalUtcMinutes * 60 * 1000);
-  const baseLocalDay = new Date(base.getFullYear(), base.getMonth(), base.getDate()).getTime();
-  const targetLocalDay = new Date(target.getFullYear(), target.getMonth(), target.getDate()).getTime();
-  const dayOffset = Math.round((targetLocalDay - baseLocalDay) / 86400000);
-  const h = String(target.getHours()).padStart(2, '0');
-  const m = String(target.getMinutes()).padStart(2, '0');
+function formatLocalClock(totalLocalMinutes) {
+  const dayOffset = Math.floor(totalLocalMinutes / (24 * 60));
+  const minuteOfDay = ((totalLocalMinutes % (24 * 60)) + 24 * 60) % (24 * 60);
+  const h = String(Math.floor(minuteOfDay / 60)).padStart(2, '0');
+  const m = String(minuteOfDay % 60).padStart(2, '0');
   return `${h}:${m}${formatDayOffset(dayOffset)}`;
 }
 
@@ -852,10 +853,10 @@ function buildProfileSlotMessage() {
   const totalHours = formatHours((slotMinutes * PROFILE_LIST.length) / 60);
   const timeZoneLabel = getLocalTimeZoneInfo();
   const lines = PROFILE_LIST.map((profile, index) => {
-    const start = PROFILE_SEQUENCE_START_UTC_MINUTES + index * slotMinutes;
+    const start = PROFILE_SEQUENCE_START_LOCAL_MINUTES + index * slotMinutes;
     const end = start + slotMinutes;
     const cookieStatus = fs.existsSync(getProfileCookieFile(profile)) ? '✅ Cookie' : '⚠️ 缺 Cookie';
-    return `${index + 1}. <code>${escapeHtml(profile)}</code> | 本机时间 ${formatLocalClockFromUtcMinutes(start)}-${formatLocalClockFromUtcMinutes(end)} | ${cookieStatus}`;
+    return `${index + 1}. <code>${escapeHtml(profile)}</code> | 本机时间 ${formatLocalClock(start)}-${formatLocalClock(end)} | ${cookieStatus}`;
   });
 
   return `🧩 <b>多账号时段分块</b>\n\n` +
@@ -909,53 +910,56 @@ async function startProfileSequenceFromPanel(messageId) {
 }
 
 function startScheduler() {
-  // 用 day-of-year 防止同一天重复执行
-  let lastCheckinDOY = -1;
-  let lastReadDOY = -1;
-  let lastProfileRunDOY = -1;
+  let lastCheckinDate = '';
+  let lastReadDate = '';
+  let lastProfileRunDate = '';
+  let lastPingSlot = '';
 
   setInterval(() => {
     const now = new Date();
-    const h = now.getUTCHours();
-    const m = now.getUTCMinutes();
-    // day-of-year 唯一标识每天
-    const doy = Math.floor((now - new Date(now.getUTCFullYear(), 0, 0)) / 86400000);
+    const h = now.getHours();
+    const m = now.getMinutes();
+    const dateKey = localDateKey(now);
 
     if (MULTI_PROFILE_MODE) {
-      if (h === 1 && m === 10 && doy !== lastProfileRunDOY) {
-        lastProfileRunDOY = doy;
+      if (h === 9 && m === 10 && dateKey !== lastProfileRunDate) {
+        lastProfileRunDate = dateKey;
         runProfileDailySequence().catch(e => console.error(`[调度器] 多账号串行失败: ${e.message}`));
       }
 
-      if ([0, 6, 12, 18].includes(h) && m === 0) {
+      const pingSlot = `${dateKey}:${h}`;
+      if ([0, 6, 12, 18].includes(h) && m === 0 && pingSlot !== lastPingSlot) {
+        lastPingSlot = pingSlot;
         runProfilePingSequence().catch(e => console.error(`[调度器] 多账号保活失败: ${e.message}`));
       }
       return;
     }
 
-    // 每天 UTC 01:10 签到（当天只执行一次）
-    if (h === 1 && m === 10 && doy !== lastCheckinDOY) {
-      lastCheckinDOY = doy;
+    // 每天本机时间 09:10 签到（当天只执行一次）
+    if (h === 9 && m === 10 && dateKey !== lastCheckinDate) {
+      lastCheckinDate = dateKey;
       runScript('签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname);
     }
 
-    // 每天 UTC 01:15 阅读（当天只执行一次）
-    if (h === 1 && m === 15 && doy !== lastReadDOY) {
-      lastReadDOY = doy;
+    // 每天本机时间 09:15 阅读（当天只执行一次）
+    if (h === 9 && m === 15 && dateKey !== lastReadDate) {
+      lastReadDate = dateKey;
       // Render 环境下直接 node，VPS Docker 里可以用 xvfb-run
       runScript('阅读', process.execPath, ['main.js'], __dirname);
     }
 
     // 每 6 小时保活（V2EX session 保活，非 Render 保活）
-    if ([0, 6, 12, 18].includes(h) && m === 0) {
+    const pingSlot = `${dateKey}:${h}`;
+    if ([0, 6, 12, 18].includes(h) && m === 0 && pingSlot !== lastPingSlot) {
+      lastPingSlot = pingSlot;
       runScript('保活', process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname);
     }
   }, 60 * 1000); // 每分钟检查一次
 
   if (MULTI_PROFILE_MODE) {
-    console.log(`[调度器] 内置定时任务已启动 (UTC 时钟，多账号串行: ${PROFILE_LIST.join(', ')})`);
+    console.log(`[调度器] 内置定时任务已启动 (本机时区 ${getLocalTimeZoneInfo()}，多账号串行: ${PROFILE_LIST.join(', ')})`);
   } else {
-    console.log('[调度器] 内置定时任务已启动 (UTC 时钟)');
+    console.log(`[调度器] 内置定时任务已启动 (本机时区 ${getLocalTimeZoneInfo()})`);
   }
 }
 
@@ -1365,8 +1369,12 @@ if (ALLOWED_CHAT_ID) {
     console.log('[BOT] 未配置 TG_CHAT_ID / TG_SETUP_CODE；为安全起见不会自动绑定任何用户');
   }
 
-  // 启动内置调度器
-  startScheduler();
+  // systemd timer 部署时只保留 Bot 交互，避免同一任务被两套调度器重复触发。
+  if (INTERNAL_SCHEDULER_DISABLED) {
+    console.log('[调度器] 内置定时任务已禁用，由外部 timer/cron 负责调度');
+  } else {
+    startScheduler();
+  }
 
   // 启动自保活
   startKeepAlive();

@@ -71,10 +71,10 @@
 2. **放置代码**：下载 / 解压本项目到 `~/v2ex-max-helper`。
 3. **生成配置**：`cp .v2ex_env.example ~/.v2ex_env`，但**保留占位符不填真实值**。
 4. **安装依赖**：在 `reader/` 执行 `npm install` 与 `npx playwright install chromium`。
-5. **干跑验证**：`cd reader && node main.js --dry-run`，确认流程无报错。
+5. **干跑验证**：`cd reader && node main.js --dry-run`，确认离线调度流程无报错；该模式不需要 Cookie，也不会访问 V2EX 或写入阅读队列。
 6. **配置定时任务**：运行 `sudo bash scripts/install-systemd.sh` 安装 systemd timer（推荐；无 systemd 时回退 crontab，见 `部署指南.md`）。
 7. **交还给你手动完成**（敏感步骤，Agent 不接触）：
-   - 你本人把真实 `TG_TOKEN` 填入 `~/.v2ex_env`；`TG_CHAT_ID` 可不填，首次私聊 Bot 会绑定到运行时数据目录；
+   - 你本人把真实 `TG_TOKEN` 填入 `~/.v2ex_env`；配置 `TG_CHAT_ID`，或配置 `TG_SETUP_CODE` 后使用 `/bind <口令>` 首次绑定；
    - 你本人执行 `V2EX_COOKIE="..." node checkin/v2ex-checkin.js --save-cookie` 保存 Cookie。
 
 ### 可直接复制给 Agent 的提示词模板

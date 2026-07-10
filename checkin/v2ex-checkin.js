@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.3.3
+ * Version: v1.3.4
  *
  * 用法：
  *   保存 Cookie：
  *     V2EX_COOKIE="..." node v2ex-checkin.js --save-cookie
  *
- *   每日签到（crontab 01:10 UTC = 北京 09:10）：
- *     10 1 * * * /usr/bin/node /path/to/v2ex-checkin.js >> /var/log/v2ex.log 2>&1
+ *   每日签到（crontab 按本机时间 09:10）：
+ *     10 9 * * * /usr/bin/node /path/to/v2ex-checkin.js >> /var/log/v2ex.log 2>&1
  *
  *   保活心跳，每6小时访问一次（防 Session 过期）：
  *     0 0,6,12,18 * * *  node /path/to/v2ex-checkin.js --ping
@@ -29,8 +29,9 @@ const url   = require('url');
 const config = require('../lib/config');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.3.3';
+const SCRIPT_VERSION = 'v1.3.4';
 const HOST           = 'www.v2ex.com';
+const COOKIE_ORIGIN  = `https://${HOST}`;
 const MAX_RETRY      = 3;
 
 const cfg = config.getConfig();
@@ -146,17 +147,36 @@ function logCookieChanges(changedKeys) {
 // 完整版：返回 { body, setCookies }。会累积重定向链路上每一跳的 Set-Cookie。
 function fetchUrlFull(reqUrl, cookie, _redirects = 0, _acc = []) {
   return new Promise((resolve, reject) => {
-    const headers = Object.assign({}, COMMON_HEADERS, { Cookie: cookie });
-    const parsed  = new url.URL(reqUrl);
+    let parsed;
+    try {
+      parsed = new url.URL(reqUrl);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+
+    // 携带登录 Cookie 的请求只能发往 V2EX HTTPS 源，重定向递归也会重复校验。
+    if (cookie && parsed.origin !== COOKIE_ORIGIN) {
+      reject(new Error(`拒绝向非 V2EX HTTPS 源发送 Cookie: ${parsed.origin}`));
+      return;
+    }
+
+    const headers = Object.assign({}, COMMON_HEADERS);
+    if (cookie) headers.Cookie = cookie;
     const lib     = parsed.protocol === 'https:' ? https : http;
     const req = lib.get(reqUrl, { headers }, (res) => {
       const sc = res.headers['set-cookie'] || [];
       const acc = _acc.concat(sc);
       // 跟随重定向（最多3次）
       if ([301, 302, 303].includes(res.statusCode) && res.headers.location && _redirects < 3) {
-        const loc = res.headers.location.startsWith('http')
-          ? res.headers.location
-          : `https://${HOST}${res.headers.location}`;
+        let loc;
+        try {
+          loc = new url.URL(res.headers.location, parsed).toString();
+        } catch (e) {
+          res.resume();
+          reject(e);
+          return;
+        }
         res.resume();
         return fetchUrlFull(loc, cookie, _redirects + 1, acc).then(resolve).catch(reject);
       }
@@ -267,9 +287,15 @@ async function queryBalance(cookie) {
 
 // ========== Logger ==========
 function pad(n) { return String(n).padStart(2, '0'); }
+function utcOffset(d) {
+  const minutes = -d.getTimezoneOffset();
+  const sign = minutes >= 0 ? '+' : '-';
+  const abs = Math.abs(minutes);
+  return `UTC${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
 function tsNow() {
   const d = new Date();
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} UTC`;
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${utcOffset(d)}`;
 }
 function log(msg) { console.log(msg); }
 function logField(label, value) {

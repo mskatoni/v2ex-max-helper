@@ -13,8 +13,7 @@
 #   sudo bash scripts/install-systemd.sh --no-reader     # 不安装阅读 timer
 #   sudo bash scripts/install-systemd.sh --bot           # 同时安装 Bot service
 #
-# 签到 / 保活时间默认按服务器本地时区解析。
-# 阅读模块默认使用显式 UTC 时间，避免 UTC 时区 VPS 错过 reader/main.js 的 UTC 06:00 截止窗口。
+# 签到、保活和阅读时间均按服务器本地时区解析。
 # =============================================================================
 set -euo pipefail
 
@@ -53,6 +52,9 @@ command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd，请改用 cr
 
 # profile 名安全校验（只允许字母数字、下划线、连字符）
 [[ "$PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] || die "profile 名非法：$PROFILE"
+if [[ $INSTALL_BOT -eq 1 && "$PROFILE" != "default" ]]; then
+  die "Telegram 长轮询 Bot 只能安装一个；请仅用默认 profile 执行 --bot，多账号由 V2EX_PROFILE_LIST 管理"
+fi
 
 # 单元名后缀：default 不加后缀，其他用 -<profile>
 if [[ "$PROFILE" == "default" ]]; then SUF=""; else SUF="-$PROFILE"; fi
@@ -115,7 +117,7 @@ fi
 # 时间配置
 read -rp "签到时间 OnCalendar [*-*-* 09:10:00]: " T_CHECKIN; T_CHECKIN="${T_CHECKIN:-*-*-* 09:10:00}"
 read -rp "保活时间 OnCalendar [*-*-* 00/6:00:00]: " T_PING;   T_PING="${T_PING:-*-*-* 00/6:00:00}"
-read -rp "阅读时间 OnCalendar [*-*-* 01:15:00 UTC]: " T_READER; T_READER="${T_READER:-*-*-* 01:15:00 UTC}"
+read -rp "阅读时间 OnCalendar [*-*-* 09:15:00]: " T_READER; T_READER="${T_READER:-*-*-* 09:15:00}"
 
 # 环境变量：V2EX_PROFILE（非 default 才注入）
 PROFILE_ENV=""
@@ -128,7 +130,7 @@ echo "  项目根目录 : ${PROJ_ROOT}"
 echo "  签到       : ${T_CHECKIN}"
 echo "  保活       : ${T_PING}"
 [[ $INSTALL_READER -eq 1 ]] && echo "  阅读       : ${T_READER}  ${XVFB_PREFIX:+(xvfb-run)}"
-[[ $INSTALL_BOT -eq 1 ]]    && echo "  Bot        : 常驻 service"
+[[ $INSTALL_BOT -eq 1 ]]    && echo "  Bot        : 常驻 service（定时任务由 systemd timer 负责）"
 read -rp "确认安装？[Y/n]: " go; [[ "${go,,}" == "n" ]] && { warn "已取消"; exit 0; }
 
 # =============================================================================
@@ -202,6 +204,7 @@ Type=simple
 User=${RUN_USER}
 Environment=HOME=${RUN_HOME}
 ${PROFILE_ENV}
+Environment=V2EX_DISABLE_INTERNAL_SCHEDULER=1
 WorkingDirectory=${RDR_DIR}
 ExecStart=${NODE_BIN} bot.js
 Restart=always

@@ -12,6 +12,7 @@ const BALANCE_LOG = cfg.balanceLog;
 const BALANCE_STATUS = cfg.balanceStatus;
 
 const HOST = 'www.v2ex.com';
+const BALANCE_ORIGIN = `https://${HOST}`;
 
 const HEADERS = {
   'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -47,9 +48,18 @@ function getLastStatus() {
   }
 }
 
+function localDateKey(date = new Date()) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function fetchBalance(cookie, targetUrl = `https://${HOST}/balance`, redirects = 0) {
   return new Promise((resolve, reject) => {
-    const url = new URL(targetUrl, `https://${HOST}`);
+    const url = new URL(targetUrl, BALANCE_ORIGIN);
+    if (url.origin !== BALANCE_ORIGIN) {
+      reject(new Error(`Balance redirect refused outside V2EX HTTPS origin: ${url.origin}`));
+      return;
+    }
     const opts = {
       hostname: url.hostname,
       path:     `${url.pathname}${url.search}`,
@@ -168,7 +178,7 @@ function saveBalanceLog(html) {
     const balance = parseBalance(html);
     if (!balance) return;
     ensureDataDir();
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const today = localDateKey();
     let log = {};
     if (fs.existsSync(BALANCE_LOG)) {
       log = JSON.parse(fs.readFileSync(BALANCE_LOG, 'utf8'));
