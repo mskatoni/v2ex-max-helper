@@ -106,8 +106,13 @@ async function shutdown(reason, stats, exitCode = 0) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   logger.sep();
-  logger.ok(`停止原因: ${reason}`);
-  logger.ok(`📊 统计: 阅读 ${stats.read} 篇 | 余额变化 ${stats.changed} 次 | 耗时 ${stats.elapsed}`);
+  if (exitCode === 0) {
+    logger.ok(`停止原因: ${reason}`);
+    logger.ok(`📊 统计: 阅读 ${stats.read} 篇 | 余额变化 ${stats.changed} 次 | 耗时 ${stats.elapsed}`);
+  } else {
+    logger.warn(`停止原因: ${reason}`);
+    logger.warn(`📊 统计: 阅读 ${stats.read} 篇 | 余额变化 ${stats.changed} 次 | 耗时 ${stats.elapsed}`);
+  }
   if (!isDryRun && queueInitialized) {
     try {
       const s = queue.stats();
@@ -185,8 +190,8 @@ async function main() {
     stats.elapsed = elapsed(startTime);
     await shutdown(sig, stats, exitCode);
   };
-  process.on('SIGTERM', () => onExit('SIGTERM', 143).catch(e => logger.error(`SIGTERM 退出失败: ${e.message}`)));
-  process.on('SIGINT',  () => onExit('SIGINT', 130).catch(e => logger.error(`SIGINT 退出失败: ${e.message}`)));
+  process.once('SIGTERM', () => onExit('SIGTERM', 143).catch(e => logger.error(`SIGTERM 退出失败: ${e.message}`)));
+  process.once('SIGINT',  () => onExit('SIGINT', 130).catch(e => logger.error(`SIGINT 退出失败: ${e.message}`)));
 
   logger.sep();
   logger.info(`🚀 V2EX Reader 启动 (dry-run=${isDryRun})`);
@@ -249,6 +254,7 @@ async function main() {
 
   // ========== 主阅读循环 ==========
   while (true) {
+    if (isShuttingDown) return;
 
     // 检查截止时间
     if (isPastDeadline()) {
@@ -281,6 +287,8 @@ async function main() {
 
     // 阅读帖子
     const ok = await browser.readPost(url);
+    // 信号退出可能与当前导航并发；此时不得再更新队列或继续取下一帖。
+    if (isShuttingDown) return;
     if (ok) {
       if (!isDryRun) queue.increment(url);
       stats.read++;

@@ -49,3 +49,13 @@ test('first identity binding clears unknown legacy browser credentials', () => {
   assert.match(reader, /identityState === 'unbound'[\s\S]{0,120}safeRemoveChromeProfile/);
   assert.match(checkin, /identityState === 'unbound'[\s\S]{0,120}safeRemoveChromeProfile/);
 });
+
+test('reader shutdown cannot mark more queue entries after a signal', () => {
+  const reader = fs.readFileSync(path.join(root, 'reader', 'main.js'), 'utf8');
+  const readStart = reader.indexOf('const ok = await browser.readPost(url)');
+  const shutdownGuard = reader.indexOf('if (isShuttingDown) return;', readStart);
+  const queueSkip = reader.indexOf('queue.skip(url)', readStart);
+  assert.ok(readStart >= 0 && shutdownGuard > readStart && queueSkip > shutdownGuard);
+  assert.match(reader, /process\.once\('SIGTERM'/);
+  assert.match(reader, /exitCode === 0[\s\S]{0,260}logger\.warn\(`停止原因/);
+});
