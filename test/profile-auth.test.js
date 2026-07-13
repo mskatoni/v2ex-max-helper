@@ -73,6 +73,15 @@ test('a sign-in string does not override explicit authenticated navigation', () 
   assert.equal(page.ok, true);
 });
 
+test('home fallback accepts private navigation paths without assuming an exact href shape', () => {
+  const page = auth.diagnoseHomePage({
+    statusCode: 200,
+    body: '<a class="top" href="/member/Alice">A</a><div data-route="/notifications"></div><script>const logout="/signout"</script>',
+  });
+  assert.equal(page.ok, true);
+  assert.equal(page.identity, 'alice');
+});
+
 test('public member links alone never prove an authenticated session', () => {
   const publicPage = auth.diagnoseAuthPage({
     statusCode: 200,
