@@ -20,6 +20,23 @@ const HOST    = 'www.v2ex.com';
 const COOKIE_FILE   = cfg.cookieFile;
 const USER_DATA_DIR = cfg.chromeProfileDir;
 
+const MIB = 1024 * 1024;
+const DISK_CACHE_LIMIT_BYTES = 64 * MIB;
+const MEDIA_CACHE_LIMIT_BYTES = 16 * MIB;
+const CACHE_PRUNE_THRESHOLD_BYTES = 128 * MIB;
+const CACHE_PATHS = [
+  path.join('Default', 'Cache'),
+  path.join('Default', 'Code Cache'),
+  path.join('Default', 'GPUCache'),
+  path.join('Default', 'DawnCache'),
+  path.join('Default', 'DawnGraphiteCache'),
+  path.join('Default', 'DawnWebGPUCache'),
+  path.join('Default', 'Service Worker', 'CacheStorage'),
+  'GrShaderCache',
+  'GraphiteDawnCache',
+  'ShaderCache',
+];
+
 // 为当前 profile 生成确定性指纹
 const FP = fingerprint.generate(PROFILE);
 const BEHAVIOR = behavior.resolve(PROFILE);
@@ -56,6 +73,90 @@ let ctx      = null;   // BrowserContext（persistent context）
 let page     = null;
 let isDryRun = false;
 
+function buildLaunchArgs() {
+  return [
+    '--disable-blink-features=AutomationControlled',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    `--disk-cache-size=${DISK_CACHE_LIMIT_BYTES}`,
+    `--media-cache-size=${MEDIA_CACHE_LIMIT_BYTES}`,
+    '--js-flags=--max-old-space-size=256',
+    '--disable-extensions',
+    '--disable-default-apps',
+    `--lang=${FP.locale}`,
+  ];
+}
+
+function cachePathSize(target) {
+  let stat;
+  try {
+    stat = fs.lstatSync(target);
+  } catch (_) {
+    return 0;
+  }
+  if (stat.isSymbolicLink()) return 0;
+  if (stat.isFile()) return stat.size;
+  if (!stat.isDirectory()) return 0;
+
+  let total = 0;
+  for (const entry of fs.readdirSync(target)) {
+    total += cachePathSize(path.join(target, entry));
+  }
+  return total;
+}
+
+function getCacheTargets(profileDir) {
+  const root = path.resolve(profileDir);
+  return CACHE_PATHS.map(relativePath => {
+    const target = path.resolve(root, relativePath);
+    const relative = path.relative(root, target);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new Error('拒绝清理不安全的 Chromium 缓存路径');
+    }
+    return target;
+  });
+}
+
+function pruneBrowserCache(profileDir = USER_DATA_DIR, thresholdBytes = CACHE_PRUNE_THRESHOLD_BYTES) {
+  if (!Number.isSafeInteger(thresholdBytes) || thresholdBytes < 0) {
+    throw new Error('Chromium 缓存清理阈值无效');
+  }
+  const targets = getCacheTargets(profileDir);
+  const sizeBefore = targets.reduce((sum, target) => sum + cachePathSize(target), 0);
+  if (sizeBefore <= thresholdBytes) {
+    return { pruned: false, sizeBefore, sizeAfter: sizeBefore, failed: 0 };
+  }
+
+  let failed = 0;
+  for (const target of targets) {
+    try {
+      const stat = fs.lstatSync(target);
+      if (stat.isSymbolicLink()) continue;
+      fs.rmSync(target, { recursive: true, force: true });
+    } catch (e) {
+      if (e.code !== 'ENOENT') failed++;
+    }
+  }
+  const sizeAfter = targets.reduce((sum, target) => sum + cachePathSize(target), 0);
+  return { pruned: true, sizeBefore, sizeAfter, failed };
+}
+
+function pruneBrowserCacheWithLog() {
+  try {
+    const result = pruneBrowserCache();
+    if (!result.pruned) return;
+    const beforeMiB = (result.sizeBefore / MIB).toFixed(1);
+    const afterMiB = (result.sizeAfter / MIB).toFixed(1);
+    logger.info(`Chromium 缓存已按阈值裁剪: ${beforeMiB} MiB -> ${afterMiB} MiB`);
+    if (result.failed > 0) logger.warn(`Chromium 缓存有 ${result.failed} 个目录清理失败`);
+  } catch (e) {
+    logger.warn(`Chromium 缓存检查失败: ${e.message}`);
+  }
+}
+
 async function launch(dryRun = false) {
   isDryRun = dryRun;
 
@@ -76,6 +177,7 @@ async function launch(dryRun = false) {
 
   // 确保 Chrome profile 目录存在
   fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+  pruneBrowserCacheWithLog();
 
   logger.info('浏览器启动中...');
   logger.info('浏览器指纹已按当前 profile 注入');
@@ -87,20 +189,7 @@ async function launch(dryRun = false) {
   const launchOptions = {
     executablePath: process.env.CHROME_BIN || undefined,
     headless: process.env.HEADLESS !== 'false',
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--memory-pressure-off',
-      '--js-flags=--max-old-space-size=256',
-      '--disable-extensions',
-      '--disable-default-apps',
-      '--single-process',
-      `--lang=${FP.locale}`,
-    ],
+    args: buildLaunchArgs(),
     ignoreHTTPSErrors: false,
     userAgent:  FP.userAgent,
     locale:     FP.locale,
@@ -332,15 +421,21 @@ async function getCurrentCookie() {
 }
 
 async function close() {
+  let closed = false;
   try {
     if (ctx) {
       await syncCookies();
       await ctx.close();
+      closed = true;
     }
     logger.info('浏览器已关闭');
   } catch (e) {
     logger.warn(`关闭浏览器时出错: ${e.message}`);
+  } finally {
+    ctx = null;
+    page = null;
   }
+  if (closed) pruneBrowserCacheWithLog();
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -349,4 +444,13 @@ function getProfileInfo() {
   return { profile: PROFILE, cookieFile: COOKIE_FILE, fingerprint: FP, behavior: BEHAVIOR };
 }
 
-module.exports = { launch, readPost, getCurrentCookie, syncCookies, close, getProfileInfo };
+module.exports = {
+  launch,
+  readPost,
+  getCurrentCookie,
+  syncCookies,
+  close,
+  getProfileInfo,
+  buildLaunchArgs,
+  pruneBrowserCache,
+};

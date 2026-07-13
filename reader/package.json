@@ -7,7 +7,7 @@
     "start":   "node main.js",
     "dry-run": "node main.js --dry-run",
     "bot":     "node bot.js",
-    "test":    "node --test ../test/profile-auth.test.js ../test/profile-lock.test.js ../test/profile-schedule.test.js ../test/multi-profile-entry.test.js ../test/bot-isolation-source.test.js ../test/secure-proxy.test.js ../test/notify.test.js ../test/config-isolation.test.js ../test/queue-persistence.test.js ../test/behavior.test.js"
+    "test":    "node --test ../test/profile-auth.test.js ../test/profile-lock.test.js ../test/profile-schedule.test.js ../test/multi-profile-entry.test.js ../test/bot-isolation-source.test.js ../test/secure-proxy.test.js ../test/notify.test.js ../test/config-isolation.test.js ../test/queue-persistence.test.js ../test/behavior.test.js ../test/browser-resource.test.js"
   },
   "dependencies": {
     "playwright": "^1.44.0",
