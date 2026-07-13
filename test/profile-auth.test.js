@@ -30,6 +30,49 @@ test('identity extraction requires one unique account', () => {
   );
 });
 
+test('authenticated home fallback requires private navigation and a unique top account', async () => {
+  const home = [
+    '<a href="/member/Alice" class="top">Alice</a>',
+    '<a href="/notifications">Notifications</a>',
+    '<a href="/signout">Sign out</a>',
+    '<a href="/member/Bob">post author</a>',
+  ].join('');
+  const result = await auth.verifyCookie('A2=test', {
+    requestPage: async (_cookie, _options, target) => {
+      if (target.endsWith('/balance')) throw new Error('balance timeout');
+      return { statusCode: 200, body: home };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.identity, 'alice');
+  assert.equal(result.verificationSource, 'home_fallback');
+  assert.equal(result.fallbackCode, 'balance_request_failed');
+});
+
+test('home fallback rejects public or logged-out pages', () => {
+  const publicPage = auth.diagnoseHomePage({
+    statusCode: 200,
+    body: '<a href="/member/Alice">post author</a><a href="/signin">Sign in</a>',
+  });
+  assert.equal(publicPage.ok, false);
+  assert.equal(publicPage.code, 'logged_out');
+
+  const missingTopIdentity = auth.diagnoseHomePage({
+    statusCode: 200,
+    body: '<a href="/notifications">N</a><a href="/signout">S</a><a href="/member/Alice">post author</a>',
+  });
+  assert.equal(missingTopIdentity.ok, false);
+  assert.equal(missingTopIdentity.code, 'identity_unverified');
+});
+
+test('a sign-in string does not override explicit authenticated navigation', () => {
+  const page = auth.diagnoseHomePage({
+    statusCode: 200,
+    body: '<script>const help="/signin"</script><a class="top" href="/member/Alice">A</a><a href="/notifications">N</a><a href="/signout">S</a>',
+  });
+  assert.equal(page.ok, true);
+});
+
 test('public member links alone never prove an authenticated session', () => {
   const publicPage = auth.diagnoseAuthPage({
     statusCode: 200,
