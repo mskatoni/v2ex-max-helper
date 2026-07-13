@@ -5,12 +5,11 @@
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
-const os = require('os');
-const path = require('path');
 const config = require('../lib/config');
+const profileLock = require('../lib/profile-lock');
 
 const cfg = config.getConfig();
-const LOCK_FILE = path.join(os.tmpdir(), 'v2ex_reader.lock');
+const LOCK_FILE = cfg.readerLockFile;
 
 let tenantToken = '';
 let tokenExpiresAt = 0;
@@ -84,11 +83,11 @@ function buildStatusText() {
     return lines.join('\n');
   }
 
-  const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-  if (pid && isProcessAlive(pid)) {
-    lines.push(`阅读任务：运行中 (PID ${pid})`);
+  const lock = profileLock.readLock(LOCK_FILE);
+  if (lock && isProcessAlive(lock.pid)) {
+    lines.push(`阅读任务：运行中 (profile=${lock.profile || 'unknown'}, PID ${lock.pid})`);
   } else {
-    lines.push(`阅读任务：残留锁文件 (PID ${pid || 'unknown'} 不存在)`);
+    lines.push('阅读任务：残留或无效锁文件');
   }
   return lines.join('\n');
 }
@@ -107,14 +106,17 @@ function readDebugText() {
 function stopReaderText() {
   try {
     if (!fs.existsSync(LOCK_FILE)) return '阅读脚本未在运行（锁文件不存在）';
-    const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-    if (!pid || Number.isNaN(pid)) return '锁文件 PID 无效';
-    if (!isProcessAlive(pid)) {
-      try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+    const lock = profileLock.readLock(LOCK_FILE);
+    if (!lock || !lock.pid) return '锁文件内容无效';
+    if (!isProcessAlive(lock.pid)) {
+      try { profileLock.clearStaleLock(LOCK_FILE); } catch (_) {}
       return '进程已不存在，锁文件已清理';
     }
-    process.kill(pid, 'SIGTERM');
-    return `已向阅读进程 PID ${pid} 发送停止信号`;
+    if (lock.profile && lock.profile !== cfg.profile) {
+      return `当前运行的是 profile=${lock.profile}，实验性飞书 Bot 只允许操作 profile=${cfg.profile}`;
+    }
+    process.kill(lock.pid, 'SIGTERM');
+    return `已停止 profile=${lock.profile || cfg.profile} 的阅读进程`;
   } catch (e) {
     return `停止失败：${e.message}`;
   }

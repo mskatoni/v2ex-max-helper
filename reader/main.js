@@ -13,8 +13,6 @@
 
 const fs      = require('fs');
 const https   = require('https');
-const os      = require('os');
-const path    = require('path');
 const logger  = require('./logger');
 const queue   = require('./queue');
 const fetcher = require('./fetcher');
@@ -22,7 +20,10 @@ const balance = require('./balance');
 const browser = require('./browser');
 const notify  = require('./notify');
 const behavior = require('./behavior');
+const fingerprint = require('./fingerprint');
 const config  = require('../lib/config');
+const profileAuth = require('../lib/profile-auth');
+const profileLock = require('../lib/profile-lock');
 
 // ========== 配置 ==========
 const MAX_READ_COUNT    = 1000;   // 每日阅读上限（安全兜底）
@@ -31,6 +32,7 @@ const MAX_CHANGE_COUNT  = 2;      // 余额变化上限（活跃度两次）
 const QUEUE_REFILL_THRESHOLD = 150;// 队列低于此数时补充
 const DEADLINE_LOCAL_HOUR = 14;   // 本机时间 14:00 超时退出
 const cfg = config.getConfig();
+const PROFILE_LIST = config.parseProfileList();
 const BEHAVIOR = behavior.resolve(cfg.profile);
 const BALANCE_CHECK_INTERVAL = BEHAVIOR.balanceCheckInterval; // 每读多少篇检查一次余额
 
@@ -55,62 +57,33 @@ function parseLimit() {
 }
 const EFFECTIVE_LIMIT = parseLimit();
 
-// 跨平台锁文件
-const LOCK_FILE = path.join(os.tmpdir(), 'v2ex_reader.lock');
-let lockOwned = false;
+const LOCK_FILE = cfg.readerLockFile;
+let readerLockHandle = null;
+let credentialLockHandle = null;
+let queueInitialized = false;
+let browserStarted = false;
 
 // ========== 锁文件 ==========
-function readLockPid() {
-  try {
-    return parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10) || null;
-  } catch (_) {
-    return null;
-  }
-}
-
 function acquireLock() {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx', mode: 0o600 });
-      lockOwned = true;
-      return;
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-    }
-
-    const pid = readLockPid();
-    if (pid && isProcessAlive(pid)) {
-      logger.error(`已有实例在运行 (PID ${pid})，退出`);
-      process.exit(1);
-    }
-    logger.warn(`发现残留锁文件 (PID ${pid} 已不存在)，清除`);
-    try {
-      fs.unlinkSync(LOCK_FILE);
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw e;
-    }
+  readerLockHandle = profileLock.acquireLock(LOCK_FILE, { profile: cfg.profile, task: 'reader' });
+  try {
+    credentialLockHandle = profileLock.acquireLock(cfg.credentialLockFile, { profile: cfg.profile, task: 'reader' });
+  } catch (e) {
+    readerLockHandle.release();
+    readerLockHandle = null;
+    throw e;
   }
-  throw new Error('锁文件获取时发生竞争，拒绝启动第二个阅读实例');
 }
 
 function releaseLock() {
-  if (!lockOwned) return;
-  try {
-    const pid = readLockPid();
-    if (pid === process.pid) {
-      fs.unlinkSync(LOCK_FILE);
-    } else if (pid) {
-      logger.warn(`锁文件已属于其他进程 (PID ${pid})，不执行删除`);
-    }
-  } catch (e) {
-    if (e.code !== 'ENOENT') logger.warn(`释放锁文件失败: ${e.message}`);
-  } finally {
-    lockOwned = false;
+  if (credentialLockHandle) {
+    try { credentialLockHandle.release(); } catch (e) { logger.warn(`释放凭证锁失败: ${e.message}`); }
+    credentialLockHandle = null;
   }
-}
-
-function isProcessAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (_) { return false; }
+  if (readerLockHandle) {
+    try { readerLockHandle.release(); } catch (e) { logger.warn(`释放阅读锁失败: ${e.message}`); }
+    readerLockHandle = null;
+  }
 }
 
 // ========== 截止时间检查 ==========
@@ -129,24 +102,32 @@ function isPastRuntime(startTime) {
 
 // ========== 优雅退出 ==========
 let isShuttingDown = false;
-async function shutdown(reason, stats) {
+async function shutdown(reason, stats, exitCode = 0) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   logger.sep();
   logger.ok(`停止原因: ${reason}`);
   logger.ok(`📊 统计: 阅读 ${stats.read} 篇 | 余额变化 ${stats.changed} 次 | 耗时 ${stats.elapsed}`);
-  if (!isDryRun) {
-    const s = queue.stats();
-    logger.ok(`📦 队列: 可读 ${s.readable} | 已读满 ${s.exhausted} | 总计 ${s.total}`);
+  if (!isDryRun && queueInitialized) {
+    try {
+      const s = queue.stats();
+      logger.ok(`📦 队列: 可读 ${s.readable} | 已读满 ${s.exhausted} | 总计 ${s.total}`);
+    } catch (e) {
+      logger.warn(`读取队列统计失败: ${e.message}`);
+    }
   }
   logger.sep();
   // Telegram 通知：仅报错时推送
   stats.reason = reason;
-  if (stats.consecutiveErrors >= 3) {
-    await notify.notifyReaderError(stats);
+  if (!isDryRun) {
+    if (exitCode !== 0 || stats.consecutiveErrors >= 3) {
+      await notify.notifyReaderError(stats);
+    } else {
+      await notify.notifyReaderDone(stats);
+    }
   }
   // 退出前最后一次余额检查（保证余额日志始终最新）
-  if (!isDryRun) {
+  if (!isDryRun && browserStarted) {
     try {
       const cookie = await browser.getCurrentCookie();
       if (cookie) {
@@ -157,12 +138,31 @@ async function shutdown(reason, stats) {
       logger.warn(`退出前余额更新失败: ${e.message}`);
     }
   }
-  await browser.close();
-  if (!isDryRun) {
+  if (browserStarted) await browser.close();
+  browserStarted = false;
+  if (!isDryRun && queueInitialized) {
     try { queue.close(); } catch (e) { logger.warn(`Queue close failed: ${e.message}`); }
+    queueInitialized = false;
   }
   releaseLock();
-  process.exit(0);
+  process.exit(exitCode);
+}
+
+async function verifyAndBindProfile(cookie) {
+  const fp = fingerprint.generate(cfg.profile);
+  const result = await profileAuth.verifyAndCompare(cfg, cookie, {
+    userAgent: fp.userAgent,
+    acceptLanguage: fp.acceptLanguage,
+  });
+  if (!result.ok) throw new Error(`Profile ${cfg.profile} 认证失败: ${result.message}`);
+  if (result.identityState === 'different') {
+    throw new Error(`Profile ${cfg.profile} 的 Cookie 与已绑定 V2EX 账号不一致，请通过 Telegram 显式换绑`);
+  }
+  if (result.identityState === 'unbound') {
+    profileAuth.safeRemoveChromeProfile(cfg);
+  }
+  profileAuth.writeIdentity(cfg.identityFile, profileAuth.createIdentityRecord(result.identity, result.current));
+  logger.info(`Profile ${cfg.profile} 身份认证通过 (${result.identityState === 'unbound' ? '首次绑定' : '已匹配'})`);
 }
 
 // ========== 主流程 ==========
@@ -171,19 +171,22 @@ async function main() {
     logger.info('[main] SKIP_READER=1, reader scheduler disabled.');
     process.exit(0);
   }
+  if (!isDryRun && PROFILE_LIST.length > 0 && !cfg.profileExplicit) {
+    throw new Error('多账号模式运行 reader 必须显式设置 V2EX_PROFILE');
+  }
   if (!isDryRun) acquireLock();
 
   const stats = { read: 0, changed: 0, elapsed: '0s', consecutiveErrors: 0 };
   const startTime = Date.now();
 
   // 注册退出信号处理
-  const onExit = async (sig) => {
+  const onExit = async (sig, exitCode) => {
     logger.warn(`收到 ${sig}，正在退出...`);
     stats.elapsed = elapsed(startTime);
-    await shutdown(sig, stats);
+    await shutdown(sig, stats, exitCode);
   };
-  process.on('SIGTERM', () => onExit('SIGTERM'));
-  process.on('SIGINT',  () => onExit('SIGINT'));
+  process.on('SIGTERM', () => onExit('SIGTERM', 143).catch(e => logger.error(`SIGTERM 退出失败: ${e.message}`)));
+  process.on('SIGINT',  () => onExit('SIGINT', 130).catch(e => logger.error(`SIGINT 退出失败: ${e.message}`)));
 
   logger.sep();
   logger.info(`🚀 V2EX Reader 启动 (dry-run=${isDryRun})`);
@@ -201,27 +204,32 @@ async function main() {
     await browser.launch(true);
     logger.info(`[DRY-RUN] 使用 ${EFFECTIVE_LIMIT} 条内存模拟帖子，不读取 Cookie、不访问网络、不写入队列`);
   } else {
-    // 初始化队列（async for sql.js）
-    await queue.init();
-    queue.cleanup();
-
-    await browser.launch(false);
-    const cookie = await browser.getCurrentCookie();
+    const cookie = fs.existsSync(cfg.cookieFile) ? fs.readFileSync(cfg.cookieFile, 'utf8').trim() : '';
     if (!cookie) {
       logger.error('无法获取 Cookie，退出');
       await notify.notifySessionExpired();
-      await browser.close();
-      try { queue.close(); } catch (e) { logger.warn(`Queue close failed: ${e.message}`); }
       releaseLock();
       process.exit(1);
     }
+    await verifyAndBindProfile(cookie);
 
-    const balanceState = await balance.init(cookie);
+    // 初始化队列（async for sql.js）
+    await queue.init();
+    queueInitialized = true;
+    queue.cleanup();
+
+    await browser.launch(false);
+    browserStarted = true;
+    const browserCookie = await browser.getCurrentCookie();
+
+    const balanceState = await balance.init(browserCookie);
     if (!balanceState.ok && balanceState.fatal) {
       logger.error(`无法获取余额基线: ${balanceState.message}`);
       await notify.notifySessionExpired();
       await browser.close();
+      browserStarted = false;
       try { queue.close(); } catch (e) { logger.warn(`Queue close failed: ${e.message}`); }
+      queueInitialized = false;
       releaseLock();
       process.exit(1);
     }
@@ -232,7 +240,7 @@ async function main() {
     // 初始填充队列（忽略冷却）
     if (queue.size() < QUEUE_REFILL_THRESHOLD) {
       logger.info('初始填充队列...');
-      const urls = await fetcher.fetchAllForce(cookie);
+      const urls = await fetcher.fetchAllForce(browserCookie);
       queue.add(urls);
     }
 
@@ -297,7 +305,7 @@ async function main() {
         const reason = loginState === 'logged_out'
           ? '连续读帖失败，登录探针确认 Cookie 已失效'
           : '连续读帖失败，登录探针无法确认状态';
-        await shutdown(reason, stats);
+        await shutdown(reason, stats, 1);
       }
     }
 
@@ -364,11 +372,9 @@ function probeLogin(cookie) {
         const loggedOut = body.includes('你要查看的页面需要先登录') ||
                           body.includes('需要先登录') ||
                           body.includes('/signin');
-        const loggedIn = body.includes('/notifications') ||
-                         body.includes('/signout') ||
-                         body.includes('/member/');
-        if (loggedIn) return resolve('logged_in');
         if (loggedOut) return resolve('logged_out');
+        const loggedIn = body.includes('/notifications') && body.includes('/signout');
+        if (loggedIn) return resolve('logged_in');
         resolve('unknown');
       });
     });

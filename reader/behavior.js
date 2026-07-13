@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const MIN_TOTAL_GAP_MS = 8000;
 
 function makeRng(seedStr) {
   const hash = crypto.createHash('sha256').update(String(seedStr)).digest();
@@ -21,6 +22,12 @@ function hasEnv(name) {
 function intEnv(name, def) {
   const v = parseInt(process.env[name], 10);
   return Number.isFinite(v) && v >= 0 ? v : def;
+}
+
+function hasValidIntEnv(name) {
+  if (!hasEnv(name)) return false;
+  const value = parseInt(process.env[name], 10);
+  return Number.isFinite(value) && value >= 0;
 }
 
 function floatEnv(name, def) {
@@ -77,7 +84,15 @@ function resolve(profile) {
   let humanGapMax = resolveHumanGap('READ_HUMAN_GAP_MAX', 'READ_GAP_MAX', 9000, shape.gapMultiplier);
   if (humanGapMax < humanGapMin) humanGapMax = humanGapMin;
 
-  const memorySettleMs = intEnv('READ_MEMORY_SETTLE_MS', 5000);
+  let memorySettleMs = intEnv('READ_MEMORY_SETTLE_MS', 5000);
+  const explicitGapMin = hasValidIntEnv('READ_HUMAN_GAP_MIN') ||
+                         (!hasEnv('READ_HUMAN_GAP_MIN') && hasValidIntEnv('READ_GAP_MIN'));
+  const explicitMemorySettle = hasValidIntEnv('READ_MEMORY_SETTLE_MS');
+  let gapFloorApplied = false;
+  if (!explicitGapMin && !explicitMemorySettle && humanGapMin + memorySettleMs < MIN_TOTAL_GAP_MS) {
+    memorySettleMs += MIN_TOTAL_GAP_MS - humanGapMin - memorySettleMs;
+    gapFloorApplied = true;
+  }
   const balanceCheckInterval = hasEnv('BALANCE_CHECK_INTERVAL')
     ? Math.max(1, intEnv('BALANCE_CHECK_INTERVAL', 50))
     : Math.max(10, 50 + shape.balanceOffset);
@@ -93,6 +108,7 @@ function resolve(profile) {
     memorySettleMs,
     balanceCheckInterval,
     usesLegacyGap,
+    gapFloorApplied,
     summary: {
       dwellMultiplier: Number(shape.dwellMultiplier.toFixed(3)),
       gapMultiplier: Number(shape.gapMultiplier.toFixed(3)),

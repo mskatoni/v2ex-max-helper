@@ -1,6 +1,6 @@
 {
   "name": "v2ex-max-helper-checkin",
-  "version": "1.3.5",
+  "version": "1.3.6",
   "description": "V2EX 每日签到 - Node.js 独立版（含保活机制）",
   "main": "v2ex-checkin.js",
   "scripts": {

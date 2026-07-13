@@ -132,6 +132,8 @@ async function launch(dryRun = false) {
 
   // 注入 Cookies
   const cookies = parseCookieString(cookieStr);
+  // Cookie 文件是当前 profile 登录态的唯一来源，避免 persistent context 残留旧账号凭证。
+  await ctx.clearCookies();
   await ctx.addCookies(cookies);
   logger.info(`已注入 ${cookies.length} 条 Cookie`);
 

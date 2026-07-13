@@ -11,7 +11,7 @@ services:
     volumes:
       - v2ex-data:/app/data
     environment:
-      - TZ=UTC
+      - TZ=${TZ:-Asia/Shanghai}
 
     mem_limit: 2g
     mem_reservation: 512m

@@ -119,9 +119,12 @@ read -rp "签到时间 OnCalendar [*-*-* 09:10:00]: " T_CHECKIN; T_CHECKIN="${T_
 read -rp "保活时间 OnCalendar [*-*-* 00/6:00:00]: " T_PING;   T_PING="${T_PING:-*-*-* 00/6:00:00}"
 read -rp "阅读时间 OnCalendar [*-*-* 09:15:00]: " T_READER; T_READER="${T_READER:-*-*-* 09:15:00}"
 
-# 环境变量：V2EX_PROFILE（非 default 才注入）
-PROFILE_ENV=""
-[[ "$PROFILE" != "default" ]] && PROFILE_ENV="Environment=V2EX_PROFILE=${PROFILE}"
+# 所有单元都显式指定 profile；非 default 单元屏蔽共享路径和启动 Cookie 覆盖值。
+PROFILE_ENV="Environment=V2EX_PROFILE=${PROFILE}"
+PROFILE_ISOLATION_ENV=""
+if [[ "$PROFILE" != "default" ]]; then
+  PROFILE_ISOLATION_ENV=$'Environment=COOKIE_FILE=\nEnvironment=DB_PATH=\nEnvironment=V2EX_COOKIE='
+fi
 
 echo
 info "即将安装（profile=${PROFILE}）："
@@ -149,6 +152,7 @@ Type=oneshot
 User=${RUN_USER}
 Environment=HOME=${RUN_HOME}
 ${PROFILE_ENV}
+${PROFILE_ISOLATION_ENV}
 WorkingDirectory=${workdir}
 ExecStart=${execstart}
 ${extra}

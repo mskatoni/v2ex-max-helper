@@ -27,9 +27,28 @@ function stripHtml(text) {
     .replace(/&amp;/g, '&');
 }
 
+function withProfile(text) {
+  if (cfg.profile === 'default') return text;
+  return `👤 <b>Profile</b>: <code>${cfg.profile}</code>\n${text}`;
+}
+
+function warnPushFailure(channel, detail) {
+  console.warn(`[notify] ${channel} 推送失败: ${detail}`);
+}
+
+function isSuccessStatus(statusCode) {
+  return Number.isInteger(statusCode) && statusCode >= 200 && statusCode < 300;
+}
+
 function sendTelegram(text) {
   if (!isTelegramConfigured()) return Promise.resolve();
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
     const body = JSON.stringify({ chat_id: cfg.telegram.chatId, text, parse_mode: 'HTML' });
     const req = https.request({
       hostname: 'api.telegram.org',
@@ -38,10 +57,25 @@ function sendTelegram(text) {
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {
       res.resume();
-      res.on('end', resolve);
+      res.on('end', () => {
+        if (settled) return;
+        if (!isSuccessStatus(res.statusCode)) {
+          warnPushFailure('Telegram', `HTTP ${res.statusCode || 'unknown'}`);
+        }
+        finish();
+      });
     });
-    req.on('error', resolve); // 推送失败不影响主流程
-    req.setTimeout(10000, () => req.destroy());
+    req.on('error', () => {
+      if (settled) return;
+      warnPushFailure('Telegram', 'network error');
+      finish();
+    });
+    req.setTimeout(10000, () => {
+      if (settled) return;
+      warnPushFailure('Telegram', 'timeout');
+      req.destroy();
+      finish();
+    });
     req.write(body);
     req.end();
   });
@@ -54,10 +88,17 @@ function sendFeishu(text) {
     try {
       target = new URL(cfg.feishu.webhook);
     } catch (_) {
+      warnPushFailure('Feishu', 'invalid webhook URL');
       resolve();
       return;
     }
 
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
     const body = JSON.stringify({
       msg_type: 'text',
       content: { text: `V2EX | ${stripHtml(text)}` },
@@ -72,17 +113,33 @@ function sendFeishu(text) {
       },
     }, (res) => {
       res.resume();
-      res.on('end', resolve);
+      res.on('end', () => {
+        if (settled) return;
+        if (!isSuccessStatus(res.statusCode)) {
+          warnPushFailure('Feishu', `HTTP ${res.statusCode || 'unknown'}`);
+        }
+        finish();
+      });
     });
-    req.on('error', resolve);
-    req.setTimeout(10000, () => req.destroy());
+    req.on('error', () => {
+      if (settled) return;
+      warnPushFailure('Feishu', 'network error');
+      finish();
+    });
+    req.setTimeout(10000, () => {
+      if (settled) return;
+      warnPushFailure('Feishu', 'timeout');
+      req.destroy();
+      finish();
+    });
     req.write(body);
     req.end();
   });
 }
 
 function sendMessage(text) {
-  return Promise.all([sendTelegram(text), sendFeishu(text)]).then(() => undefined);
+  const profiledText = withProfile(text);
+  return Promise.all([sendTelegram(profiledText), sendFeishu(profiledText)]).then(() => undefined);
 }
 
 // ========== 预定义通知模板 ==========
@@ -118,7 +175,7 @@ async function notifySessionExpired() {
   await sendMessage(
     `🔴 <b>V2EX Session 失效</b>\n` +
     `Cookie 已过期，请重新登录并更新 Cookie\n` +
-    `更新方式：将新 Cookie 写入服务器的 <code>~/.v2ex_cookie</code>`
+    `更新方式：通过 Telegram 面板为 profile <code>${cfg.profile}</code> 重新导入 Cookie`
   );
 }
 

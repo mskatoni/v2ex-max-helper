@@ -15,23 +15,30 @@
 
 const https  = require('https');
 const http   = require('http');
+const crypto = require('crypto');
 const fs     = require('fs');
 const path   = require('path');
-const os     = require('os');
 const { spawn } = require('child_process');
 const config = require('../lib/config');
+const fingerprint = require('./fingerprint');
+const profileAuth = require('../lib/profile-auth');
+const profileLock = require('../lib/profile-lock');
+const profileSchedule = require('../lib/profile-schedule');
 
 // ========== 配置 ==========
 const cfg            = config.getConfig();
 const TOKEN          = cfg.telegram.token;
 const SETUP_CODE     = cfg.telegram.setupCode;
 const DATA_DIR       = cfg.readerDataDir;
-const LOCK_FILE       = path.join(os.tmpdir(), 'v2ex_reader.lock');
-const BALANCE_LOG     = cfg.balanceLog;
-const BALANCE_STATUS  = cfg.balanceStatus;
+const LOCK_FILE       = cfg.readerLockFile;
 const READER_LOG      = cfg.readerLog;
 const AUTH_CHAT_FILE  = cfg.authChatFile;
 const INTERNAL_SCHEDULER_DISABLED = config.boolEnv('V2EX_DISABLE_INTERNAL_SCHEDULER');
+const MAX_PROFILE_COUNT = config.MAX_PROFILE_COUNT;
+const PROFILE_LIST = config.parseProfileList();
+const MULTI_PROFILE_MODE = PROFILE_LIST.length > 0;
+const CONTROL_PROFILES = MULTI_PROFILE_MODE ? PROFILE_LIST : [cfg.profile];
+const PROFILE_SELECTION_REQUIRED = CONTROL_PROFILES.length > 1;
 
 let ALLOWED_CHAT_ID = loadAuthorizedChatId();   // 硬锁，唯一授权用户
 
@@ -71,8 +78,7 @@ function saveAuthorizedChatId(chatId) {
   ALLOWED_CHAT_ID = config.saveAuthorizedChatId(chatId, cfg);
 }
 
-// Cookie 文件路径（与 browser.js / v2ex-checkin.js 保持一致）
-const PROFILE     = cfg.profile;
+// 当前进程的 Cookie 路径；多账号子任务通过 getProfileConfig() 解析独立路径。
 const COOKIE_FILE = cfg.cookieFile;
 
 // V2EX 关键 Cookie 字段白名单（按重要性排列）
@@ -95,12 +101,7 @@ function maskId(id) {
 }
 
 function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (_) {
-    return false;
-  }
+  return profileLock.isProcessAlive(pid);
 }
 
 
@@ -177,6 +178,91 @@ function sendDirectMsg(chatId, text) {
 
 // ========== 命令处理 ==========
 
+function getProfileConfig(profile) {
+  if (!MULTI_PROFILE_MODE && profile === cfg.profile) return cfg;
+  return config.getProfileConfig(profile);
+}
+
+function getProfileIndex(profile) {
+  return CONTROL_PROFILES.indexOf(profile);
+}
+
+function getOnlyProfile() {
+  return CONTROL_PROFILES[0];
+}
+
+function profileTitle(profile) {
+  return profile === 'default' ? 'default' : profile;
+}
+
+function hasUsableCookie(file) {
+  try {
+    const stat = fs.statSync(file);
+    return stat.isFile() && stat.size > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+const INTERACTION_TTL_MS = 10 * 60 * 1000;
+const interactionSessions = new Map();
+
+function createInteractionSession(action, extraValue = null, messageId = null, profiles = CONTROL_PROFILES) {
+  const id = crypto.randomBytes(9).toString('base64url');
+  const session = {
+    action,
+    extraValue,
+    messageId,
+    profiles: profiles.slice(),
+    expiresAt: Date.now() + INTERACTION_TTL_MS,
+  };
+  interactionSessions.set(id, session);
+  setTimeout(() => {
+    if (interactionSessions.get(id) === session) interactionSessions.delete(id);
+  }, INTERACTION_TTL_MS).unref();
+  return id;
+}
+
+function getInteractionSession(id, messageId = null) {
+  const session = interactionSessions.get(id);
+  if (!session) return null;
+  if (session.expiresAt <= Date.now() || (session.messageId && messageId && session.messageId !== messageId)) {
+    interactionSessions.delete(id);
+    return null;
+  }
+  return session;
+}
+
+function clearInteractionSessions() {
+  interactionSessions.clear();
+}
+
+function getProfilePickerMarkup(action, extraValue = null, messageId = null) {
+  const sessionId = createInteractionSession(action, extraValue, messageId);
+  const rows = CONTROL_PROFILES.map((profile, index) => {
+    const hasCookie = hasUsableCookie(getProfileConfig(profile).cookieFile);
+    return [{
+      text: `${hasCookie ? '✅' : '⚠️'} ${profile}`,
+      callback_data: `ps:${sessionId}:${index}`,
+    }];
+  });
+  rows.push([{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]);
+  return { inline_keyboard: rows };
+}
+
+function showProfilePicker(action, prompt, messageId = null, extraValue = null) {
+  const text = `👥 <b>${escapeHtml(prompt)}</b>\n\n请选择 profile：`;
+  const markup = getProfilePickerMarkup(action, extraValue, messageId);
+  return messageId
+    ? editMsgText(messageId, text, markup)
+    : sendMsgWithKeyboard(text, markup);
+}
+
+function sendOrEdit(messageId, text, replyMarkup = null) {
+  if (messageId) return editMsgText(messageId, text, replyMarkup || undefined);
+  return replyMarkup ? sendMsgWithKeyboard(text, replyMarkup) : sendMsg(text);
+}
+
 function getMainKeyboardMarkup() {
   return {
     inline_keyboard: [
@@ -204,6 +290,8 @@ function getMainKeyboardMarkup() {
 }
 
 async function handleStart() {
+  clearPendingCookieImport();
+  clearInteractionSessions();
   const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n欢迎回来！你可以直接使用下方按钮完成常用操作；也可以直接粘贴 Cookie 文本，Bot 会自动识别并导入。`;
   return sendMsgWithKeyboard(text, getMainKeyboardMarkup());
 }
@@ -214,48 +302,42 @@ async function handleHelp() {
                `- <code>/start</code>: 打开主交互遥控面板\n` +
                `- <code>/help</code>: 显示当前命令说明\n\n` +
                `💰 <b>数据与状态</b>: \n` +
-               `- <code>/sou</code>: 查询今日与昨日的 V2EX 余额记录\n` +
+               `- <code>/sou [profile]</code>: 查询今日与昨日的 V2EX 余额记录\n` +
                `- <code>/tasks</code>: 实时查询后台签到 / 阅读的运行状态\n\n` +
                `⚙️ <b>脚本控制</b>: \n` +
-               `- <code>/checkin</code>: 立刻开跑手动签到测试\n` +
-               `- <code>/read [数量]</code>: 触发手动阅读测试（默认 5 篇）\n` +
+               `- <code>/checkin [profile]</code>: 立刻开跑手动签到测试\n` +
+               `- <code>/read [数量]</code> 或 <code>/read profile [数量]</code>: 触发手动阅读测试（默认 5 篇）\n` +
                `- 面板「时段分块」: 查看多账号窗口，并手动启动串行签到 + 阅读\n` +
-               `- <code>/stop</code>: 紧急打断正在运行中的阅读/签到任务\n\n` +
+               `- <code>/stop [profile]</code>: 打断当前任务；串行运行时取消后续账号\n\n` +
                `🔧 <b>日志与设置</b>: \n` +
                `- <code>/debug [级别]</code>: 查看/修改日志级别（OFF / ERROR / WARN / INFO）\n` +
-               `- <code>/cookie [内容]</code>: 手动识别并导入新的 V2EX Cookie\n\n` +
-               `💡 <b>小提示</b>：你也可以直接把含有 Cookie 的文本粘贴给我，我会自动智能识别并合并导入。`;
+               `- <code>/cookie [profile] [内容]</code>: 手动识别并导入新的 V2EX Cookie\n\n` +
+               `💡 <b>小提示</b>：你也可以直接粘贴完整 Cookie；验证通过后才会原子替换目标 profile。`;
   return sendMsgWithKeyboard(text, getMainKeyboardMarkup());
 }
 
-async function handleCookieHelp(messageId = null) {
-  const text = `🍪 <b>导入 Cookie</b>\n\n请直接把完整 V2EX Cookie 文本粘贴到当前私聊，Bot 会自动识别、合并并验证登录态。\n\n也可以使用命令：<code>/cookie 你的Cookie内容</code>`;
-  const replyMarkup = { inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]] };
-  if (messageId) return editMsgText(messageId, text, replyMarkup);
-  return sendMsgWithKeyboard(text, replyMarkup);
+async function handleCookieHelp(messageId = null, profile = null) {
+  if (!profile && PROFILE_SELECTION_REQUIRED) {
+    return showProfilePicker('k', '导入 Cookie', messageId);
+  }
+  return beginCookieImport(profile || getOnlyProfile(), messageId);
 }
 
 async function handleTasks() {
-  if (!fs.existsSync(LOCK_FILE)) {
-    if (runningTask || profileSequenceRunning) {
-      const detail = runningTask || '多账号串行队列';
-      return sendMsg(`ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 当前任务: <code>${escapeHtml(detail)}</code>`);
-    }
+  const lock = getActiveReaderLock();
+  if (!runningTask && !profileSequenceRunning && !lock) {
     return sendMsg('ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)');
   }
-  try {
-    const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-    if (!pid || isNaN(pid)) return sendMsg('⚠️ 发现残留锁文件，但 PID 无效');
-    const alive = isProcessAlive(pid);
-    if (alive) {
-      return sendMsg(`ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 运行进程 PID: <code>${pid}</code>\n- 你可以使用 <code>/stop</code> 命令强制打断当前任务。`);
-    } else {
-      try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
-      return sendMsg('ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (已清理残留锁文件)');
-    }
-  } catch (e) {
-    return sendMsg(`❌ 状态查询失败: ${e.message}`);
-  }
+  const taskName = runningTaskName() || (profileSequenceRunning ? '多账号串行队列' : '外部阅读任务');
+  const profile = (runningTask && runningTask.profile) || (lock && lock.profile);
+  const pid = (runningTask && runningTask.child && runningTask.child.pid) || (lock && lock.pid);
+  return sendMsg(
+    `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n` +
+    `- 当前任务: <code>${escapeHtml(taskName)}</code>` +
+    `${profile ? `\n- Profile: <code>${escapeHtml(profile)}</code>` : ''}` +
+    `${pid ? `\n- PID: <code>${pid}</code>` : ''}` +
+    `\n- 使用 <code>/stop${profile ? ` ${escapeHtml(profile)}` : ''}</code> 可停止当前任务。`
+  );
 }
 
 // 格式化硬币显示，优先显示金币和银币
@@ -294,13 +376,17 @@ function formatBalanceStatus(status) {
   return `\n\n最近一次余额检查：<b>${ok}</b>${http}\n时间：<code>${escapeHtml(time)}</code>\n状态：${escapeHtml(detail)}`;
 }
 
-function buildBalanceMessage() {
-  const status = readJsonFile(BALANCE_STATUS);
-  const log = readJsonFile(BALANCE_LOG);
+function buildBalanceMessage(profile = getOnlyProfile()) {
+  const profileCfg = getProfileConfig(profile);
+  const status = readJsonFile(profileCfg.balanceStatus);
+  const log = readJsonFile(profileCfg.balanceLog);
   const days = log ? Object.keys(log).filter(k => /^\d{4}-\d{2}-\d{2}$/.test(k)) : [];
+  const profileSuffix = profile === 'default' && !MULTI_PROFILE_MODE
+    ? ''
+    : ` · ${escapeHtml(profileTitle(profile))}`;
 
   if (!log || days.length === 0) {
-    return '⚠️ 尚无余额记录，脚本至少需成功读取一次余额后才有数据' + formatBalanceStatus(status);
+    return `⚠️ <b>余额记录${profileSuffix}</b>\n\n尚无余额记录，脚本至少需成功读取一次余额后才有数据` + formatBalanceStatus(status);
   }
 
   const now = new Date();
@@ -315,7 +401,7 @@ function buildBalanceMessage() {
     ? new Date(todayEntry.lastTime).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
     : '--';
 
-  let msg = `💰 <b>余额记录</b>\n`;
+  let msg = `💰 <b>余额记录${profileSuffix}</b>\n`;
   msg += todayEntry
     ? `今日 (${today})：${formatCoins(todayEntry, true)}  最后查询 ${todayTime}（本机时间）\n`
     : `今日：暂无记录\n`;
@@ -331,8 +417,8 @@ function buildBalanceMessage() {
 }
 
 // /sou — 从本地余额记录读取，不做实时请求
-async function handleSou() {
-  return sendMsg(buildBalanceMessage());
+async function handleSou(profile = getOnlyProfile()) {
+  return sendMsg(buildBalanceMessage(profile));
 }
 
 // /debug — 修改日志级别，默认不产生日志，一共四个级别
@@ -389,55 +475,171 @@ async function renderDebugKeyboard(messageId) {
   return editMsgText(messageId, text, replyMarkup);
 }
 
-async function handleRead(limitArg, messageId = null) {
-  if (limitArg) {
-    let limit = 5;
-    const parsed = parseInt(limitArg, 10);
-    if (parsed > 0) limit = parsed;
-    const startMsg = `⏳ 正在启动手动阅读（限制阅读 ${limit} 篇）...`;
-    if (messageId) await editMsgText(messageId, startMsg);
-    else await sendMsg(startMsg);
-    const args = ['main.js', '--limit', String(limit)];
-    runScript('手动阅读', process.execPath, args, __dirname);
-    return;
-  }
-  
-  const text = `📖 <b>手动阅读控制面板</b>\n\n请选择本次阅读的文章篇数：`;
-  const replyMarkup = {
-    inline_keyboard: [
-      [
-        { text: '5 篇', callback_data: 'trigger_read_5' },
-        { text: '10 篇', callback_data: 'trigger_read_10' }
-      ],
-      [
-        { text: '50 篇', callback_data: 'trigger_read_50' },
-        { text: '250 篇', callback_data: 'trigger_read_250' }
-      ],
-      [
-        { text: '◀️ 返回面板', callback_data: 'go_to_start' }
-      ]
-    ]
-  };
-  if (messageId) {
-    return editMsgText(messageId, text, replyMarkup);
-  } else {
-    return sendMsgWithKeyboard(text, replyMarkup);
-  }
+function parseReadLimit(value) {
+  const text = String(value || '').trim();
+  if (!/^\d+$/.test(text)) return null;
+  const limit = Number(text);
+  return Number.isSafeInteger(limit) && limit > 0 ? limit : null;
 }
 
-// /stop — 向阅读脚本发送 SIGTERM
-async function handleStop() {
-  if (!fs.existsSync(LOCK_FILE)) {
-    return sendMsg('ℹ️ 阅读脚本未在运行（锁文件不存在）');
+function getReadCountPickerMarkup(profile, messageId = null) {
+  const profileIndex = getProfileIndex(profile);
+  const sessionId = createInteractionSession('r', null, messageId);
+  return {
+    inline_keyboard: [
+      [
+        { text: '5 篇', callback_data: `ps:${sessionId}:${profileIndex}:5` },
+        { text: '10 篇', callback_data: `ps:${sessionId}:${profileIndex}:10` },
+      ],
+      [
+        { text: '50 篇', callback_data: `ps:${sessionId}:${profileIndex}:50` },
+        { text: '250 篇', callback_data: `ps:${sessionId}:${profileIndex}:250` },
+      ],
+      [{ text: '◀️ 返回面板', callback_data: 'go_to_start' }],
+    ],
+  };
+}
+
+function showReadCountPicker(profile, messageId = null) {
+  const text = `📖 <b>手动阅读控制面板</b>\n\nProfile：<code>${escapeHtml(profileTitle(profile))}</code>\n请选择本次阅读的文章篇数：`;
+  return sendOrEdit(messageId, text, getReadCountPickerMarkup(profile, messageId));
+}
+
+function hasActiveReaderLock() {
+  if (!fs.existsSync(LOCK_FILE)) return false;
+  const lock = profileLock.readLock(LOCK_FILE);
+  if (lock && isProcessAlive(lock.pid)) return true;
+  try { profileLock.clearStaleLock(LOCK_FILE); } catch (_) {}
+  return fs.existsSync(LOCK_FILE);
+}
+
+function getActiveReaderLock() {
+  const lock = profileLock.readLock(LOCK_FILE);
+  if (lock && isProcessAlive(lock.pid)) return lock;
+  try { profileLock.clearStaleLock(LOCK_FILE); } catch (_) {}
+  return null;
+}
+
+function getTaskStartError(profile, readerTask = false) {
+  if (!CONTROL_PROFILES.includes(profile)) return `未知 profile: ${profile}`;
+  if (profileSequenceRunning) return '多账号串行任务正在运行';
+  if (runningTask) return `任务 ${runningTaskName()} 正在运行`;
+  if (readerTask && hasActiveReaderLock()) return '已有阅读进程正在运行';
+  const profileCfg = getProfileConfig(profile);
+  if (!hasUsableCookie(profileCfg.cookieFile)) {
+    return `Profile ${profile} 缺少 Cookie，请先导入`;
+  }
+  return '';
+}
+
+function reportManualTaskResult(profile, taskLabel, result) {
+  if (!result) return;
+  let detail = '';
+  if (result.skipped) {
+    const reasons = {
+      busy: '已有任务正在运行',
+      profile_sequence: '多账号串行任务正在运行',
+      missing_cookie: 'Cookie 文件不存在或为空',
+    };
+    detail = reasons[result.reason] || '启动条件不满足';
+  } else if (result.error) {
+    detail = '进程启动失败';
+  } else if (result.status === 'timed_out') {
+    detail = '任务运行超时并已结束';
+  } else if (Number.isInteger(result.code) && result.code !== 0) {
+    detail = `进程以 code ${result.code} 退出`;
+  }
+  if (!detail) return;
+  sendMsg(`❌ Profile <code>${escapeHtml(profile)}</code> ${taskLabel}未完成：${escapeHtml(detail)}`).catch(() => {});
+}
+
+async function startProfileCheckin(profile, messageId = null) {
+  const blocked = getTaskStartError(profile);
+  if (blocked) {
+    return sendOrEdit(messageId, `⚠️ ${escapeHtml(blocked)}`, getMainKeyboardMarkup());
+  }
+
+  const profileCfg = getProfileConfig(profile);
+  const name = `手动签到(${profile})`;
+  const task = runScript(name, process.execPath, ['../checkin/v2ex-checkin.js'], __dirname, {
+    env: childEnvForProfile(profile),
+    cookieFile: profileCfg.cookieFile,
+    timeoutMs: 15 * 60 * 1000,
+    profile,
+    type: 'checkin',
+  });
+  await sendOrEdit(messageId, `⏳ 正在为 <code>${escapeHtml(profileTitle(profile))}</code> 启动手动签到...`);
+  task.then(result => reportManualTaskResult(profile, '签到', result));
+}
+
+async function startProfileRead(profile, limit, messageId = null) {
+  const blocked = getTaskStartError(profile, true);
+  if (blocked) {
+    return sendOrEdit(messageId, `⚠️ ${escapeHtml(blocked)}`, getMainKeyboardMarkup());
+  }
+
+  const profileCfg = getProfileConfig(profile);
+  const name = `手动阅读(${profile})`;
+  const task = runScript(name, process.execPath, ['main.js', '--limit', String(limit)], __dirname, {
+    env: childEnvForProfile(profile),
+    cookieFile: profileCfg.cookieFile,
+    profile,
+    type: 'reader',
+  });
+  await sendOrEdit(
+    messageId,
+    `⏳ 正在为 <code>${escapeHtml(profileTitle(profile))}</code> 启动手动阅读（限制 ${limit} 篇）...`
+  );
+  task.then(result => reportManualTaskResult(profile, '阅读', result));
+}
+
+async function handleRead(profile, limitArg = null, messageId = null) {
+  if (limitArg !== null && limitArg !== undefined && String(limitArg).trim() !== '') {
+    const limit = parseReadLimit(limitArg);
+    if (!limit) {
+      return sendOrEdit(messageId, '❌ 阅读数量必须是大于 0 的整数', getMainKeyboardMarkup());
+    }
+    return startProfileRead(profile, limit, messageId);
+  }
+  return showReadCountPicker(profile, messageId);
+}
+
+// /stop [profile] — 停止当前子任务，并取消尚未运行的串行账号。
+async function handleStop(profile = null) {
+  if (profile && !CONTROL_PROFILES.includes(profile)) return sendUnknownProfile(profile);
+
+  if (runningTask && runningTask.child) {
+    if (profile && runningTask.profile && runningTask.profile !== profile) {
+      return sendMsg(`⚠️ 当前运行的是 <code>${escapeHtml(runningTask.profile)}</code>，未停止其他账号任务`);
+    }
+    if (profileSequenceRunning) sequenceCancelRequested = true;
+    try {
+      runningTask.child.kill('SIGTERM');
+      return sendMsg(
+        `🛑 已停止 <code>${escapeHtml(runningTaskName())}</code>` +
+        `${profileSequenceRunning ? '，并取消后续串行账号' : ''}`
+      );
+    } catch (e) {
+      return sendMsg(`停止失败: ${escapeHtml(e.message)}`);
+    }
+  }
+
+  const lock = getActiveReaderLock();
+  if (profile && lock && lock.profile && lock.profile !== profile) {
+    return sendMsg(`⚠️ 当前阅读账号是 <code>${escapeHtml(lock.profile)}</code>，未停止 <code>${escapeHtml(profile)}</code>`);
+  }
+  if (profileSequenceRunning) sequenceCancelRequested = true;
+  if (!lock) {
+    return sendMsg(profileSequenceRunning
+      ? '🛑 已取消多账号串行队列，当前没有活动子进程'
+      : 'ℹ️ 阅读脚本未在运行');
   }
   try {
-    const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-    if (!pid || isNaN(pid)) return sendMsg('⚠️ 锁文件 PID 无效');
-    process.kill(pid, 'SIGTERM');
-    await sendMsg(`🛑 已向 PID ${pid} 发送停止信号`);
+    process.kill(lock.pid, 'SIGTERM');
+    await sendMsg(`🛑 已停止阅读任务${lock.profile ? `（<code>${escapeHtml(lock.profile)}</code>）` : ''}`);
   } catch (e) {
     if (e.code === 'ESRCH') {
-      fs.unlinkSync(LOCK_FILE);
+      try { profileLock.clearStaleLock(LOCK_FILE); } catch (_) {}
       return sendMsg('ℹ️ 进程已不存在，锁文件已清理');
     }
     return sendMsg(`停止失败: ${e.message}`);
@@ -450,186 +652,235 @@ function escapeHtml(str) {
 
 // ========== Cookie 智能识别导入 ==========
 
-// 从任意文本中提取 V2EX 关键 Cookie 字段
-// 返回 { found: Map<name, value>, missing: string[] } 或 null（未找到 A2）
+const COOKIE_IMPORT_TTL_MS = 5 * 60 * 1000;
+const pendingCookieImports = new Map();
+let activeCookieInputId = null;
+
 function extractCookie(text) {
-  const found = new Map();
-
-  for (const key of V2EX_COOKIE_KEYS) {
-    const re = new RegExp(
-      key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
-      '=("[^"]*"|[^;\\s\\n]+)',
-      'g'
-    );
-
-    let match;
-    while ((match = re.exec(text)) !== null) {
-      let value = match[1].trim();
-      // 去除尾部可能粘上的分号
-      if (value.endsWith(';')) value = value.slice(0, -1);
-      // 保留引号内容
-      if (value) found.set(key, value);
-    }
-  }
-
-  // A2 是必需字段
-  if (!found.has('A2')) return null;
-
-  const missing = V2EX_COOKIE_KEYS.slice(0, 3).filter(k => !found.has(k));
-  return { found, missing };
+  try { return profileAuth.parseCookieInput(text); } catch (_) { return null; }
 }
 
-// 用 Cookie 请求 V2EX 首页，检查登录状态
-function verifyCookie(cookieStr) {
-  return new Promise((resolve) => {
-    const req = https.request({
-      hostname: 'www.v2ex.com',
-      path: '/',
-      method: 'GET',
-      headers: {
-        'Cookie': cookieStr,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html',
-      },
-    }, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => {
-        const loggedIn = !body.includes('你要查看的页面需要先登录') &&
-                         !body.includes('需要先登录') &&
-                         (body.includes('/notifications') || body.includes('/member/'));
-        resolve(loggedIn);
-      });
-    });
-    req.on('error', () => resolve(false));
-    req.setTimeout(15000, () => { req.destroy(); resolve(false); });
-    req.end();
+function setPendingCookieImport(state) {
+  const id = crypto.randomBytes(12).toString('base64url');
+  const pending = { id, ...state, expiresAt: Date.now() + COOKIE_IMPORT_TTL_MS };
+  pendingCookieImports.set(id, pending);
+  setTimeout(() => {
+    const current = pendingCookieImports.get(id);
+    if (current && current.expiresAt <= Date.now()) pendingCookieImports.delete(id);
+    if (!pendingCookieImports.has(id) && activeCookieInputId === id) activeCookieInputId = null;
+  }, COOKIE_IMPORT_TTL_MS).unref();
+  return pending;
+}
+
+function getPendingCookieImport(id = activeCookieInputId) {
+  const pending = id ? pendingCookieImports.get(id) : null;
+  if (!pending) return null;
+  if (pending.expiresAt <= Date.now()) {
+    pendingCookieImports.delete(id);
+    if (activeCookieInputId === id) activeCookieInputId = null;
+    return null;
+  }
+  return pending;
+}
+
+function clearPendingCookieImport(id = null) {
+  if (id) pendingCookieImports.delete(id);
+  else pendingCookieImports.clear();
+  if (!id || activeCookieInputId === id) activeCookieInputId = null;
+}
+
+async function beginCookieImport(profile, messageId = null) {
+  if (!CONTROL_PROFILES.includes(profile)) {
+    return sendOrEdit(messageId, '❌ 未知或已失效的 profile', getMainKeyboardMarkup());
+  }
+  const pending = setPendingCookieImport({ profile, candidate: null, state: 'awaiting_cookie' });
+  activeCookieInputId = pending.id;
+  const text = `🍪 <b>导入 Cookie</b>\n\nProfile：<code>${escapeHtml(profileTitle(profile))}</code>\n请在 5 分钟内粘贴完整 V2EX Cookie。候选凭证会先验证，成功后才原子替换，不会与旧账号字段混合。\n\n也可以使用：<code>/cookie ${escapeHtml(profile)} 你的Cookie内容</code>`;
+  return sendOrEdit(messageId, text, {
+    inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]],
   });
 }
 
-// 处理 Cookie 导入
-async function handleCookieImport(text) {
-  const result = extractCookie(text);
-  if (!result) return false;
+function readOptionalFile(file) {
+  try { return fs.existsSync(file) ? fs.readFileSync(file) : null; } catch (_) { return null; }
+}
 
-  const { found, missing } = result;
+function restoreOptionalFile(file, content) {
+  if (content === null) {
+    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (_) {}
+  } else {
+    config.writeFileAtomic(file, content, { mode: 0o600 });
+  }
+}
 
-  // 与旧 Cookie 合并
-  let oldCookieMap = new Map();
+function stageChromeProfileReset(profileCfg) {
+  const target = path.resolve(profileCfg.chromeProfileDir);
+  const root = path.resolve(path.join(profileCfg.readerDataDir, 'chrome-profile'));
+  const relative = path.relative(root, target);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error('拒绝操作不安全的 Chromium profile 路径');
+  }
+  if (!fs.existsSync(target)) return null;
+  const backup = `${target}.rebind.${process.pid}.${Date.now()}`;
+  fs.renameSync(target, backup);
+  return { target, backup };
+}
+
+function commitProfileCredentials(profileCfg, candidate, verification, replaceIdentity) {
+  const oldCookie = readOptionalFile(profileCfg.cookieFile);
+  const oldIdentity = readOptionalFile(profileCfg.identityFile);
+  let chromeBackup = null;
   try {
-    if (fs.existsSync(COOKIE_FILE)) {
-      const oldStr = fs.readFileSync(COOKIE_FILE, 'utf8').trim();
-      for (const part of oldStr.split(';')) {
-        const s = part.trim();
-        if (!s) continue;
-        const i = s.indexOf('=');
-        if (i < 0) continue;
-        oldCookieMap.set(s.slice(0, i).trim(), s.slice(i + 1).trim());
-      }
+    if (replaceIdentity || verification.identityState === 'unbound') {
+      chromeBackup = stageChromeProfileReset(profileCfg);
     }
-  } catch (_) {}
-
-  // 新值覆盖旧值
-  for (const [k, v] of found) {
-    oldCookieMap.set(k, v);
-  }
-
-  // 组装最终 Cookie 字符串
-  const finalCookie = Array.from(oldCookieMap.entries())
-    .map(([k, v]) => `${k}=${v}`)
-    .join('; ');
-
-  // 确保目录存在
-  const cookieDir = path.dirname(COOKIE_FILE);
-  if (!fs.existsSync(cookieDir)) {
-    fs.mkdirSync(cookieDir, { recursive: true });
-  }
-
-  // 写入文件
-  try {
-    config.writeFileAtomic(COOKIE_FILE, finalCookie, { mode: 0o600 });
+    config.writeFileAtomic(profileCfg.cookieFile, candidate, { mode: 0o600 });
+    const record = profileAuth.createIdentityRecord(
+      verification.identity,
+      replaceIdentity ? null : verification.current
+    );
+    profileAuth.writeIdentity(profileCfg.identityFile, record);
+    if (chromeBackup) fs.rmSync(chromeBackup.backup, { recursive: true, force: false });
   } catch (e) {
-    await sendMsg(`❌ Cookie 写入失败: ${e.message}`);
+    try { restoreOptionalFile(profileCfg.cookieFile, oldCookie); } catch (_) {}
+    try { restoreOptionalFile(profileCfg.identityFile, oldIdentity); } catch (_) {}
+    if (chromeBackup && fs.existsSync(chromeBackup.backup) && !fs.existsSync(chromeBackup.target)) {
+      try { fs.renameSync(chromeBackup.backup, chromeBackup.target); } catch (_) {}
+    }
+    throw e;
+  }
+}
+
+function maskAccount(identity) {
+  const value = String(identity || '');
+  if (value.length <= 2) return '**';
+  return `${value.slice(0, 1)}***${value.slice(-1)}`;
+}
+
+async function importCookieResult(candidateMap, profile, pendingId = null, forceReplace = false) {
+  if (!CONTROL_PROFILES.includes(profile)) {
+    if (pendingId) clearPendingCookieImport(pendingId);
+    await sendMsg('❌ 未知或已失效的 profile');
+    return true;
+  }
+  const profileCfg = getProfileConfig(profile);
+  const candidate = profileAuth.serializeCookieMap(candidateMap);
+  let lockHandle;
+  try {
+    lockHandle = profileLock.acquireLock(profileCfg.credentialLockFile, { profile, task: 'cookie-import' });
+  } catch (e) {
+    if (pendingId) clearPendingCookieImport(pendingId);
+    const owner = e.lock && e.lock.task ? `${e.lock.task}${e.lock.profile ? `(${e.lock.profile})` : ''}` : '其他任务';
+    await sendMsg(`⚠️ Profile <code>${escapeHtml(profile)}</code> 正被 ${escapeHtml(owner)} 使用，暂不能导入 Cookie`);
     return true;
   }
 
-  // 构建识别结果消息
-  const fieldLines = [];
-  for (const key of V2EX_COOKIE_KEYS) {
-    if (found.has(key)) {
-      const label = key === 'A2' ? '登录态' :
-                    key === 'PB3_SESSION' ? '会话' :
-                    key === 'cf_clearance' ? 'CF验证' :
-                    key === 'V2EX_REFERRER' ? '来源' :
-                    key === 'A2O' ? '辅助登录' : 'Analytics';
-      fieldLines.push(`  ✅ ${key}（${label}）`);
+  try {
+    const fp = fingerprint.generate(profile);
+    const verification = await profileAuth.verifyAndCompare(profileCfg, candidate, {
+      userAgent: fp.userAgent,
+      acceptLanguage: fp.acceptLanguage,
+    });
+    if (!verification.ok) {
+      if (pendingId) clearPendingCookieImport(pendingId);
+      await sendMsg(`❌ Profile <code>${escapeHtml(profile)}</code> Cookie 未写入：${escapeHtml(verification.message)}`);
+      return true;
     }
-  }
-  if (missing.length > 0) {
-    for (const key of missing) {
-      fieldLines.push(`  ⚠️ ${key}（未提供，已保留旧值）`);
+
+    if (verification.identityState === 'different' && !forceReplace) {
+      const pending = pendingId ? getPendingCookieImport(pendingId) : null;
+      const state = pending || setPendingCookieImport({ profile, candidate: candidateMap, state: 'replace_confirmation' });
+      state.profile = profile;
+      state.candidate = candidateMap;
+      state.state = 'replace_confirmation';
+      pendingCookieImports.set(state.id, state);
+      await sendMsgWithKeyboard(
+        `⚠️ <b>检测到账号换绑</b>\n\nProfile：<code>${escapeHtml(profile)}</code>\n新账号：<code>${escapeHtml(maskAccount(verification.identity))}</code>\n\n确认后会替换整套 Cookie，并清空该 profile 的旧 Chromium 登录状态。`,
+        { inline_keyboard: [[
+          { text: '确认换绑', callback_data: `ci:${state.id}:replace` },
+          { text: '取消', callback_data: `ci:${state.id}:cancel` },
+        ]] }
+      );
+      return true;
     }
+
+    commitProfileCredentials(profileCfg, candidate, verification, verification.identityState === 'different');
+    if (pendingId) clearPendingCookieImport(pendingId);
+    const fields = Array.from(candidateMap.keys()).filter(key => V2EX_COOKIE_KEYS.includes(key));
+    await sendMsg(
+      `✅ <b>Cookie 已验证并原子更新</b>\n\n` +
+      `Profile：<code>${escapeHtml(profile)}</code>\n` +
+      `账号：<code>${escapeHtml(maskAccount(verification.identity))}</code>\n` +
+      `字段：<code>${escapeHtml(fields.join(', ') || 'A2')}</code>`
+    );
+    return true;
+  } catch (e) {
+    if (pendingId) clearPendingCookieImport(pendingId);
+    await sendMsg(`❌ Profile <code>${escapeHtml(profile)}</code> Cookie 导入失败：${escapeHtml(e.message)}`);
+    return true;
+  } finally {
+    try { lockHandle.release(); } catch (_) {}
+  }
+}
+
+async function applyPendingCookie(profile, messageId, pendingId) {
+  const pending = getPendingCookieImport(pendingId);
+  if (!pending || !pending.candidate) {
+    return sendOrEdit(messageId, '⚠️ Cookie 选择已过期，请重新粘贴 Cookie', getMainKeyboardMarkup());
+  }
+  await sendOrEdit(messageId, `⏳ 正在把 Cookie 保存到 <code>${escapeHtml(profile)}</code>...`);
+  return importCookieResult(pending.candidate, profile, pending.id);
+}
+
+async function handleCookieImport(text, profile = null) {
+  const candidate = extractCookie(text);
+  if (!candidate) return false;
+
+  if (profile) return importCookieResult(candidate, profile);
+
+  const pending = getPendingCookieImport(activeCookieInputId);
+  if (pending && pending.profile) {
+    activeCookieInputId = null;
+    pending.candidate = candidate;
+    pending.state = 'verifying';
+    return importCookieResult(candidate, pending.profile, pending.id);
   }
 
-  await sendMsg(
-    `🍪 <b>Cookie 已更新</b>\n\n` +
-    `识别到以下字段：\n${fieldLines.join('\n')}\n\n` +
-    `⏳ 正在验证有效性...`
-  );
-
-  console.log('[BOT] 验证 Cookie 有效性...');
-  const valid = await verifyCookie(finalCookie);
-  if (valid) {
-    await sendMsg('✅ Cookie 验证通过，登录态正常');
-    console.log('[BOT] Cookie 验证通过');
-  } else {
-    await sendMsg('⚠️ Cookie 已保存，但验证未通过（可能已过期或 CF 拦截）\n请确认 Cookie 是最新的');
-    console.log('[BOT] Cookie 验证未通过');
+  if (PROFILE_SELECTION_REQUIRED) {
+    const staged = setPendingCookieImport({ profile: null, candidate, state: 'choose_profile' });
+    await showProfilePicker('kp', 'Cookie 已识别，请选择保存账号', null, staged.id);
+    return true;
   }
 
-  return true;
+  return importCookieResult(candidate, getOnlyProfile());
 }
 
 // ========== 内置调度器（替代 Docker cron，Render 友好）==========
 
-let runningTask = null; // 防止任务重叠
+let runningTask = null; // { name, profile, type, child, startedAt }
 let profileSequenceRunning = false;
+let sequenceCancelRequested = false;
 
-const MAX_PROFILE_COUNT = 6;
-
-function parseProfileList() {
-  const raw = (process.env.V2EX_PROFILE_LIST || '').trim();
-  if (!raw) return [];
-  const seen = new Set();
-  const profiles = [];
-  for (const item of raw.split(',')) {
-    const profile = item.trim();
-    if (!profile || seen.has(profile)) continue;
-    seen.add(profile);
-    if (profiles.length >= MAX_PROFILE_COUNT) {
-      console.warn(`[调度器] V2EX_PROFILE_LIST 最多支持 ${MAX_PROFILE_COUNT} 个 profile，已忽略后续配置`);
-      break;
-    }
-    profiles.push(profile);
-  }
-  return profiles;
+function runningTaskName() {
+  return runningTask ? runningTask.name : '';
 }
 
-const PROFILE_LIST = parseProfileList();
-const MULTI_PROFILE_MODE = PROFILE_LIST.length > 0;
-const PROFILE_TIME_SLOT_HOURS = Math.max(1, parseFloat(process.env.PROFILE_TIME_SLOT_HOURS || '4') || 4);
+const PROFILE_TIME_SLOT_HOURS = profileSchedule.validateSlotHours(
+  parseFloat(process.env.PROFILE_TIME_SLOT_HOURS || '4'),
+  PROFILE_LIST.length
+);
 const PROFILE_TIME_SLOT_MS = Math.round(PROFILE_TIME_SLOT_HOURS * 60 * 60 * 1000);
 const PROFILE_SEQUENCE_START_LOCAL_MINUTES = 9 * 60 + 10;
 
 function getProfileCookieFile(profile) {
-  const base = path.join(cfg.cookieBaseDir, '.v2ex_cookie');
-  return profile === 'default' ? base : `${base}.${profile}`;
+  return getProfileConfig(profile).cookieFile;
 }
 
 function childEnvForProfile(profile, extra = {}) {
   const env = { ...process.env, ...extra, V2EX_PROFILE: profile };
   if (MULTI_PROFILE_MODE) {
     delete env.COOKIE_FILE;
+    delete env.DB_PATH;
     delete env.V2EX_COOKIE;
   }
   return env;
@@ -678,111 +929,248 @@ function pipeTaskOutput(child, name) {
 
 function runScriptAsync(name, command, args, cwd, options = {}) {
   if (runningTask) {
-    console.log(`[调度器] 跳过 ${name}，上一个任务 ${runningTask} 还在运行`);
-    return Promise.resolve({ skipped: true });
+    console.log(`[调度器] 跳过 ${name}，上一个任务 ${runningTaskName()} 还在运行`);
+    return Promise.resolve({ skipped: true, reason: 'busy' });
   }
   if (profileSequenceRunning && !options.partOfProfileSequence) {
     console.log(`[调度器] 跳过 ${name}，多账号串行任务正在运行`);
-    return Promise.resolve({ skipped: true });
+    return Promise.resolve({ skipped: true, reason: 'profile_sequence' });
   }
 
   // 检查 Cookie 文件是否存在（无 cookie 时跳过，不崩溃）
   const cookieFile = options.cookieFile || COOKIE_FILE;
-  if (options.requireCookie !== false && !fs.existsSync(cookieFile)) {
+  if (options.requireCookie !== false && !hasUsableCookie(cookieFile)) {
     console.log(`[调度器] 跳过 ${name}，Cookie 文件不存在: ${cookieFile}`);
-    return Promise.resolve({ skipped: true });
+    return Promise.resolve({ skipped: true, reason: 'missing_cookie' });
   }
 
   console.log(`[调度器] 启动 ${name}`);
-  runningTask = name;
+  const task = {
+    name,
+    profile: options.profile || null,
+    type: options.type || 'task',
+    child: null,
+    startedAt: new Date().toISOString(),
+  };
+  runningTask = task;
 
-  const child = spawn(command, args, {
-    cwd,
-    env: options.env || { ...process.env },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  let child;
+  try {
+    child = spawn(command, args, {
+      cwd,
+      env: options.env || { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    task.child = child;
+  } catch (e) {
+    if (runningTask === task) runningTask = null;
+    return Promise.resolve({ error: e, status: 'spawn_failed' });
+  }
 
   pipeTaskOutput(child, name);
 
   return new Promise((resolve) => {
     let settled = false;
     let timeout = null;
+    let forceKillTimeout = null;
+    let timedOut = false;
     function finish(result) {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
-      runningTask = null;
+      if (forceKillTimeout) clearTimeout(forceKillTimeout);
+      if (runningTask === task) runningTask = null;
       resolve(result);
     }
 
     if (options.timeoutMs > 0) {
       timeout = setTimeout(() => {
+        timedOut = true;
         console.warn(`[调度器] ${name} 超过 ${Math.round(options.timeoutMs / 60000)} 分钟，发送 SIGTERM`);
         try { child.kill('SIGTERM'); } catch (_) {}
+        forceKillTimeout = setTimeout(() => {
+          console.warn(`[调度器] ${name} 在 SIGTERM 后 30 秒仍未退出，强制结束`);
+          try { child.kill('SIGKILL'); } catch (_) {}
+        }, 30000);
       }, options.timeoutMs);
     }
 
-    child.on('close', (code) => {
-      console.log(`[调度器] ${name} 退出 (code ${code})`);
-      finish({ code });
+    child.on('close', (code, signal) => {
+      console.log(`[调度器] ${name} 退出 (code ${code}, signal ${signal || 'none'})`);
+      finish({
+        code,
+        signal: signal || null,
+        status: timedOut ? 'timed_out' : (code === 0 ? 'ok' : 'failed'),
+      });
     });
 
     child.on('error', (err) => {
       console.error(`[调度器] ${name} 启动失败: ${err.message}`);
-      finish({ error: err });
+      finish({ error: err, status: 'spawn_failed' });
     });
   });
 }
 
-function runScript(name, command, args, cwd) {
-  runScriptAsync(name, command, args, cwd).catch(err => {
+function runScript(name, command, args, cwd, options = {}) {
+  return runScriptAsync(name, command, args, cwd, options).catch(err => {
     console.error(`[调度器] ${name} 执行失败: ${err.message}`);
+    return { error: err };
   });
 }
 
-async function runProfileDailySequence() {
+function waitUntil(targetMs) {
+  return new Promise(resolve => {
+    const tick = () => {
+      if (sequenceCancelRequested || Date.now() >= targetMs) return resolve();
+      setTimeout(tick, Math.min(1000, targetMs - Date.now()));
+    };
+    tick();
+  });
+}
+
+function readScheduleState() {
+  try { return JSON.parse(fs.readFileSync(cfg.scheduleStateFile, 'utf8')); } catch (_) { return null; }
+}
+
+function writeScheduleState(state) {
+  config.writeFileAtomic(cfg.scheduleStateFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+}
+
+function summarizeTaskResult(result) {
+  if (!result) return 'failed';
+  if (result.skipped) return `skipped:${result.reason || 'unknown'}`;
+  return result.status || (result.code === 0 ? 'ok' : 'failed');
+}
+
+async function runProfileDailySequence(options = {}) {
   if (!MULTI_PROFILE_MODE) {
     console.log('[调度器] 跳过多账号串行，未配置 V2EX_PROFILE_LIST');
     return { skipped: true, reason: 'no_profiles' };
   }
-  if (profileSequenceRunning || runningTask) {
-    const busy = profileSequenceRunning ? '多账号串行任务' : runningTask;
+  const activeReader = hasActiveReaderLock();
+  if (profileSequenceRunning || runningTask || activeReader) {
+    const busy = profileSequenceRunning ? '多账号串行任务' : (runningTaskName() || '已有阅读进程');
     console.log(`[调度器] 跳过多账号串行，当前已有任务运行: ${busy}`);
     return { skipped: true, reason: 'busy' };
   }
 
   profileSequenceRunning = true;
+  sequenceCancelRequested = false;
   const results = [];
+  const sequenceStartMs = Number.isFinite(options.startTimeMs) ? options.startTimeMs : Date.now();
+  const cycleId = options.cycleId || null;
+  let scheduleState = cycleId && readScheduleState();
+  if (!scheduleState || scheduleState.cycleId !== cycleId) {
+    scheduleState = {
+      version: 1,
+      cycleId,
+      startTime: new Date(sequenceStartMs).toISOString(),
+      profileOrder: PROFILE_LIST.slice(),
+      profiles: {},
+      cancelled: false,
+      completed: false,
+    };
+  }
   try {
+    if (cycleId && scheduleState.profileOrder && scheduleState.profileOrder.join(',') !== PROFILE_LIST.join(',')) {
+      scheduleState.cancelled = true;
+      scheduleState.completed = true;
+      scheduleState.cancelReason = 'profile_list_changed';
+      writeScheduleState(scheduleState);
+      console.warn('[调度器] 当前周期的 profile 列表已变化，拒绝按旧时段继续运行');
+      return { skipped: true, reason: 'profile_list_changed', results: [] };
+    }
+    scheduleState.profileOrder = PROFILE_LIST.slice();
     console.log(`[调度器] 多账号串行开始: ${PROFILE_LIST.join(', ')} | 每账号窗口约 ${PROFILE_TIME_SLOT_HOURS} 小时`);
-    if (process.env.COOKIE_FILE || process.env.V2EX_COOKIE) {
-      console.warn('[调度器] 多账号模式会忽略 COOKIE_FILE / V2EX_COOKIE，改用按 profile 分隔的 Cookie 文件');
+    if (process.env.COOKIE_FILE || process.env.DB_PATH || process.env.V2EX_COOKIE) {
+      console.warn('[调度器] 多账号子任务会忽略 COOKIE_FILE / DB_PATH / V2EX_COOKIE，改用按 profile 分隔的状态文件');
     }
 
-    for (const profile of PROFILE_LIST) {
+    for (let index = 0; index < PROFILE_LIST.length; index++) {
+      const profile = PROFILE_LIST[index];
+      if (sequenceCancelRequested) break;
+      if (cycleId && scheduleState.profiles[profile] && scheduleState.profiles[profile].completed) continue;
+
+      const slotWindow = profileSchedule.getSlotWindow(sequenceStartMs, PROFILE_TIME_SLOT_MS, index);
+      const slotStart = slotWindow.startTimeMs;
+      const slotEnd = slotWindow.endTimeMs;
+      if (Date.now() < slotStart) await waitUntil(slotStart);
+      if (sequenceCancelRequested) break;
+      if (Date.now() >= slotEnd) {
+        const missed = { skipped: true, reason: 'slot_expired', status: 'missed' };
+        results.push({ profile, checkin: missed, read: missed });
+        if (cycleId) {
+          scheduleState.profiles[profile] = { completed: true, status: 'missed', finishedAt: new Date().toISOString() };
+          writeScheduleState(scheduleState);
+        }
+        continue;
+      }
+
       const env = childEnvForProfile(profile);
       const cookieFile = getProfileCookieFile(profile);
+      if (cycleId) {
+        scheduleState.activeProfile = profile;
+        scheduleState.activeIndex = index;
+        scheduleState.profiles[profile] = { completed: false, status: 'running', startedAt: new Date().toISOString() };
+        writeScheduleState(scheduleState);
+      }
+      const checkinBudget = Math.max(1000, Math.min(15 * 60 * 1000, slotEnd - Date.now()));
       const checkin = await runScriptAsync(`签到(${profile})`, process.execPath, ['../checkin/v2ex-checkin.js'], __dirname, {
         env,
         cookieFile,
-        timeoutMs: 15 * 60 * 1000,
+        timeoutMs: checkinBudget,
         partOfProfileSequence: true,
+        profile,
+        type: 'checkin',
       });
-      const read = await runScriptAsync(`阅读(${profile})`, process.execPath, ['main.js'], __dirname, {
+      if (sequenceCancelRequested) {
+        results.push({ profile, checkin, read: { skipped: true, reason: 'cancelled', status: 'cancelled' } });
+        break;
+      }
+      const remaining = slotEnd - Date.now();
+      let read;
+      if (remaining <= 1000) {
+        read = { skipped: true, reason: 'slot_expired', status: 'missed' };
+      } else {
+        const readerBudget = Math.max(1000, remaining - 30000);
+        const readResult = await runScriptAsync(`阅读(${profile})`, process.execPath, ['main.js'], __dirname, {
         env: childEnvForProfile(profile, {
           READ_DISABLE_DEADLINE: '1',
-          READ_MAX_RUNTIME_MS: String(PROFILE_TIME_SLOT_MS),
+            READ_MAX_RUNTIME_MS: String(readerBudget),
         }),
         cookieFile,
-        timeoutMs: PROFILE_TIME_SLOT_MS + 5 * 60 * 1000,
+          timeoutMs: remaining,
         partOfProfileSequence: true,
+        profile,
+        type: 'reader',
       });
+        read = readResult;
+      }
       results.push({ profile, checkin, read });
+      if (cycleId) {
+        scheduleState.profiles[profile] = {
+          completed: true,
+          status: `${summarizeTaskResult(checkin)}/${summarizeTaskResult(read)}`,
+          finishedAt: new Date().toISOString(),
+        };
+        scheduleState.activeProfile = null;
+        scheduleState.activeIndex = null;
+        writeScheduleState(scheduleState);
+      }
+    }
+    if (cycleId) {
+      scheduleState.cancelled = sequenceCancelRequested;
+      scheduleState.completed = sequenceCancelRequested || PROFILE_LIST.every(profile =>
+        scheduleState.profiles[profile] && scheduleState.profiles[profile].completed
+      );
+      scheduleState.finishedAt = new Date().toISOString();
+      writeScheduleState(scheduleState);
     }
     console.log('[调度器] 多账号串行结束');
-    return { profiles: PROFILE_LIST.length, results };
+    return { profiles: PROFILE_LIST.length, results, cancelled: sequenceCancelRequested };
   } finally {
     profileSequenceRunning = false;
+    sequenceCancelRequested = false;
   }
 }
 
@@ -793,21 +1181,26 @@ async function runProfilePingSequence() {
   }
 
   profileSequenceRunning = true;
+  sequenceCancelRequested = false;
   const results = [];
   try {
     for (const profile of PROFILE_LIST) {
+      if (sequenceCancelRequested) break;
       const cookieFile = getProfileCookieFile(profile);
       const result = await runScriptAsync(`保活(${profile})`, process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname, {
         env: childEnvForProfile(profile),
         cookieFile,
         timeoutMs: 10 * 60 * 1000,
         partOfProfileSequence: true,
+        profile,
+        type: 'ping',
       });
       results.push({ profile, result });
     }
     return { profiles: PROFILE_LIST.length, results };
   } finally {
     profileSequenceRunning = false;
+    sequenceCancelRequested = false;
   }
 }
 
@@ -848,7 +1241,7 @@ function buildProfileSlotMessage() {
   const busyText = profileSequenceRunning
     ? '🟡 多账号串行中'
     : runningTask
-      ? `🟡 ${escapeHtml(runningTask)} 运行中`
+      ? `🟡 ${escapeHtml(runningTaskName())} 运行中`
       : '🟢 空闲';
 
   if (!MULTI_PROFILE_MODE) {
@@ -865,7 +1258,7 @@ function buildProfileSlotMessage() {
   const lines = PROFILE_LIST.map((profile, index) => {
     const start = PROFILE_SEQUENCE_START_LOCAL_MINUTES + index * slotMinutes;
     const end = start + slotMinutes;
-    const cookieStatus = fs.existsSync(getProfileCookieFile(profile)) ? '✅ Cookie' : '⚠️ 缺 Cookie';
+    const cookieStatus = hasUsableCookie(getProfileCookieFile(profile)) ? '✅ Cookie' : '⚠️ 缺 Cookie';
     return `${index + 1}. <code>${escapeHtml(profile)}</code> | 本机时间 ${formatLocalClock(start)}-${formatLocalClock(end)} | ${cookieStatus}`;
   });
 
@@ -888,11 +1281,21 @@ function getProfileSlotKeyboard() {
   return { inline_keyboard: keyboard };
 }
 
+function buildSequenceResultMessage(result) {
+  if (!result || result.skipped) return 'ℹ️ 多账号串行任务未启动，当前配置或运行状态不满足条件。';
+  const lines = result.results.map(item =>
+    `${summarizeTaskResult(item.checkin) === 'ok' && summarizeTaskResult(item.read) === 'ok' ? '✅' : '⚠️'} ` +
+    `<code>${escapeHtml(item.profile)}</code>：签到 ${escapeHtml(summarizeTaskResult(item.checkin))} / 阅读 ${escapeHtml(summarizeTaskResult(item.read))}`
+  );
+  const title = result.cancelled ? '🛑 多账号串行任务已取消' : '📋 多账号串行任务已结束';
+  return `${title}\n\n${lines.join('\n') || '没有执行任何 profile'}`;
+}
+
 async function startProfileSequenceFromPanel(messageId) {
   if (!MULTI_PROFILE_MODE) {
     return editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
   }
-  if (profileSequenceRunning || runningTask) {
+  if (profileSequenceRunning || runningTask || hasActiveReaderLock()) {
     return editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
   }
 
@@ -908,10 +1311,7 @@ async function startProfileSequenceFromPanel(messageId) {
 
   runProfileDailySequence()
     .then(result => {
-      if (result && result.skipped) {
-        return sendMsgWithKeyboard('ℹ️ 多账号串行任务未启动，当前配置或运行状态不满足条件。', getMainKeyboardMarkup());
-      }
-      return sendMsgWithKeyboard(`✅ 多账号串行任务已结束，共处理 ${PROFILE_LIST.length} 个 profile。`, getMainKeyboardMarkup());
+      return sendMsgWithKeyboard(buildSequenceResultMessage(result), getMainKeyboardMarkup());
     })
     .catch(err => {
       console.error(`[调度器] 面板启动多账号串行失败: ${err.message}`);
@@ -919,28 +1319,44 @@ async function startProfileSequenceFromPanel(messageId) {
     });
 }
 
+function getProfileCycle(now = new Date()) {
+  return profileSchedule.getDailyCycle(
+    now,
+    PROFILE_LIST.length,
+    PROFILE_TIME_SLOT_MS,
+    PROFILE_SEQUENCE_START_LOCAL_MINUTES
+  );
+}
+
 function startScheduler() {
   let lastCheckinDate = '';
   let lastReadDate = '';
-  let lastProfileRunDate = '';
   let lastPingSlot = '';
+  let tickActive = false;
 
-  setInterval(() => {
+  const tick = async () => {
+    if (tickActive) return;
+    tickActive = true;
+    try {
     const now = new Date();
     const h = now.getHours();
     const m = now.getMinutes();
     const dateKey = localDateKey(now);
 
     if (MULTI_PROFILE_MODE) {
-      if (h === 9 && m === 10 && dateKey !== lastProfileRunDate) {
-        lastProfileRunDate = dateKey;
-        runProfileDailySequence().catch(e => console.error(`[调度器] 多账号串行失败: ${e.message}`));
+      const cycle = getProfileCycle(now);
+      const state = readScheduleState();
+      const cycleDone = state && state.cycleId === cycle.id && (state.completed || state.cancelled);
+      if (now.getTime() >= cycle.startTimeMs && now.getTime() < cycle.endTimeMs &&
+          !cycleDone && !profileSequenceRunning && !runningTask && !hasActiveReaderLock()) {
+        runProfileDailySequence({ startTimeMs: cycle.startTimeMs, cycleId: cycle.id })
+          .catch(e => console.error(`[调度器] 多账号串行失败: ${e.message}`));
       }
 
       const pingSlot = `${dateKey}:${h}`;
-      if ([0, 6, 12, 18].includes(h) && m === 0 && pingSlot !== lastPingSlot) {
-        lastPingSlot = pingSlot;
-        runProfilePingSequence().catch(e => console.error(`[调度器] 多账号保活失败: ${e.message}`));
+      if ([0, 6, 12, 18].includes(h) && m < 10 && pingSlot !== lastPingSlot && !profileSequenceRunning && !runningTask) {
+        const result = await runProfilePingSequence().catch(e => ({ error: e }));
+        if (!result.skipped && !result.error) lastPingSlot = pingSlot;
       }
       return;
     }
@@ -948,23 +1364,40 @@ function startScheduler() {
     // 每天本机时间 09:10 签到（当天只执行一次）
     if (h === 9 && m === 10 && dateKey !== lastCheckinDate) {
       lastCheckinDate = dateKey;
-      runScript('签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname);
+      const result = await runScript('签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname, {
+        profile: cfg.profile,
+        type: 'checkin',
+      });
+      if (result.skipped || result.error) lastCheckinDate = '';
     }
 
     // 每天本机时间 09:15 阅读（当天只执行一次）
     if (h === 9 && m === 15 && dateKey !== lastReadDate) {
       lastReadDate = dateKey;
       // Render 环境下直接 node，VPS Docker 里可以用 xvfb-run
-      runScript('阅读', process.execPath, ['main.js'], __dirname);
+      const result = await runScript('阅读', process.execPath, ['main.js'], __dirname, {
+        profile: cfg.profile,
+        type: 'reader',
+      });
+      if (result.skipped || result.error) lastReadDate = '';
     }
 
     // 每 6 小时保活（V2EX session 保活，非 Render 保活）
     const pingSlot = `${dateKey}:${h}`;
     if ([0, 6, 12, 18].includes(h) && m === 0 && pingSlot !== lastPingSlot) {
-      lastPingSlot = pingSlot;
-      runScript('保活', process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname);
+      const result = await runScript('保活', process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname, {
+        profile: cfg.profile,
+        type: 'ping',
+      });
+      if (!result.skipped && !result.error) lastPingSlot = pingSlot;
     }
-  }, 60 * 1000); // 每分钟检查一次
+    } finally {
+      tickActive = false;
+    }
+  };
+
+  tick().catch(e => console.error(`[调度器] 初始检查失败: ${e.message}`));
+  setInterval(() => tick().catch(e => console.error(`[调度器] 检查失败: ${e.message}`)), 60 * 1000);
 
   if (MULTI_PROFILE_MODE) {
     console.log(`[调度器] 内置定时任务已启动 (本机时区 ${getLocalTimeZoneInfo()}，多账号串行: ${PROFILE_LIST.join(', ')})`);
@@ -1033,14 +1466,79 @@ function startKeepAlive() {
 // ========== 长轮询主循环（含重启容错）==========
 let offset = 0;
 let pollRetryDelay = 1000; // 初始重试间隔 1 秒
+let pollConflictCount = 0;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+let botShuttingDown = false;
+async function shutdownBot(reason, exitCode) {
+  if (botShuttingDown) return;
+  botShuttingDown = true;
+  sequenceCancelRequested = true;
+  console.warn(`[BOT] 正在退出: ${reason}`);
+  const child = runningTask && runningTask.child;
+  if (child) {
+    try { child.kill('SIGTERM'); } catch (_) {}
+    await Promise.race([
+      new Promise(resolve => child.once('close', resolve)),
+      sleep(30000).then(() => {
+        try { child.kill('SIGKILL'); } catch (_) {}
+      }),
+    ]);
+  } else {
+    await sleep(100);
+  }
+  process.exit(exitCode);
+}
+
+process.once('SIGTERM', () => shutdownBot('SIGTERM', 143).catch(() => process.exit(143)));
+process.once('SIGINT', () => shutdownBot('SIGINT', 130).catch(() => process.exit(130)));
+
+function resolveControlProfile(value) {
+  const profile = String(value || '').trim();
+  return CONTROL_PROFILES.includes(profile) ? profile : null;
+}
+
+function sendUnknownProfile(value) {
+  return sendMsg(
+    `❌ 未知 profile：<code>${escapeHtml(value || '')}</code>\n可用 profile：<code>${CONTROL_PROFILES.map(escapeHtml).join(', ')}</code>`
+  );
+}
+
+async function handleReadCommand(args) {
+  if (args.length === 0) {
+    return PROFILE_SELECTION_REQUIRED
+      ? showProfilePicker('r', '运行阅读')
+      : handleRead(getOnlyProfile());
+  }
+
+  if (args.length === 1) {
+    const limit = parseReadLimit(args[0]);
+    if (limit) {
+      return PROFILE_SELECTION_REQUIRED
+        ? showProfilePicker('r', `运行阅读（限制 ${limit} 篇）`, null, limit)
+        : handleRead(getOnlyProfile(), limit);
+    }
+    const profile = resolveControlProfile(args[0]);
+    if (!profile) return sendUnknownProfile(args[0]);
+    return handleRead(profile);
+  }
+
+  if (args.length === 2) {
+    const profile = resolveControlProfile(args[0]);
+    if (!profile) return sendUnknownProfile(args[0]);
+    return handleRead(profile, args[1]);
+  }
+
+  return sendMsg('❌ 用法：<code>/read [数量]</code> 或 <code>/read profile [数量]</code>');
+}
 
 async function handleMessage(msg) {
   const text = msg.text.trim();
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
-  const arg = parts[1];
+  const args = parts.slice(1);
+  const arg = args[0];
   
   if (cmd === '/start') {
     await handleStart();
@@ -1049,20 +1547,35 @@ async function handleMessage(msg) {
     await handleHelp();
   }
   else if (cmd === '/sou') {
-    await handleSou();
+    if (arg) {
+      const profile = resolveControlProfile(arg);
+      if (!profile) await sendUnknownProfile(arg);
+      else await handleSou(profile);
+    } else if (PROFILE_SELECTION_REQUIRED) {
+      await showProfilePicker('b', '查询余额');
+    } else {
+      await handleSou(getOnlyProfile());
+    }
   }
   else if (cmd === '/debug') {
     await handleDebug(arg);
   }
   else if (cmd === '/stop') {
-    await handleStop();
+    await handleStop(arg || null);
   }
   else if (cmd === '/checkin') {
-    await sendMsg('⏳ 正在启动手动签到...');
-    runScript('手动签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname);
+    if (arg) {
+      const profile = resolveControlProfile(arg);
+      if (!profile) await sendUnknownProfile(arg);
+      else await startProfileCheckin(profile);
+    } else if (PROFILE_SELECTION_REQUIRED) {
+      await showProfilePicker('c', '运行签到');
+    } else {
+      await startProfileCheckin(getOnlyProfile());
+    }
   }
   else if (cmd === '/read') {
-    await handleRead(arg);
+    await handleReadCommand(args);
   }
   else if (cmd === '/tasks') {
     await handleTasks();
@@ -1072,7 +1585,14 @@ async function handleMessage(msg) {
     if (!cookieText) {
       await handleCookieHelp();
     } else {
-      const handled = await handleCookieImport(cookieText);
+      const firstToken = cookieText.split(/\s+/, 1)[0];
+      const profile = resolveControlProfile(firstToken);
+      const remaining = profile ? cookieText.slice(firstToken.length).trim() : cookieText;
+      if (profile && !remaining) {
+        await beginCookieImport(profile);
+        return;
+      }
+      const handled = await handleCookieImport(remaining, profile);
       if (!handled) {
         await sendMsg('❌ 未能从中识别出有效的 V2EX Cookie（如 A2 字段）。请确认格式。');
       }
@@ -1082,9 +1602,14 @@ async function handleMessage(msg) {
     await sendMsgWithKeyboard('未识别命令。常用操作都在下方交互面板里，也可以发送 <code>/help</code> 查看文本命令。', getMainKeyboardMarkup());
   } else {
     // 非命令消息：尝试智能识别 Cookie
+    const hadPendingImport = Boolean(getPendingCookieImport());
     const handled = await handleCookieImport(text);
     if (!handled) {
-      console.log('[BOT] 未识别到有效 Cookie，忽略');
+      if (hadPendingImport) {
+        await sendMsg('❌ 未识别到有效 V2EX Cookie（必须包含 A2 字段），请重新粘贴或返回面板取消');
+      } else {
+        console.log('[BOT] 未识别到有效 Cookie，忽略');
+      }
     }
   }
 }
@@ -1097,21 +1622,71 @@ async function handleCallbackQuery(query) {
   await tgRequest('answerCallbackQuery', { callback_query_id: query.id });
   
   try {
-    if (data === 'run_checkin') {
-      await editMsgText(messageId, '⏳ 正在启动手动签到...');
-      runScript('手动签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname);
+    if (data.startsWith('ps:')) {
+      const [, sessionId, indexValue, callbackExtra] = data.split(':');
+      const session = getInteractionSession(sessionId, messageId);
+      const index = Number(indexValue);
+      const profile = session && Number.isInteger(index) ? session.profiles[index] : null;
+      const action = session && session.action;
+      const extraValue = callbackExtra || (session && session.extraValue) || null;
+      if (!session || !profile || !CONTROL_PROFILES.includes(profile)) {
+        await sendOrEdit(messageId, '⚠️ Profile 选择已失效，请重新打开面板', getMainKeyboardMarkup());
+      } else if (action === 'c') {
+        await startProfileCheckin(profile, messageId);
+      } else if (action === 'r') {
+        await handleRead(profile, extraValue || null, messageId);
+      } else if (action === 'b') {
+        await editMsgText(messageId, buildBalanceMessage(profile), {
+          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]],
+        });
+      } else if (action === 'k') {
+        await beginCookieImport(profile, messageId);
+      } else if (action === 'kp') {
+        await applyPendingCookie(profile, messageId, extraValue);
+      } else {
+        await sendOrEdit(messageId, '⚠️ 操作已失效，请重新打开面板', getMainKeyboardMarkup());
+      }
+    }
+    else if (data.startsWith('ci:')) {
+      const [, pendingId, action] = data.split(':');
+      const pending = getPendingCookieImport(pendingId);
+      if (!pending || pending.state !== 'replace_confirmation' || !pending.profile || !pending.candidate) {
+        await sendOrEdit(messageId, '⚠️ Cookie 换绑确认已过期，请重新导入', getMainKeyboardMarkup());
+      } else if (action === 'cancel') {
+        clearPendingCookieImport(pendingId);
+        await sendOrEdit(messageId, 'ℹ️ 已取消账号换绑，原 Cookie 和 Chromium 状态未修改', getMainKeyboardMarkup());
+      } else if (action === 'replace') {
+        await sendOrEdit(messageId, `⏳ 正在重新验证并换绑 <code>${escapeHtml(pending.profile)}</code>...`);
+        await importCookieResult(pending.candidate, pending.profile, pendingId, true);
+      } else {
+        await sendOrEdit(messageId, '⚠️ Cookie 换绑操作无效', getMainKeyboardMarkup());
+      }
+    }
+    else if (data.startsWith('p:') || data.startsWith('trigger_read_')) {
+      await sendOrEdit(messageId, '⚠️ 旧版按钮未携带可靠的账号信息，请重新打开面板', getMainKeyboardMarkup());
+    }
+    else if (data === 'run_checkin') {
+      if (PROFILE_SELECTION_REQUIRED) {
+        await showProfilePicker('c', '运行签到', messageId);
+      } else {
+        await startProfileCheckin(getOnlyProfile(), messageId);
+      }
     }
     else if (data === 'run_read_panel') {
-      await handleRead(null, messageId);
-    }
-    else if (data.startsWith('trigger_read_')) {
-      const count = data.replace('trigger_read_', '');
-      await handleRead(count, messageId);
+      if (PROFILE_SELECTION_REQUIRED) {
+        await showProfilePicker('r', '运行阅读', messageId);
+      } else {
+        await handleRead(getOnlyProfile(), null, messageId);
+      }
     }
     else if (data === 'query_balance') {
-      await editMsgText(messageId, buildBalanceMessage(), {
-        inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
-      });
+      if (PROFILE_SELECTION_REQUIRED) {
+        await showProfilePicker('b', '查询余额', messageId);
+      } else {
+        await editMsgText(messageId, buildBalanceMessage(getOnlyProfile()), {
+          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]],
+        });
+      }
     }
     else if (data === 'show_profile_slots') {
       await editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
@@ -1129,14 +1704,14 @@ async function handleCallbackQuery(query) {
       const text = `ℹ️ <b>V2EX Max Helper 命令帮助说明</b>\n\n` +
                    `所有常用操作都已集成到主面板按钮；也可以继续使用文本命令：\n\n` +
                    `<code>/start</code> 打开主面板\n` +
-                   `<code>/sou</code> 查询余额\n` +
+                   `<code>/sou [profile]</code> 查询余额\n` +
                    `<code>/tasks</code> 查看任务状态\n` +
-                   `<code>/checkin</code> 手动签到\n` +
-                   `<code>/read [数量]</code> 手动阅读\n` +
+                   `<code>/checkin [profile]</code> 手动签到\n` +
+                   `<code>/read [数量]</code> 或 <code>/read profile [数量]</code> 手动阅读\n` +
                    `面板「时段分块」查看/启动多账号串行\n` +
                    `<code>/debug [级别]</code> 日志级别\n` +
-                   `<code>/stop</code> 停止任务\n` +
-                   `<code>/cookie [内容]</code> 导入 Cookie`;
+                   `<code>/stop [profile]</code> 停止任务并取消后续串行账号\n` +
+                   `<code>/cookie [profile] [内容]</code> 导入 Cookie`;
       await editMsgText(messageId, text, {
         inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
       });
@@ -1146,59 +1721,47 @@ async function handleCallbackQuery(query) {
       await handleDebug(level, messageId);
     }
     else if (data === 'query_tasks') {
-      let statusText = '';
+      const lock = getActiveReaderLock();
+      const taskName = runningTaskName() || (profileSequenceRunning ? '多账号串行队列' : (lock ? '外部阅读任务' : ''));
+      const profile = (runningTask && runningTask.profile) || (lock && lock.profile);
+      const pid = (runningTask && runningTask.child && runningTask.child.pid) || (lock && lock.pid);
+      let statusText = taskName
+        ? `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 当前任务: <code>${escapeHtml(taskName)}</code>` +
+          `${profile ? `\n- Profile: <code>${escapeHtml(profile)}</code>` : ''}` +
+          `${pid ? `\n- PID: <code>${pid}</code>` : ''}`
+        : 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)';
       let keyboard = [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]];
-      if (!fs.existsSync(LOCK_FILE)) {
-        if (runningTask || profileSequenceRunning) {
-          const detail = runningTask || '多账号串行队列';
-          statusText = `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 当前任务: <code>${escapeHtml(detail)}</code>`;
-        } else {
-          statusText = 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)';
-        }
-      } else {
-        const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-        if (pid && isProcessAlive(pid)) {
-          statusText = `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 运行进程 PID: <code>${pid}</code>`;
-          keyboard = [
-            [{ text: '🛑 停止任务', callback_data: 'stop_task' }],
-            [{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]
-          ];
-        } else {
-          try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
-          statusText = 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (已清理残留锁文件)';
-        }
+      if (taskName) {
+        keyboard = [
+          [{ text: '🛑 停止任务', callback_data: 'stop_task' }],
+          [{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]
+        ];
       }
       await editMsgText(messageId, statusText, { inline_keyboard: keyboard });
     }
     else if (data === 'stop_task') {
-      if (!fs.existsSync(LOCK_FILE)) {
-        await editMsgText(messageId, 'ℹ️ 阅读脚本未在运行。', {
-          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
-        });
-        return;
-      }
-      const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-      if (pid && !isNaN(pid)) {
+      if (profileSequenceRunning) sequenceCancelRequested = true;
+      const lock = getActiveReaderLock();
+      const pid = (runningTask && runningTask.child && runningTask.child.pid) || (lock && lock.pid);
+      let statusText = profileSequenceRunning ? '🛑 已取消多账号串行队列。' : 'ℹ️ 当前没有运行任务。';
+      if (pid) {
         try {
-          process.kill(pid, 'SIGTERM');
-          await editMsgText(messageId, `🛑 已发送停止信号给 PID ${pid}。`, {
-            inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
-          });
+          if (runningTask && runningTask.child) runningTask.child.kill('SIGTERM');
+          else process.kill(pid, 'SIGTERM');
+          const profile = (runningTask && runningTask.profile) || (lock && lock.profile);
+          statusText = `🛑 已停止当前任务${profile ? `（<code>${escapeHtml(profile)}</code>）` : ''}。` +
+            `${profileSequenceRunning ? '\n后续串行账号也已取消。' : ''}`;
         } catch (e) {
-          if (e.code === 'ESRCH') {
-            try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
-            await editMsgText(messageId, 'ℹ️ 进程已结束，锁文件已清理。', {
-              inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
-            });
-          } else {
-            await editMsgText(messageId, `❌ 停止失败: ${e.message}`, {
-              inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
-            });
-          }
+          statusText = `❌ 停止失败: ${escapeHtml(e.message)}`;
         }
       }
+      await editMsgText(messageId, statusText, {
+        inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
+      });
     }
     else if (data === 'go_to_start') {
+      clearPendingCookieImport();
+      clearInteractionSessions();
       const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n常用操作都在这里。你也可以直接粘贴 Cookie 文本，Bot 会自动识别并导入。`;
       await editMsgText(messageId, text, getMainKeyboardMarkup());
     }
@@ -1251,12 +1814,19 @@ async function poll() {
     const res = await tgRequest('getUpdates', { offset, timeout: 30, allowed_updates: ['message', 'callback_query'] });
 
     if (res.conflict) {
+      pollConflictCount++;
+      if (pollConflictCount >= 3) {
+        console.error('[BOT] Telegram 409 连续冲突，终止本实例以避免重复调度');
+        await shutdownBot('telegram_conflict', 1);
+        return;
+      }
       await sleep(pollRetryDelay);
       pollRetryDelay = Math.min(pollRetryDelay * 2, 10000);
       return;
     }
 
     pollRetryDelay = 1000;
+    pollConflictCount = 0;
 
     if (!res.ok || !res.result) return;
 
@@ -1323,26 +1893,14 @@ if (ALLOWED_CHAT_ID) {
   // 清除残留锁文件（重启后旧 PID 已无效）
   if (fs.existsSync(LOCK_FILE)) {
     try {
-      const oldPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-      try { process.kill(oldPid, 0); } catch (_) {
-        // 旧进程已不存在，安全删除锁文件
-        fs.unlinkSync(LOCK_FILE);
+      if (profileLock.clearStaleLock(LOCK_FILE)) {
         console.log('[BOT] 已清除残留锁文件');
       }
     } catch (_) {}
   }
 
-  // 从环境变量 V2EX_COOKIE 初始化 Cookie 文件 (用于 Render 等临时容器持久化)
-  if (process.env.V2EX_COOKIE && !fs.existsSync(COOKIE_FILE)) {
-    try {
-      config.writeFileAtomic(COOKIE_FILE, process.env.V2EX_COOKIE.trim(), { mode: 0o600 });
-      console.log('[BOT] 从环境变量 V2EX_COOKIE 初始化 Cookie 文件成功');
-    } catch (e) {
-      console.error(`[BOT] 从环境变量 V2EX_COOKIE 初始化 Cookie 失败: ${e.message}`);
-    }
-  }
-
   // 跳过历史消息（offset 设为最新，带重试）
+  let telegramOwnershipConfirmed = false;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const init = await tgRequest('getUpdates', { offset: -1, timeout: 0 });
@@ -1354,18 +1912,44 @@ if (ALLOWED_CHAT_ID) {
       if (init.ok && init.result.length > 0) {
         offset = init.result[init.result.length - 1].update_id + 1;
       }
+      if (init.ok) telegramOwnershipConfirmed = true;
       break;
     } catch (e) {
       console.error(`[BOT] 初始化失败: ${e.message}，重试中...`);
       await sleep(2000 * (attempt + 1));
     }
   }
+  if (!telegramOwnershipConfirmed) {
+    throw new Error('无法取得 Telegram getUpdates 所有权，拒绝启动内部调度器');
+  }
+
+  // 仅由取得 Telegram 所有权的实例处理环境启动凭证。
+  const startupCookie = process.env.V2EX_COOKIE || '';
+  try {
+    if (startupCookie) {
+      if (MULTI_PROFILE_MODE && (!cfg.profileExplicit || !CONTROL_PROFILES.includes(cfg.profile))) {
+        console.warn('[BOT] 多账号模式下 V2EX_COOKIE 必须同时显式指定列表内的 V2EX_PROFILE，已忽略该启动凭证');
+      } else if (!hasUsableCookie(getProfileConfig(cfg.profile).cookieFile)) {
+        const candidate = extractCookie(startupCookie);
+        if (!candidate) console.error('[BOT] V2EX_COOKIE 格式无效，未写入任何 profile');
+        else await importCookieResult(candidate, cfg.profile);
+      }
+    }
+  } finally {
+    delete process.env.V2EX_COOKIE;
+  }
 
   // 检查 Cookie 状态，构建启动消息
-  const hasCookie = fs.existsSync(COOKIE_FILE);
+  const readyProfiles = CONTROL_PROFILES.filter(profile => hasUsableCookie(getProfileConfig(profile).cookieFile));
+  const missingProfiles = CONTROL_PROFILES.filter(profile => !readyProfiles.includes(profile));
   let startupMsg = '🤖 Bot 已上线';
-  if (!hasCookie) {
-    startupMsg += '\n\n⚠️ 未检测到 Cookie 文件\n💡 请直接粘贴 Cookie 文本，Bot 会自动识别导入';
+  if (CONTROL_PROFILES.length > 1) {
+    startupMsg += `\n✅ Cookie 已就绪 ${readyProfiles.length}/${CONTROL_PROFILES.length}`;
+    if (missingProfiles.length > 0) {
+      startupMsg += `\n⚠️ 缺少 Cookie：<code>${missingProfiles.map(escapeHtml).join(', ')}</code>`;
+    }
+  } else if (readyProfiles.length === 0) {
+    startupMsg += '\n\n⚠️ 未检测到 Cookie 文件\n💡 请从面板选择「导入 Cookie」或直接粘贴 Cookie 文本';
   } else {
     startupMsg += '\n✅ Cookie 文件已就绪';
   }
@@ -1393,4 +1977,7 @@ if (ALLOWED_CHAT_ID) {
   while (true) {
     await poll();
   }
-})();
+})().catch(e => {
+  console.error(`[BOT] 启动失败: ${e.message}`);
+  process.exit(1);
+});

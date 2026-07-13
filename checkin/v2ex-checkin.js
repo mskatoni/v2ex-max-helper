@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.3.5
+ * Version: v1.3.6
  *
  * 用法：
  *   保存 Cookie：
@@ -27,15 +27,18 @@ const http  = require('http');
 const fs    = require('fs');
 const url   = require('url');
 const config = require('../lib/config');
+const profileAuth = require('../lib/profile-auth');
+const profileLock = require('../lib/profile-lock');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.3.5';
+const SCRIPT_VERSION = 'v1.3.6';
 const HOST           = 'www.v2ex.com';
 const COOKIE_ORIGIN  = `https://${HOST}`;
 const MAX_RETRY      = 3;
 
 const cfg = config.getConfig();
 const COOKIE_FILE = cfg.cookieFile;
+const PROFILE_LIST = config.parseProfileList();
 
 // 推送配置（从环境变量或 ~/.v2ex_env 读取，不硬编码）
 const BARK_URL       = cfg.barkUrl;                 // e.g. https://api.day.app/YOUR_KEY
@@ -55,10 +58,6 @@ const COMMON_HEADERS = {
 
 // ========== Cookie 存储 ==========
 function readCookie() {
-  // 如果 Cookie 文件不存在，但环境变量里有，则自动初始化
-  if (process.env.V2EX_COOKIE && !fs.existsSync(COOKIE_FILE)) {
-    writeCookie(process.env.V2EX_COOKIE);
-  }
   try {
     if (fs.existsSync(COOKIE_FILE)) return fs.readFileSync(COOKIE_FILE, 'utf8').trim();
   } catch (e) {}
@@ -182,7 +181,7 @@ function fetchUrlFull(reqUrl, cookie, _redirects = 0, _acc = []) {
       }
       let body = '';
       res.on('data', c => body += c);
-      res.on('end', () => resolve({ body, setCookies: acc }));
+      res.on('end', () => resolve({ body, setCookies: acc, statusCode: res.statusCode }));
     });
     req.on('error', reject);
     req.setTimeout(20000, () => req.destroy(new Error('请求超时')));
@@ -195,6 +194,18 @@ function fetchUrl(reqUrl, cookie) {
 }
 
 // ========== 推送通知 ==========
+function warnPushFailure(channel, detail) {
+  log(`⚠️ ${channel} 推送失败: ${detail}`);
+}
+
+function isSuccessStatus(statusCode) {
+  return Number.isInteger(statusCode) && statusCode >= 200 && statusCode < 300;
+}
+
+function escapeTelegramMarkdown(value) {
+  return String(value || '').replace(/([_*`\[])/g, '\\$1');
+}
+
 function sendBark(title, msg) {
   if (!BARK_URL) return Promise.resolve();
   const target = `${BARK_URL.replace(/\/$/, '')}/${encodeURIComponent(title)}/${encodeURIComponent(msg)}`;
@@ -203,9 +214,15 @@ function sendBark(title, msg) {
 
 function sendTelegram(title, msg) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return Promise.resolve();
-  const text = `*${title}*\n${msg}`;
+  const text = `*${escapeTelegramMarkdown(title)}*\n${escapeTelegramMarkdown(msg)}`;
   const target = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage?chat_id=${TG_CHAT_ID}&text=${encodeURIComponent(text)}&parse_mode=Markdown`;
-  return fetchUrl(target, '').catch(() => {});
+  return fetchUrlFull(target, '')
+    .then((response) => {
+      if (!isSuccessStatus(response.statusCode)) {
+        warnPushFailure('Telegram', `HTTP ${response.statusCode || 'unknown'}`);
+      }
+    })
+    .catch(() => warnPushFailure('Telegram', 'network error'));
 }
 
 function sendFeishu(title, msg) {
@@ -215,9 +232,16 @@ function sendFeishu(title, msg) {
     try {
       target = new url.URL(FEISHU_WEBHOOK);
     } catch (_) {
+      warnPushFailure('Feishu', 'invalid webhook URL');
       resolve();
       return;
     }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
     const body = JSON.stringify({
       msg_type: 'text',
       content: { text: `V2EX | ${title}\n${msg}` },
@@ -232,17 +256,37 @@ function sendFeishu(title, msg) {
       },
     }, (res) => {
       res.resume();
-      res.on('end', resolve);
+      res.on('end', () => {
+        if (settled) return;
+        if (!isSuccessStatus(res.statusCode)) {
+          warnPushFailure('Feishu', `HTTP ${res.statusCode || 'unknown'}`);
+        }
+        finish();
+      });
     });
-    req.on('error', resolve);
-    req.setTimeout(10000, () => req.destroy());
+    req.on('error', () => {
+      if (settled) return;
+      warnPushFailure('Feishu', 'network error');
+      finish();
+    });
+    req.setTimeout(10000, () => {
+      if (settled) return;
+      warnPushFailure('Feishu', 'timeout');
+      req.destroy();
+      finish();
+    });
     req.write(body);
     req.end();
   });
 }
 
 function notify(title, msg) {
-  return Promise.all([sendBark(title, msg), sendTelegram(title, msg), sendFeishu(title, msg)]);
+  const profiledMsg = cfg.profile === 'default' ? msg : `Profile: ${cfg.profile}\n${msg}`;
+  return Promise.all([
+    sendBark(title, profiledMsg),
+    sendTelegram(title, profiledMsg),
+    sendFeishu(title, profiledMsg),
+  ]);
 }
 
 // ========== 解析函数 ==========
@@ -409,15 +453,87 @@ async function doCheckin(attempt = 0) {
 // ========== 入口 ==========
 const args = process.argv.slice(2);
 
-if (args.includes('--save-cookie')) {
-  const cookie = process.env.V2EX_COOKIE || '';
-  if (!cookie) {
-    console.error('请设置环境变量 V2EX_COOKIE="your_cookie_here"');
-    process.exit(1);
+async function verifyExistingIdentity(cookie) {
+  const result = await profileAuth.verifyAndCompare(cfg, cookie, {
+    userAgent: COMMON_HEADERS['User-Agent'],
+    acceptLanguage: COMMON_HEADERS['Accept-Language'],
+  });
+  if (!result.ok) throw new Error(`Profile ${cfg.profile} 认证失败: ${result.message}`);
+  if (result.identityState === 'different') {
+    throw new Error(`Profile ${cfg.profile} 的 Cookie 与已绑定账号不一致，请通过 Telegram 显式换绑`);
   }
-  if (writeCookie(cookie)) console.log(`✅ Cookie 已保存到 ${COOKIE_FILE}`);
-} else if (args.includes('--ping')) {
-  doPing().catch(e => { console.error(e.message); process.exit(1); });
-} else {
-  doCheckin().catch(e => { console.error('未捕获错误:', e.message); process.exit(1); });
+  if (result.identityState === 'unbound') {
+    profileAuth.safeRemoveChromeProfile(cfg);
+  }
+  profileAuth.writeIdentity(cfg.identityFile, profileAuth.createIdentityRecord(result.identity, result.current));
 }
+
+async function saveCookieSafely(rawCookie) {
+  const candidate = profileAuth.serializeCookieMap(profileAuth.parseCookieInput(rawCookie));
+  const result = await profileAuth.verifyAndCompare(cfg, candidate, {
+    userAgent: COMMON_HEADERS['User-Agent'],
+    acceptLanguage: COMMON_HEADERS['Accept-Language'],
+  });
+  if (!result.ok) throw new Error(`Cookie 验证失败: ${result.message}`);
+  if (result.identityState === 'different') {
+    throw new Error(`Profile ${cfg.profile} 已绑定其他账号，请通过 Telegram 显式换绑`);
+  }
+  if (result.identityState === 'unbound') {
+    profileAuth.safeRemoveChromeProfile(cfg);
+  }
+
+  const oldCookie = fs.existsSync(COOKIE_FILE) ? fs.readFileSync(COOKIE_FILE, 'utf8') : null;
+  try {
+    config.writeFileAtomic(COOKIE_FILE, candidate, { mode: 0o600 });
+    profileAuth.writeIdentity(cfg.identityFile, profileAuth.createIdentityRecord(result.identity, result.current));
+  } catch (e) {
+    try {
+      if (oldCookie === null) {
+        if (fs.existsSync(COOKIE_FILE)) fs.unlinkSync(COOKIE_FILE);
+      } else {
+        config.writeFileAtomic(COOKIE_FILE, oldCookie, { mode: 0o600 });
+      }
+    } catch (_) {}
+    throw e;
+  }
+  console.log(`✅ Cookie 已验证并保存到 ${COOKIE_FILE}`);
+}
+
+async function runEntry() {
+  if (PROFILE_LIST.length > 0 && !cfg.profileExplicit) {
+    throw new Error('多账号模式运行签到或保活必须显式设置 V2EX_PROFILE');
+  }
+
+  const lockHandle = profileLock.acquireLock(cfg.credentialLockFile, {
+    profile: cfg.profile,
+    task: args.includes('--save-cookie') ? 'cookie-import' : (args.includes('--ping') ? 'ping' : 'checkin'),
+  });
+  const release = () => {
+    try { lockHandle.release(); } catch (_) {}
+  };
+  process.once('exit', release);
+  try {
+    if (args.includes('--save-cookie')) {
+      const cookie = process.env.V2EX_COOKIE || '';
+      if (!cookie) throw new Error('请设置环境变量 V2EX_COOKIE="your_cookie_here"');
+      await saveCookieSafely(cookie);
+      return;
+    }
+
+    if (PROFILE_LIST.length === 0 && !fs.existsSync(COOKIE_FILE) && process.env.V2EX_COOKIE) {
+      await saveCookieSafely(process.env.V2EX_COOKIE);
+    }
+    const cookie = readCookie();
+    if (cookie) await verifyExistingIdentity(cookie);
+    if (args.includes('--ping')) await doPing();
+    else await doCheckin();
+  } finally {
+    process.removeListener('exit', release);
+    release();
+  }
+}
+
+runEntry().catch(e => {
+  console.error('未捕获错误:', e.message);
+  process.exit(1);
+});

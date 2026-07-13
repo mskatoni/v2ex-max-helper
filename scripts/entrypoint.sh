@@ -8,24 +8,8 @@ DATA_DIR="${V2EX_DATA_DIR:-/app/data}"
 export V2EX_DATA_DIR="$DATA_DIR"
 mkdir -p "$V2EX_DATA_DIR"
 
-# 将 V2EX_COOKIE 环境变量写入文件（供模块读取）。
-# 如果 volume 里已有 cookie，则保留已续期/已通过 Bot 更新的版本。
-if [ -n "${V2EX_COOKIE:-}" ]; then
-  PROFILE="${V2EX_PROFILE:-default}"
-  if [ "$PROFILE" = "default" ]; then
-    COOKIE_TARGET="${V2EX_DATA_DIR}/.v2ex_cookie"
-  else
-    COOKIE_TARGET="${V2EX_DATA_DIR}/.v2ex_cookie.${PROFILE}"
-  fi
-
-  if [ ! -s "$COOKIE_TARGET" ]; then
-    echo "[entrypoint] Writing cookie from env to ${COOKIE_TARGET}"
-    printf '%s' "$V2EX_COOKIE" > "$COOKIE_TARGET"
-    chmod 600 "$COOKIE_TARGET"
-  else
-    echo "[entrypoint] Cookie file already exists, keeping persisted cookie: ${COOKIE_TARGET}"
-  fi
-fi
+# V2EX_COOKIE 由 Node.js 在确认 profile 并验证账号身份后原子写入。
+# 入口脚本不直接触碰登录凭证，避免多账号模式下写入错误槽位。
 
 # Docker 下禁用 bot.js 内置的 HTTP 铁墙（由 server.js 统一提供）
 export DISABLE_HTTP_WALL=1
