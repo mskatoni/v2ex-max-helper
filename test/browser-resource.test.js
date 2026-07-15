@@ -7,6 +7,13 @@ const path = require('node:path');
 const test = require('node:test');
 const browser = require('../reader/browser');
 
+test('Docker keeps only runtime data writable without copying the full app layer', () => {
+  const dockerfile = fs.readFileSync(path.resolve(__dirname, '..', 'Dockerfile'), 'utf8');
+  assert.doesNotMatch(dockerfile, /chown\s+-R\s+v2ex:v2ex\s+\/app(?:\s|$)/);
+  assert.match(dockerfile, /chown\s+v2ex:v2ex\s+\/app\/data/);
+  assert.match(dockerfile, /^USER\s+v2ex\s*$/m);
+});
+
 test('Chromium launch args bound disk caches and keep memory pressure enabled', () => {
   const args = browser.buildLaunchArgs();
   assert.ok(args.includes('--disk-cache-size=67108864'));
