@@ -137,7 +137,12 @@ async function shutdown(reason, stats, exitCode = 0) {
       const cookie = await browser.getCurrentCookie();
       if (cookie) {
         await balance.check(cookie);
-        logger.info('退出前余额已更新');
+        const balanceStatus = balance.getLastStatus();
+        if (balanceStatus && balanceStatus.ok) {
+          logger.info('退出前余额已更新');
+        } else {
+          logger.warn(`退出前余额未更新: ${(balanceStatus && balanceStatus.message) || '状态未知'}`);
+        }
       }
     } catch (e) {
       logger.warn(`退出前余额更新失败: ${e.message}`);
@@ -358,7 +363,7 @@ function elapsed(start) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function probeLogin(cookie) {
+function probeLoginOnce(cookie) {
   if (!cookie) return Promise.resolve('logged_out');
 
   return new Promise((resolve) => {
@@ -393,6 +398,16 @@ function probeLogin(cookie) {
     });
     req.end();
   });
+}
+
+async function probeLogin(cookie, attempts = 3) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const state = await probeLoginOnce(cookie);
+    if (state !== 'unknown' || attempt === attempts) return state;
+    logger.warn(`登录探针暂时无响应，5 秒后重试 (${attempt}/${attempts})`);
+    await sleep(5000);
+  }
+  return 'unknown';
 }
 
 main().catch(async (e) => {

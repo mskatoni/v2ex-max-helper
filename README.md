@@ -4,7 +4,7 @@
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.3.6-blue)
+![Version](https://img.shields.io/badge/version-v1.3.7-blue)
 
 纯 Node.js 实现，可部署在任意 VPS、Docker 或 Render 上挂机运行。包含两个相互独立、可单独使用的模块：
 
@@ -104,7 +104,7 @@ Bot 作为常驻进程运行，负责远程控制和状态查询。
 | **签到 + 自动阅读** | **512 MB** | **建议 1 GB** | Chromium 峰值约 400~700 MB，**务必配 Swap** |
 | **签到 + 自动阅读（推荐）** | **2 GB** | 可不开 | 运行稳定 |
 
-代理默认关闭。确实需要时设置 `V2EX_PROXY_ENABLE=1`，并指定本机代理，例如 `V2EX_PROXY=http://127.0.0.1:7890` 或 `V2EX_PROXY=socks5://127.0.0.1:7890`。代理服务不限定 mihomo，也可以是 xray-core、sing-box、Clash、Surge、gost 等；如果代理在局域网另一台机器上，需要额外设置 `V2EX_PROXY_ALLOW_LAN=1`，项目仍拒绝公网代理。启用代理后若地址、协议或主机校验失败，程序会拒绝启动，不会静默回退到真实出口。
+代理默认关闭。确实需要时设置 `V2EX_PROXY_ENABLE=1`：原生部署可用 `V2EX_PROXY=http://127.0.0.1:7890`，Docker Compose 连接宿主机 mihomo / sing-box 等代理时使用 `V2EX_PROXY=http://host.docker.internal:7890`。未设置 `V2EX_PROXY` 时会依次读取 `https_proxy` / `HTTPS_PROXY`、`http_proxy` / `HTTP_PROXY`、`all_proxy` / `ALL_PROXY`，并遵循 `no_proxy` / `NO_PROXY`；显式 `V2EX_PROXY` 始终优先。项目的 Node.js HTTPS 请求与 Chromium 共用该代理，启用后若配置校验失败会拒绝启动，不静默回退；`NO_PROXY` 中列出的目标属于用户明确允许的直连。局域网代理仍需额外设置 `V2EX_PROXY_ALLOW_LAN=1`，公网代理继续拒绝。
 
 多账号串行阅读可通过 `V2EX_PROFILE_LIST=acc1,acc2` 开启，最多读取前 6 个 profile；名称仅允许字母、数字、下划线和连字符，且不得只靠大小写区分。每个固定时段包含该账号的签到和阅读，全部时段总长不得超过 24 小时。Telegram 面板可按 profile 查询余额、原子导入 Cookie、签到或选择 5/10/50/250 篇阅读；多账号 CLI 未明确指定 `V2EX_PROFILE` 时会拒绝运行。飞书通知 / 交互 Bot 属于社区讨论阶段能力，默认关闭。
 
@@ -269,7 +269,7 @@ systemctl status v2ex-bot                     # 查看状态
 ```
 v2ex-max-helper/
 ├── checkin/                 # 签到模块
-│   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.3.6）
+│   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.3.7）
 │   └── package.json
 ├── reader/                  # 自动阅读 + Bot 模块
 │   ├── main.js              # 阅读主调度器（支持 --dry-run / --limit）

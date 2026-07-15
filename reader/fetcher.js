@@ -2,6 +2,7 @@
 // ========== 帖子 URL 多源抓取 ==========
 const https  = require('https');
 const logger = require('./logger');
+require('../lib/config'); // 独立调用本模块时也先安装共享代理。
 
 const HOST = 'www.v2ex.com';
 

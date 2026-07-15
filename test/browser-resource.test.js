@@ -15,6 +15,24 @@ test('Chromium launch args bound disk caches and keep memory pressure enabled', 
   assert.equal(args.includes('--single-process'), false);
 });
 
+test('Chromium disables QUIC only when the explicit proxy gate is enabled', () => {
+  const previous = process.env.V2EX_PROXY_ENABLE;
+  try {
+    process.env.V2EX_PROXY_ENABLE = '';
+    assert.equal(browser.buildLaunchArgs().includes('--disable-quic'), false);
+    process.env.V2EX_PROXY_ENABLE = '1';
+    assert.equal(browser.buildLaunchArgs().includes('--disable-quic'), true);
+  } finally {
+    if (previous === undefined) delete process.env.V2EX_PROXY_ENABLE;
+    else process.env.V2EX_PROXY_ENABLE = previous;
+  }
+});
+
+test('navigation timeouts rebuild the page before the next post', () => {
+  assert.equal(browser.shouldResetPage(new Error('page.goto: Timeout 30000ms exceeded.')), true);
+  assert.equal(browser.shouldResetPage(new Error('ordinary content error')), false);
+});
+
 test('cache pruning removes only known cache directories above the threshold', () => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'v2ex-browser-cache-'));
   try {

@@ -74,7 +74,7 @@ let page     = null;
 let isDryRun = false;
 
 function buildLaunchArgs() {
-  return [
+  const args = [
     '--disable-blink-features=AutomationControlled',
     '--no-sandbox',
     '--disable-setuid-sandbox',
@@ -88,6 +88,8 @@ function buildLaunchArgs() {
     '--disable-default-apps',
     `--lang=${FP.locale}`,
   ];
+  if (secureProxy.proxyEnabled()) args.push('--disable-quic');
+  return args;
 }
 
 function cachePathSize(target) {
@@ -306,7 +308,8 @@ function randomHumanGapMs() {
 
 function shouldResetPage(error) {
   const msg = String(error && error.message || '');
-  return msg.includes('ERR_TOO_MANY_REDIRECTS') ||
+  return msg.includes('Timeout') ||
+         msg.includes('ERR_TOO_MANY_REDIRECTS') ||
          msg.includes('ERR_HTTP_RESPONSE_CODE_FAILURE') ||
          msg.includes('Navigation to') ||
          msg.includes('chrome-error://');
@@ -453,4 +456,5 @@ module.exports = {
   getProfileInfo,
   buildLaunchArgs,
   pruneBrowserCache,
+  shouldResetPage,
 };

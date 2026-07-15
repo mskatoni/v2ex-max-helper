@@ -13,6 +13,10 @@ services:
     environment:
       - TZ=${TZ:-Asia/Shanghai}
 
+    # Linux Docker 访问宿主机 mihomo / sing-box；Docker Desktop 也兼容此别名。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     mem_limit: 2g
     mem_reservation: 512m
 

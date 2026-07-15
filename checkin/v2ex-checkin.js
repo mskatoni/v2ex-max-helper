@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.3.6
+ * Version: v1.3.7
  *
  * 用法：
  *   保存 Cookie：
@@ -31,7 +31,7 @@ const profileAuth = require('../lib/profile-auth');
 const profileLock = require('../lib/profile-lock');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.3.6';
+const SCRIPT_VERSION = 'v1.3.7';
 const HOST           = 'www.v2ex.com';
 const COOKIE_ORIGIN  = `https://${HOST}`;
 const MAX_RETRY      = 3;
@@ -504,10 +504,23 @@ async function runEntry() {
     throw new Error('多账号模式运行签到或保活必须显式设置 V2EX_PROFILE');
   }
 
-  const lockHandle = profileLock.acquireLock(cfg.credentialLockFile, {
+  const lockDetails = {
     profile: cfg.profile,
     task: args.includes('--save-cookie') ? 'cookie-import' : (args.includes('--ping') ? 'ping' : 'checkin'),
-  });
+  };
+  let waitLogged = false;
+  const lockHandle = args.includes('--save-cookie')
+    ? profileLock.acquireLock(cfg.credentialLockFile, lockDetails)
+    : await profileLock.acquireLockWithWait(cfg.credentialLockFile, lockDetails, {
+      timeoutMs: 4 * 60 * 60 * 1000,
+      retryMs: 30000,
+      onWait(error) {
+        if (waitLogged) return;
+        waitLogged = true;
+        const owner = error.lock && error.lock.task ? error.lock.task : 'unknown';
+        log(`⏳ 当前 profile 正在执行 ${owner}，签到/保活将在锁释放后继续（最多等待 4 小时）`);
+      },
+    });
   const release = () => {
     try { lockHandle.release(); } catch (_) {}
   };
