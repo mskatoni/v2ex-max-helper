@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.3.7
+ * Version: v1.3.8
  *
  * 用法：
  *   保存 Cookie：
@@ -31,7 +31,7 @@ const profileAuth = require('../lib/profile-auth');
 const profileLock = require('../lib/profile-lock');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.3.7';
+const SCRIPT_VERSION = 'v1.3.8';
 const HOST           = 'www.v2ex.com';
 const COOKIE_ORIGIN  = `https://${HOST}`;
 const MAX_RETRY      = 3;

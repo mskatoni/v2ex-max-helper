@@ -23,6 +23,20 @@ test('cookie import verifies before committing and never advertises old-field me
   assert.equal(body.includes('已保留旧值'), false);
 });
 
+test('recognized Telegram cookie messages are deleted before verification or storage', () => {
+  const deleteStart = bot.indexOf('async function deleteCookieSourceMessage');
+  const importStart = bot.indexOf('async function handleCookieImport');
+  const importEnd = bot.indexOf('// ========== 内置调度器', importStart);
+  const body = bot.slice(importStart, importEnd);
+
+  assert.ok(deleteStart >= 0, 'cookie message deletion helper must exist');
+  assert.match(bot.slice(deleteStart, importStart), /tgRequest\('deleteMessage'/);
+  assert.ok(body.indexOf('extractCookie(text)') < body.indexOf('deleteCookieSourceMessage(sourceMessage)'));
+  assert.ok(body.indexOf('deleteCookieSourceMessage(sourceMessage)') < body.indexOf('importCookieResult'));
+  assert.match(bot, /handleCookieImport\(remaining, profile, msg\)/);
+  assert.match(bot, /handleCookieImport\(text, null, msg\)/);
+});
+
 test('container entrypoint does not write V2EX_COOKIE directly', () => {
   const entrypoint = fs.readFileSync(path.join(root, 'scripts', 'entrypoint.sh'), 'utf8');
   assert.equal(entrypoint.includes('printf \'%s\' "$V2EX_COOKIE"'), false);

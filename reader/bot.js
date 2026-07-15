@@ -660,6 +660,25 @@ function extractCookie(text) {
   try { return profileAuth.parseCookieInput(text); } catch (_) { return null; }
 }
 
+async function deleteCookieSourceMessage(message) {
+  const chatId = message && message.chat && message.chat.id;
+  const messageId = message && message.message_id;
+  if (!chatId || !Number.isInteger(messageId)) return;
+
+  try {
+    const result = await tgRequest('deleteMessage', {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+    if (result && result.ok) return;
+  } catch (_) {}
+
+  console.warn('[BOT] Cookie 来源消息自动删除失败，未记录消息内容');
+  try {
+    await sendMsg('⚠️ 已识别 Cookie，但未能自动删除原消息，请立即在 Telegram 中手动删除。');
+  } catch (_) {}
+}
+
 function setPendingCookieImport(state) {
   const id = crypto.randomBytes(12).toString('base64url');
   const pending = { id, ...state, expiresAt: Date.now() + COOKIE_IMPORT_TTL_MS };
@@ -832,9 +851,10 @@ async function applyPendingCookie(profile, messageId, pendingId) {
   return importCookieResult(pending.candidate, profile, pending.id);
 }
 
-async function handleCookieImport(text, profile = null) {
+async function handleCookieImport(text, profile = null, sourceMessage = null) {
   const candidate = extractCookie(text);
   if (!candidate) return false;
+  if (sourceMessage) await deleteCookieSourceMessage(sourceMessage);
 
   if (profile) return importCookieResult(candidate, profile);
 
@@ -1592,7 +1612,7 @@ async function handleMessage(msg) {
         await beginCookieImport(profile);
         return;
       }
-      const handled = await handleCookieImport(remaining, profile);
+      const handled = await handleCookieImport(remaining, profile, msg);
       if (!handled) {
         await sendMsg('❌ 未能从中识别出有效的 V2EX Cookie（如 A2 字段）。请确认格式。');
       }
@@ -1603,7 +1623,7 @@ async function handleMessage(msg) {
   } else {
     // 非命令消息：尝试智能识别 Cookie
     const hadPendingImport = Boolean(getPendingCookieImport());
-    const handled = await handleCookieImport(text);
+    const handled = await handleCookieImport(text, null, msg);
     if (!handled) {
       if (hadPendingImport) {
         await sendMsg('❌ 未识别到有效 V2EX Cookie（必须包含 A2 字段），请重新粘贴或返回面板取消');
