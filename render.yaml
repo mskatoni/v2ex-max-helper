@@ -7,11 +7,12 @@ services:
     region: singapore                 # 建议选 Singapore（靠近 v2ex 服务器）
     healthCheckPath: /health
     envVars:
-      # 以下敏感变量在 Render Dashboard 的 "Environment" 中手动填入
+      # 以下敏感变量只在 Render Dashboard 的 "Environment" 中手动填入
       - key: V2EX_COOKIE
         sync: false
       - key: TG_TOKEN
         sync: false
+      # 免费实例推荐固定配置，避免运行时绑定文件在重启后丢失
       - key: TG_CHAT_ID
         sync: false
       - key: TG_SETUP_CODE
