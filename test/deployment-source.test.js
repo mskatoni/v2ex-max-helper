@@ -15,6 +15,8 @@ test('container uses supported Node, reproducible installs, and supervised child
   assert.match(dockerfile, /^FROM node:24-bookworm-slim$/m);
   assert.match(dockerfile, /npm ci --omit=dev/);
   assert.match(dockerfile, /^HEALTHCHECK /m);
+  assert.match(dockerfile, /^\s+CMD wget /m);
+  assert.doesNotMatch(dockerfile, /\bCMD-SHELL\b/);
   assert.match(dockerfile, /\$\{PORT:-8080\}\/health/);
   assert.match(dockerfile, /^ENTRYPOINT \["\/usr\/bin\/tini", "--"\]$/m);
   assert.match(entrypoint, /^exec node reader\/bot\.js$/m);
