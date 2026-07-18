@@ -1,6 +1,6 @@
 {
   "name": "v2ex-max-helper-reader",
-  "version": "1.4.9",
+  "version": "1.4.10",
   "description": "V2EX 自动阅读活跃度脚本 - Playwright + SQLite",
   "main": "main.js",
   "scripts": {
