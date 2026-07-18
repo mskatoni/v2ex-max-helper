@@ -73,6 +73,15 @@ test('a sign-in string does not override explicit authenticated navigation', () 
   assert.equal(page.ok, true);
 });
 
+test('authenticated topic navigation does not require a signout link', () => {
+  const page = auth.diagnoseHomePage({
+    statusCode: 200,
+    body: '<a class="top" href="/member/Alice">A</a><a href="/notifications">N</a>',
+  });
+  assert.equal(page.ok, true);
+  assert.equal(page.identity, 'alice');
+});
+
 test('home fallback rejects private-route strings that are not navigation links', () => {
   const page = auth.diagnoseHomePage({
     statusCode: 200,

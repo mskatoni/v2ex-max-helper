@@ -405,7 +405,7 @@ fi
 step "7/8 Telegram Bot 常驻服务（可选）"
 if [[ $UPDATE_MODE -eq 1 ]]; then
   # 更新模式下重写受管 Bot unit，确保加载当前安全参数和新代码。
-  if [[ $HAS_SYSTEMD -eq 1 ]] && systemctl list-unit-files 2>/dev/null | grep -q '^v2ex-bot\.service'; then
+  if [[ $HAS_SYSTEMD -eq 1 ]] && systemctl cat v2ex-bot.service >/dev/null 2>&1; then
     BOT_ARGS=(--bot-only --yes --user "$TARGET_USER" --project-root "$PROJ_DIR")
     if bash "${PROJ_DIR}/scripts/install-systemd.sh" "${BOT_ARGS[@]}"; then
       ok "Bot 服务单元已更新并加载新代码"

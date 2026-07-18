@@ -77,15 +77,20 @@ test('installer documents the bot-only path instead of recreating timers', () =>
   assert.match(systemdInstaller, /systemd-analyze calendar "\$T_READER"/);
   assert.match(systemdInstaller, /systemctl restart "\$\{UNIT_BOT\}\.service"/);
   assert.match(systemdInstaller, /systemctl is-active --quiet "\$\{UNIT_BOT\}\.service"/);
+  assert.match(systemdInstaller, /Environment=DISABLE_HTTP_WALL=1/);
   assert.match(installer, /V2EX_PROFILE 不能使用跨平台保留名称/);
   assert.match(systemdInstaller, /profile 不能使用跨平台保留名称/);
 });
 
 test('native updater cannot claim success without loading new code and restarting the bot', () => {
   const installer = read('scripts/install.sh');
+  const systemdInstaller = read('scripts/install-systemd.sh');
   assert.match(installer, /for pkg in curl unzip git rsync/);
   assert.match(installer, /sync_zip_branch "\$PROJ_DIR"/);
   assert.match(installer, /install-systemd\.sh" "\$\{BOT_ARGS\[@\]\}"/);
+  assert.match(installer, /systemctl cat v2ex-bot\.service/);
+  assert.doesNotMatch(installer, /list-unit-files[^\n]*grep -q/);
+  assert.doesNotMatch(systemdInstaller, /list-unit-files[^\n]*grep -q/);
   assert.doesNotMatch(installer, /systemctl try-restart/);
   assert.doesNotMatch(installer, /curl[^\n|]*\|\s*bash/);
   assert.doesNotMatch(installer, /rm -rf "\$PROJ_DIR"/);

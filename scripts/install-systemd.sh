@@ -88,7 +88,7 @@ if [[ $DO_UNINSTALL -eq 1 ]]; then
   for u in "${UNIT_CHECKIN}.timer" "${UNIT_PING}.timer" "${UNIT_READER}.timer" \
            "${UNIT_CHECKIN}.service" "${UNIT_PING}.service" "${UNIT_READER}.service" \
            "${UNIT_BOT}.service"; do
-    if systemctl list-unit-files | grep -q "^${u}"; then
+    if systemctl cat "$u" >/dev/null 2>&1; then
       systemctl disable --now "$u" >/dev/null 2>&1 || true
     fi
     rm -f "${SYSD}/${u}"
@@ -262,6 +262,7 @@ UMask=0077
 Environment=HOME=${RUN_HOME}
 ${PROFILE_ENV}
 Environment=V2EX_DISABLE_INTERNAL_SCHEDULER=1
+Environment=DISABLE_HTTP_WALL=1
 WorkingDirectory=${RDR_DIR}
 ExecStart=${NODE_BIN} bot.js
 Restart=always
