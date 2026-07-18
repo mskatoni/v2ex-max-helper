@@ -4,10 +4,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const root = path.resolve(__dirname, '..');
 const bot = fs.readFileSync(path.join(root, 'reader', 'bot.js'), 'utf8');
 const main = fs.readFileSync(path.join(root, 'reader', 'main.js'), 'utf8');
+const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
 
 test('legacy read callbacks cannot launch the first profile', () => {
   assert.equal(bot.includes('await handleRead(getOnlyProfile(), count'), false);
@@ -69,8 +71,8 @@ test('binding secrets are deleted and compared without ordinary string equality'
   const end = bot.indexOf('async function poll', start);
   const body = bot.slice(start, end);
   assert.match(body, /deleteBindingSourceMessage\(msg\)/);
-  assert.match(body, /safeSecretEqual\(bindMatch\[1\]\.trim\(\), SETUP_CODE\)/);
-  assert.doesNotMatch(body, /bindMatch\[1\]\.trim\(\) !== SETUP_CODE/);
+  assert.match(body, /safeSecretEqual\(bindCommand\.argsText, SETUP_CODE\)/);
+  assert.doesNotMatch(body, /bindCommand\.argsText !== SETUP_CODE/);
   assert.match(bot, /function loadAuthorizedChatId\(\) \{\s*return cfg\.telegram\.chatId;\s*\}/);
   const boundStart = bot.indexOf('async function handleMessage');
   const boundEnd = bot.indexOf('async function handleCallbackQuery', boundStart);
@@ -168,9 +170,73 @@ test('text and panel help share one complete command reference', () => {
   const help = (bot.match(/function buildHelpText\(\)[\s\S]*?\n}\n\nasync function handleHelp/) || [])[0] || '';
   for (const command of ['/start', '/help', '/sou', '/tasks', '/checkin', '/read', '/stop', '/cookie', '/debug', '/bind']) {
     assert.equal(help.includes(command), true, `help should include ${command}`);
+    assert.equal(readme.includes(`\`${command}`), true, `README should include ${command}`);
   }
   assert.match(bot, /handleHelp\(\)[\s\S]{0,100}buildHelpText\(\)/);
   assert.match(bot, /data === 'show_help'[\s\S]{0,100}buildHelpText\(\)/);
+});
+
+test('text and panel task status use the same state builder', () => {
+  assert.match(bot, /async function handleTasks\(\) \{\s*return sendMsg\(buildTaskStatusView\(\)\.text\);/);
+  const callbackStart = bot.indexOf("else if (data === 'query_tasks')");
+  const callbackEnd = bot.indexOf("else if (data.startsWith('st:'))", callbackStart);
+  assert.match(bot.slice(callbackStart, callbackEnd), /const status = buildTaskStatusView\(\)/);
+});
+
+test('Telegram command aliases, bot mentions, and command menu stay compatible', () => {
+  assert.ok(bot.includes("'/balance': '/sou'"));
+  assert.ok(bot.includes("'/status': '/tasks'"));
+  assert.ok(bot.includes("'/stats': '/tasks'"));
+  assert.match(bot, /const parsedCommand = parseTelegramCommand\(text\)/);
+  assert.match(bot, /\(\?:@\[a-z0-9_\]\+\)\?/i);
+  for (const command of ['start', 'help', 'sou', 'tasks', 'checkin', 'read', 'stop', 'cookie', 'debug', 'bind']) {
+    assert.ok(bot.includes(`{ command: '${command}'`), `menu should include ${command}`);
+  }
+  assert.match(bot, /tgRequest\('deleteMyCommands'/);
+  assert.match(bot, /tgRequest\('setMyCommands'/);
+  assert.match(bot, /scope: \{ type: 'chat', chat_id: ALLOWED_CHAT_ID \}/);
+
+  const aliasesStart = bot.indexOf('const TELEGRAM_COMMAND_ALIASES');
+  const aliasesEnd = bot.indexOf('\n\nif (!TOKEN)', aliasesStart);
+  const parserStart = bot.indexOf('function parseTelegramCommand');
+  const parserEnd = bot.indexOf('\n\nasync function handleReadCommand', parserStart);
+  const sandbox = {};
+  vm.runInNewContext(
+    `${bot.slice(aliasesStart, aliasesEnd)}\n${bot.slice(parserStart, parserEnd)}\n` +
+    'result = { parseTelegramCommand };',
+    sandbox
+  );
+  const parse = sandbox.result.parseTelegramCommand;
+  assert.equal(parse('/stats').command, '/tasks');
+  assert.equal(parse('/status@v2ex_reader_bot').command, '/tasks');
+  assert.equal(parse('/balance 1').command, '/sou');
+  assert.deepEqual(Array.from(parse('/balance 1').args), ['1']);
+  assert.equal(parse('/cookie@v2ex_reader_bot A2=secret; PB3_SESSION=session').argsText, 'A2=secret; PB3_SESSION=session');
+  assert.equal(parse('A2=secret'), null);
+});
+
+test('every emitted callback has a current handler and mutating panels expire', () => {
+  const callbackStart = bot.indexOf('async function handleCallbackQuery');
+  const callbackEnd = bot.indexOf('async function handleUnboundMessage', callbackStart);
+  const callbackBody = bot.slice(callbackStart, callbackEnd);
+  const staticCallbacks = new Set(
+    [...bot.matchAll(/callback_data:\s*'([^']+)'/g)].map(match => match[1])
+  );
+  for (const callback of staticCallbacks) {
+    assert.ok(callbackBody.includes(`data === '${callback}'`), `missing handler for ${callback}`);
+  }
+  const dynamicPrefixes = new Set(
+    [...bot.matchAll(/callback_data:\s*`([a-z]+):/g)].map(match => match[1])
+  );
+  for (const prefix of dynamicPrefixes) {
+    assert.ok(callbackBody.includes(`data.startsWith('${prefix}:')`), `missing handler for ${prefix}:*`);
+  }
+  assert.equal(bot.includes("callback_data: 'run_profile_sequence'"), false);
+  assert.equal(bot.includes("callback_data: 'set_debug_off'"), false);
+  assert.match(bot, /callback_data: `sq:\$\{sessionId\}`/);
+  assert.match(bot, /callback_data: `ds:\$\{sessionId\}:off`/);
+  assert.match(callbackBody, /data === 'run_profile_sequence'[\s\S]{0,220}已拒绝执行/);
+  assert.match(callbackBody, /data\.startsWith\('set_debug_'\)[\s\S]{0,220}原设置未改变/);
 });
 
 test('Bot escapes user-controlled values in HTML error replies', () => {

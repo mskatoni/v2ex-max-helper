@@ -103,3 +103,11 @@ test('Feishu callback listener is loopback-only and debug reads are bounded', ()
   assert.match(source, /req\.on\('aborted'/);
   assert.doesNotMatch(source, /readFileSync\(cfg\.readerLog/);
 });
+
+test('Feishu status command accepts Telegram-compatible aliases', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const source = fs.readFileSync(path.resolve(__dirname, '..', 'reader', 'feishu-bot.js'), 'utf8');
+  assert.match(source, /case '\/status':[\s\S]{0,80}case '\/tasks':[\s\S]{0,80}case '\/stats':/);
+  assert.match(source, /case '\/start':[\s\S]{0,40}case '\/help':/);
+});

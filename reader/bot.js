@@ -1,11 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // ========== V2EX Telegram Bot 命令处理器 ==========
-// 常驻进程，长轮询 Telegram，响应：
-//   /sou   — 今日最后一次余额查询 & 昨日余额
-//   /debug — 最新报错（日志末尾 ERROR/WARN 行）
-//   /stop  — 停止正在运行的阅读脚本
-//   直接粘贴 Cookie — 智能识别并导入
+// 常驻进程，长轮询 Telegram，提供账号、签到、阅读、状态、日志和 Cookie 控制。
 //
 // 配置（环境变量或 ~/.v2ex_env 文件）：
 //   TG_TOKEN    — Telegram Bot Token
@@ -87,6 +83,25 @@ const V2EX_COOKIE_KEYS = [
   '_gid',            // ⚪ Google Analytics
 ];
 
+const TELEGRAM_COMMANDS = Object.freeze([
+  { command: 'start', description: '打开交互遥控中心' },
+  { command: 'help', description: '查看完整命令帮助' },
+  { command: 'sou', description: '查询账号余额记录' },
+  { command: 'tasks', description: '查看当前任务状态' },
+  { command: 'checkin', description: '手动运行签到' },
+  { command: 'read', description: '手动运行阅读任务' },
+  { command: 'stop', description: '停止当前任务' },
+  { command: 'cookie', description: '导入或更新账号 Cookie' },
+  { command: 'debug', description: '查看或修改日志级别' },
+  { command: 'bind', description: '首次绑定授权用户' },
+]);
+
+const TELEGRAM_COMMAND_ALIASES = Object.freeze({
+  '/balance': '/sou',
+  '/status': '/tasks',
+  '/stats': '/tasks',
+});
+
 if (!TOKEN) { console.error('TG_TOKEN 未设置'); process.exit(1); }
 
 function maskId(id) {
@@ -163,6 +178,36 @@ function tgRequest(method, params) {
     req.write(body);
     req.end();
   });
+}
+
+async function syncTelegramCommands() {
+  try {
+    const staleScopes = [
+      { type: 'default' },
+      { type: 'all_private_chats' },
+      { type: 'all_group_chats' },
+      { type: 'all_chat_administrators' },
+    ];
+    let synced = true;
+    for (const scope of staleScopes) {
+      const result = await tgRequest('deleteMyCommands', { scope });
+      if (!result || !result.ok) synced = false;
+    }
+    if (ALLOWED_CHAT_ID) {
+      const result = await tgRequest('setMyCommands', {
+        commands: TELEGRAM_COMMANDS,
+        scope: { type: 'chat', chat_id: ALLOWED_CHAT_ID },
+      });
+      if (!result || !result.ok) synced = false;
+    }
+    if (!synced) {
+      console.warn('[BOT] Telegram 命令菜单同步不完整，将继续运行并在下次启动重试');
+    }
+    return synced;
+  } catch (_) {
+    console.warn('[BOT] Telegram 命令菜单同步失败，将继续运行并在下次启动重试');
+    return false;
+  }
 }
 
 function sendMsg(text) {
@@ -415,9 +460,9 @@ function buildHelpText() {
     '• 面板「时段分块」：按本机时区查看各位置的起止时间、空闲/任务分配，并可启动串行签到 + 阅读。',
     '',
     '💰 <b>余额与状态</b>',
-    '• <code>/sou</code>：读取当前账号最近保存的余额记录，不会立即访问 V2EX。',
+    '• <code>/sou</code>：读取当前账号最近保存的余额记录，不会立即访问 V2EX；兼容旧命令 <code>/balance</code>。',
     '• <code>/sou 1</code>：读取账号位置 <code>1</code> 的余额记录。',
-    '• <code>/tasks</code>：查看当前签到、阅读或多账号串行任务，以及正在运行的 profile 和 PID。',
+    '• <code>/tasks</code>：查看当前签到、阅读或多账号串行任务，以及正在运行的 profile 和 PID；兼容 <code>/status</code>、<code>/stats</code>。',
     '',
     '⚙️ <b>签到与阅读</b>',
     '• <code>/checkin</code>：为当前账号手动签到。',
@@ -454,21 +499,31 @@ async function handleCookieHelp(messageId = null, profile = null) {
   return beginCookieImport(profile || getActiveControlProfile(), messageId);
 }
 
-async function handleTasks() {
+function buildTaskStatusView() {
   const lock = getActiveReaderLock();
   if (!runningTask && !profileSequenceRunning && !lock) {
-    return sendMsg('ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)');
+    return {
+      active: false,
+      profile: null,
+      text: 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)',
+    };
   }
   const taskName = runningTaskName() || (profileSequenceRunning ? '多账号串行队列' : '外部阅读任务');
   const profile = (runningTask && runningTask.profile) || (lock && lock.profile) || sequenceActiveProfile;
   const pid = (runningTask && runningTask.child && runningTask.child.pid) || (lock && lock.pid);
-  return sendMsg(
-    `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n` +
+  return {
+    active: true,
+    profile,
+    text: `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n` +
     `- 当前任务: <code>${escapeHtml(taskName)}</code>` +
     `${profile ? `\n- Profile: <code>${escapeHtml(profile)}</code>` : ''}` +
     `${pid ? `\n- PID: <code>${pid}</code>` : ''}` +
-    `\n- 使用 <code>/stop${profile ? ` ${escapeHtml(profile)}` : ''}</code> 可停止当前任务。`
-  );
+    `\n- 使用 <code>/stop${profile ? ` ${escapeHtml(profile)}` : ''}</code> 可停止当前任务。`,
+  };
+}
+
+async function handleTasks() {
+  return sendMsg(buildTaskStatusView().text);
 }
 
 // 格式化硬币显示，优先显示金币和银币
@@ -588,17 +643,18 @@ async function handleDebug(levelArg, messageId = null) {
   }
 }
 
-function getDebugKeyboardMarkup() {
+function getDebugKeyboardMarkup(messageId = null) {
   const checked = (level) => currentLogLevel === level ? ' 🔹' : '';
+  const sessionId = createInteractionSession('d', null, messageId, []);
   return {
     inline_keyboard: [
       [
-        { text: `OFF${checked('OFF')}`, callback_data: 'set_debug_off' },
-        { text: `ERROR${checked('ERROR')}`, callback_data: 'set_debug_error' }
+        { text: `OFF${checked('OFF')}`, callback_data: `ds:${sessionId}:off` },
+        { text: `ERROR${checked('ERROR')}`, callback_data: `ds:${sessionId}:error` }
       ],
       [
-        { text: `WARN${checked('WARN')}`, callback_data: 'set_debug_warn' },
-        { text: `INFO${checked('INFO')}`, callback_data: 'set_debug_info' }
+        { text: `WARN${checked('WARN')}`, callback_data: `ds:${sessionId}:warn` },
+        { text: `INFO${checked('INFO')}`, callback_data: `ds:${sessionId}:info` }
       ],
       [
         { text: '◀️ 返回面板', callback_data: 'go_to_start' }
@@ -609,7 +665,7 @@ function getDebugKeyboardMarkup() {
 
 async function renderDebugKeyboard(messageId) {
   const text = `⚙️ <b>日志级别配置</b>\n\n当前设置: <code>${currentLogLevel}</code>\n\n请点击下方按钮快速切换日志输出等级：`;
-  const replyMarkup = getDebugKeyboardMarkup();
+  const replyMarkup = getDebugKeyboardMarkup(messageId);
   return editMsgText(messageId, text, replyMarkup);
 }
 
@@ -1667,10 +1723,11 @@ function buildProfileSlotMessage() {
     `流程：每个 profile 依次执行 <b>签到 → 阅读</b>，同一时间只启动一个子进程。`;
 }
 
-function getProfileSlotKeyboard() {
+function getProfileSlotKeyboard(messageId = null) {
   const keyboard = [];
   if (MULTI_PROFILE_MODE) {
-    keyboard.push([{ text: '▶️ 立即串行签到+阅读', callback_data: 'run_profile_sequence' }]);
+    const sessionId = createInteractionSession('q', null, messageId, PROFILE_LIST);
+    keyboard.push([{ text: '▶️ 立即串行签到+阅读', callback_data: `sq:${sessionId}` }]);
   }
   keyboard.push([{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]);
   return { inline_keyboard: keyboard };
@@ -1688,10 +1745,10 @@ function buildSequenceResultMessage(result) {
 
 async function startProfileSequenceFromPanel(messageId) {
   if (!MULTI_PROFILE_MODE) {
-    return editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
+    return editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard(messageId));
   }
   if (profileSequenceRunning || runningTask || hasActiveReaderLock()) {
-    return editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
+    return editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard(messageId));
   }
 
   const text = `⏳ 已启动多账号串行任务。\n\n` +
@@ -2007,6 +2064,21 @@ function sendUnknownProfile(value) {
   );
 }
 
+function parseTelegramCommand(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/^\/([^\s@]+)(?:@[a-z0-9_]+)?(?=\s|$)/i);
+  if (!match) return null;
+  const enteredCommand = `/${match[1].toLowerCase()}`;
+  const command = TELEGRAM_COMMAND_ALIASES[enteredCommand] || enteredCommand;
+  const argsText = text.slice(match[0].length).trim();
+  return {
+    command,
+    enteredCommand,
+    argsText,
+    args: argsText ? argsText.split(/\s+/) : [],
+  };
+}
+
 async function handleReadCommand(args) {
   if (args.length === 0) {
     return handleRead(getActiveControlProfile());
@@ -2033,9 +2105,20 @@ async function handleReadCommand(args) {
 
 async function handleMessage(msg) {
   const text = msg.text.trim();
-  const parts = text.split(/\s+/);
-  const cmd = parts[0].toLowerCase();
-  const args = parts.slice(1);
+  const parsedCommand = parseTelegramCommand(text);
+  if (!parsedCommand) {
+    const hadPendingImport = Boolean(getPendingCookieImport());
+    const handled = await handleCookieImport(text, null, msg);
+    if (!handled) {
+      if (hadPendingImport) {
+        await sendMsg('❌ 未识别到有效 V2EX Cookie（必须包含 A2 字段），请重新粘贴或返回面板取消');
+      } else {
+        console.log('[BOT] 未识别到有效 Cookie，忽略');
+      }
+    }
+    return;
+  }
+  const { command: cmd, args, argsText } = parsedCommand;
   const arg = args[0];
   
   if (cmd === '/start') {
@@ -2079,7 +2162,7 @@ async function handleMessage(msg) {
     await handleTasks();
   }
   else if (cmd === '/cookie') {
-    const cookieText = text.slice(cmd.length).trim();
+    const cookieText = argsText;
     if (!cookieText) {
       await handleCookieHelp();
     } else {
@@ -2105,19 +2188,8 @@ async function handleMessage(msg) {
       }
     }
   }
-  else if (cmd.startsWith('/')) {
+  else {
     await sendMsgWithKeyboard('未识别命令。常用操作都在下方交互面板里，也可以发送 <code>/help</code> 查看文本命令。', getMainKeyboardMarkup());
-  } else {
-    // 非命令消息：尝试智能识别 Cookie
-    const hadPendingImport = Boolean(getPendingCookieImport());
-    const handled = await handleCookieImport(text, null, msg);
-    if (!handled) {
-      if (hadPendingImport) {
-        await sendMsg('❌ 未识别到有效 V2EX Cookie（必须包含 A2 字段），请重新粘贴或返回面板取消');
-      } else {
-        console.log('[BOT] 未识别到有效 Cookie，忽略');
-      }
-    }
   }
 }
 
@@ -2225,10 +2297,23 @@ async function handleCallbackQuery(query) {
       );
     }
     else if (data === 'show_profile_slots') {
-      await editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
+      await editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard(messageId));
+    }
+    else if (data.startsWith('sq:')) {
+      const [, sessionId] = data.split(':');
+      const session = getInteractionSession(sessionId, messageId);
+      const profilesMatch = session && session.action === 'q' &&
+        session.profiles.length === PROFILE_LIST.length &&
+        session.profiles.every((profile, index) => profile === PROFILE_LIST[index]);
+      if (!profilesMatch) {
+        await sendOrEdit(messageId, '⚠️ 串行任务按钮已过期，未启动任何任务。请重新打开时段分块。', getMainKeyboardMarkup(messageId));
+      } else {
+        interactionSessions.delete(sessionId);
+        await startProfileSequenceFromPanel(messageId);
+      }
     }
     else if (data === 'run_profile_sequence') {
-      await startProfileSequenceFromPanel(messageId);
+      await sendOrEdit(messageId, '⚠️ 旧版串行任务按钮没有时效保护，已拒绝执行。请重新打开时段分块。', getMainKeyboardMarkup(messageId));
     }
     else if (data === 'config_debug') {
       await handleDebug(null, messageId);
@@ -2244,34 +2329,35 @@ async function handleCallbackQuery(query) {
         inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
       });
     }
+    else if (data.startsWith('ds:')) {
+      const [, sessionId, level] = data.split(':');
+      const session = getInteractionSession(sessionId, messageId);
+      if (!session || session.action !== 'd' || !['off', 'error', 'warn', 'info'].includes(level)) {
+        await sendOrEdit(messageId, '⚠️ 日志级别按钮已过期，原设置未改变。请重新打开日志级别面板。', getMainKeyboardMarkup(messageId));
+      } else {
+        interactionSessions.delete(sessionId);
+        await handleDebug(level, messageId);
+      }
+    }
     else if (data.startsWith('set_debug_')) {
-      const level = data.replace('set_debug_', '');
-      await handleDebug(level, messageId);
+      await sendOrEdit(messageId, '⚠️ 旧版日志按钮没有时效保护，原设置未改变。请重新打开日志级别面板。', getMainKeyboardMarkup(messageId));
     }
     else if (data === 'query_tasks') {
-      const lock = getActiveReaderLock();
-      const taskName = runningTaskName() || (profileSequenceRunning ? '多账号串行队列' : (lock ? '外部阅读任务' : ''));
-      const profile = (runningTask && runningTask.profile) || (lock && lock.profile) || sequenceActiveProfile;
-      const pid = (runningTask && runningTask.child && runningTask.child.pid) || (lock && lock.pid);
-      let statusText = taskName
-        ? `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 当前任务: <code>${escapeHtml(taskName)}</code>` +
-          `${profile ? `\n- Profile: <code>${escapeHtml(profile)}</code>` : ''}` +
-          `${pid ? `\n- PID: <code>${pid}</code>` : ''}`
-        : 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)';
+      const status = buildTaskStatusView();
       let keyboard = [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]];
-      if (taskName) {
+      if (status.active) {
         const stopSessionId = createInteractionSession(
           'x',
           getActiveTaskSnapshot(),
           messageId,
-          profile ? [profile] : []
+          status.profile ? [status.profile] : []
         );
         keyboard = [
           [{ text: '🛑 停止任务', callback_data: `st:${stopSessionId}` }],
           [{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]
         ];
       }
-      await editMsgText(messageId, statusText, { inline_keyboard: keyboard });
+      await editMsgText(messageId, status.text, { inline_keyboard: keyboard });
     }
     else if (data.startsWith('st:')) {
       const [, sessionId] = data.split(':');
@@ -2310,7 +2396,8 @@ async function handleUnboundMessage(msg) {
   }
 
   const text = (msg.text || '').trim();
-  if (/^\/bind(?:\s|$)/i.test(text) && msg.message_id) {
+  const bindCommand = parseTelegramCommand(text);
+  if (bindCommand && bindCommand.command === '/bind' && msg.message_id) {
     await deleteBindingSourceMessage(msg);
   }
   if (!SETUP_CODE) {
@@ -2322,8 +2409,7 @@ async function handleUnboundMessage(msg) {
     return;
   }
 
-  const bindMatch = text.match(/^\/bind\s+(.+)$/);
-  if (!bindMatch || !safeSecretEqual(bindMatch[1].trim(), SETUP_CODE)) {
+  if (!bindCommand || bindCommand.command !== '/bind' || !safeSecretEqual(bindCommand.argsText, SETUP_CODE)) {
     await sendDirectMsg(
       msg.chat.id,
       '🔐 <b>Bot 尚未绑定授权用户</b>\n\n请发送 <code>/bind 你的绑定口令</code> 完成绑定。'
@@ -2334,6 +2420,7 @@ async function handleUnboundMessage(msg) {
   try {
     saveAuthorizedChatId(msg.chat.id);
     console.log(`[BOT] 已绑定授权 Chat ID: ${maskId(ALLOWED_CHAT_ID)}`);
+    await syncTelegramCommands();
     await sendDirectMsg(
       ALLOWED_CHAT_ID,
       '✅ <b>授权绑定成功</b>\n\n你的 Telegram Chat ID 只保存在运行时数据目录，不会写入仓库或日志明文。'
@@ -2482,6 +2569,7 @@ if (ALLOWED_CHAT_ID) {
   if (!telegramOwnershipConfirmed) {
     throw new Error('无法取得 Telegram getUpdates 所有权，拒绝启动内部调度器');
   }
+  await syncTelegramCommands();
 
   let staleBackupCount = 0;
   for (const profile of CONTROL_PROFILES) {

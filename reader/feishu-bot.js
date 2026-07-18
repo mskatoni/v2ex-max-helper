@@ -299,11 +299,12 @@ async function handleCommand(text, chatId, senderId, chatType) {
   const command = String(text || '').split(/\s+/)[0].toLowerCase();
   const prefix = senderId ? `@${maskId(senderId)}\n` : '';
   switch (command) {
+    case '/start':
     case '/help':
       return sendFeishuMessage(chatId,
         `${prefix}可用命令：\n` +
-        '/sou - 查询余额记录\n' +
-        '/status - 查看运行状态\n' +
+        '/sou - 查询余额记录（兼容 /balance）\n' +
+        '/status - 查看运行状态（兼容 /tasks、/stats）\n' +
         '/debug - 查看最近 reader 日志\n' +
         '/stop - 停止正在运行的阅读脚本'
       );
@@ -311,6 +312,8 @@ async function handleCommand(text, chatId, senderId, chatType) {
     case '/balance':
       return sendFeishuMessage(chatId, `${prefix}${buildBalanceText()}`);
     case '/status':
+    case '/tasks':
+    case '/stats':
       return sendFeishuMessage(chatId, `${prefix}${buildStatusText()}`);
     case '/debug':
       return sendFeishuMessage(chatId, `${prefix}${readDebugText()}`);
