@@ -481,11 +481,26 @@ function formatBalance(html) {
 }
 
 function parseLoginStatus(html) {
-  if (!html) return { logged_in: false };
-  const hasSignout = /<a\b[^>]*\bhref=["']\/signout(?:\?[^"']*)?["'][^>]*>/i.test(html);
-  const hasSignin = /<a\b[^>]*\bhref=["']\/signin(?:\?[^"']*)?["'][^>]*>/i.test(html);
-  const loggedOutText = html.includes('你要查看的页面需要先登录') || html.includes('需要先登录');
-  return { logged_in: hasSignout && !loggedOutText && !(hasSignin && !hasSignout) };
+  const body = String(html || '');
+  if (!body) return { logged_in: false, definitive: false, code: 'empty_page' };
+
+  const challenge = /cf-challenge|cf-browser-verification|challenge-platform|just a moment|attention required/i.test(body);
+  if (challenge) return { logged_in: false, definitive: false, code: 'challenge_page' };
+
+  const hasSignout = /<a\b[^>]*\bhref=["']\/signout(?:\?[^"']*)?["'][^>]*>/i.test(body);
+  const hasSignin = /\b(?:href|action)=["']\/signin(?:\?[^"']*)?["']/i.test(body);
+  const loggedOutText = body.includes('你要查看的页面需要先登录') || body.includes('需要先登录');
+  if (loggedOutText || (hasSignin && !hasSignout)) {
+    return { logged_in: false, definitive: true, code: 'logged_out' };
+  }
+  if (hasSignout) return { logged_in: true, definitive: true, code: 'signout_link' };
+
+  // V2EX 的签到页目前可能省略 /signout，但仍保留通知入口和唯一账号导航。
+  const navigation = profileAuth.diagnoseHomePage({ statusCode: 200, body });
+  if (navigation.ok) {
+    return { logged_in: true, definitive: true, code: 'authenticated_navigation' };
+  }
+  return { logged_in: false, definitive: false, code: 'page_unrecognized' };
 }
 
 async function getOnce(cookie) {
@@ -495,7 +510,14 @@ async function getOnce(cookie) {
   );
   const { body: html, setCookies } = response;
   const status = parseLoginStatus(html);
-  if (!status.logged_in) return { once: '', logged_in: false, already: false, days: '?' };
+  if (!status.logged_in) {
+    if (!status.definitive) {
+      const error = new Error(`签到页无法确认登录状态 (${status.code})`);
+      error.code = status.code;
+      throw error;
+    }
+    return { once: '', logged_in: false, already: false, days: '?' };
+  }
   // 签到访问也会触发登录态续期，写回刷新后的 Cookie
   const refreshedCookie = refreshCookieFromResponse(cookie, setCookies);
   const days = (html.match(/已连续登录\s*(\d+)\s*天/) || [])[1] || '?';
@@ -547,9 +569,13 @@ async function doPing() {
     const { body: html, setCookies } = response;
     const status = parseLoginStatus(html);
     if (!status.logged_in) {
-      log('❌ Cookie 已失效（保活检测）');
-      await notify('V2EX ⚠️ Cookie 失效', '请重新登录 V2EX 并更新 Cookie，签到将中断！');
-      log('📢 告警已发送（如已配置推送）');
+      if (status.definitive) {
+        log('❌ Cookie 已失效（保活检测）');
+        await notify('V2EX ⚠️ Cookie 失效', '请重新登录 V2EX 并更新 Cookie，签到将中断！');
+        log('📢 告警已发送（如已配置推送）');
+      } else {
+        log(`⚠️  保活页无法确认登录状态 (${status.code})，本次不判定 Cookie 失效`);
+      }
       process.exitCode = 1;
     } else {
       // 关键：把服务端下发的续期 Cookie 写回，实现登录态自动刷新

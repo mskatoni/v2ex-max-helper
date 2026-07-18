@@ -33,10 +33,42 @@ test('flat cookie persistence ignores incompatible Path and Domain scopes', () =
   assert.match(merged.cookie, /PB3_SESSION=fresh/);
 });
 
-test('login status requires real authenticated navigation', () => {
-  assert.equal(checkin.parseLoginStatus('<script>const route="/signout"</script>').logged_in, false);
-  assert.equal(checkin.parseLoginStatus('<a href="/signin">Sign in</a>').logged_in, false);
+test('login status accepts authenticated navigation when mission page omits signout', () => {
+  const missionPage = [
+    '<a class="top" href="/member/alice">alice</a>',
+    '<a href="/notifications">Notifications</a>',
+    '<div>每日登录奖励已领取</div>',
+  ].join('');
+
+  assert.deepEqual(checkin.parseLoginStatus('<script>const route="/signout"</script>'), {
+    logged_in: false,
+    definitive: false,
+    code: 'page_unrecognized',
+  });
+  assert.deepEqual(checkin.parseLoginStatus('<a href="/signin">Sign in</a>'), {
+    logged_in: false,
+    definitive: true,
+    code: 'logged_out',
+  });
   assert.equal(checkin.parseLoginStatus('<a href="/signout?once=1">Sign out</a>').logged_in, true);
+  assert.deepEqual(checkin.parseLoginStatus(missionPage), {
+    logged_in: true,
+    definitive: true,
+    code: 'authenticated_navigation',
+  });
+});
+
+test('challenge and unknown pages are not reported as expired cookies', () => {
+  assert.deepEqual(checkin.parseLoginStatus('<title>Just a moment...</title>'), {
+    logged_in: false,
+    definitive: false,
+    code: 'challenge_page',
+  });
+  assert.deepEqual(checkin.parseLoginStatus('<html>temporary response</html>'), {
+    logged_in: false,
+    definitive: false,
+    code: 'page_unrecognized',
+  });
 });
 
 test('HTTP success guard rejects redirects and error pages', () => {
