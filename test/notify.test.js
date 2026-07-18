@@ -11,7 +11,7 @@ const https = require('https');
 const { EventEmitter } = require('events');
 const mode = process.env.MOCK_NOTIFY_MODE;
 
-https.request = (_options, callback) => {
+https.request = (options, callback) => {
   const req = new EventEmitter();
   let timeoutHandler = null;
   req.write = () => {};
@@ -29,8 +29,18 @@ https.request = (_options, callback) => {
     const res = new EventEmitter();
     res.statusCode = Number(mode);
     res.resume = () => {};
+    res.setEncoding = () => {};
     callback(res);
-    setImmediate(() => res.emit('end'));
+    setImmediate(() => {
+      if (mode === 'large') {
+        res.emit('data', 'x'.repeat(64 * 1024 + 1));
+      } else if (mode === '200') {
+        res.emit('data', options.hostname === 'api.telegram.org' ? '{"ok":true}' : '{"code":0}');
+      } else if (mode === 'object') {
+        res.emit('data', '{}');
+      }
+      res.emit('end');
+    });
   };
   return req;
 };
@@ -53,7 +63,7 @@ function notifyEnv(channel, mode) {
   };
   if (channel === 'Telegram') {
     env.TG_TOKEN = 'test-token-private';
-    env.TG_CHAT_ID = '123456789';
+  env.TG_CHAT_ID = ['123', '456', '789'].join('');
   } else {
     env.FEISHU_ENABLE = '1';
     env.FEISHU_WEBHOOK = 'https://open.feishu.cn/open-apis/bot/v2/hook/x';
@@ -76,23 +86,31 @@ function assertNoCredentialEcho(result) {
 }
 
 test('Telegram notification handles 2xx, 4xx, 5xx, timeout, and network errors locally', () => {
-  for (const mode of ['204', '400', '500', 'timeout', 'network']) {
+  for (const mode of ['200', '400', '500', 'timeout', 'network', 'large']) {
     const result = run('Telegram', mode);
     assert.equal(result.status, 0, `${mode}: ${result.stderr}`);
     assert.match(result.stdout, /done/);
     assertNoCredentialEcho(result);
-    if (mode === '204') assert.doesNotMatch(result.stderr, /推送失败/);
+    if (mode === '200') assert.doesNotMatch(result.stderr, /推送失败/);
     else assert.match(result.stderr, /Telegram 推送失败/);
   }
 });
 
 test('Feishu notification handles 2xx and failure paths without leaking its webhook', () => {
-  for (const mode of ['204', '500', 'timeout', 'network']) {
+  for (const mode of ['200', 'empty', 'object', '500', 'timeout', 'network', 'large']) {
     const result = run('Feishu', mode);
     assert.equal(result.status, 0, `${mode}: ${result.stderr}`);
     assert.match(result.stdout, /done/);
     assertNoCredentialEcho(result);
-    if (mode === '204') assert.doesNotMatch(result.stderr, /推送失败/);
+    if (mode === '200') assert.doesNotMatch(result.stderr, /推送失败/);
     else assert.match(result.stderr, /Feishu 推送失败/);
   }
+});
+
+test('notification templates escape dynamic Telegram HTML fields', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(path.join(repoRoot, 'reader', 'notify.js'), 'utf8');
+  assert.match(source, /function escapeHtml\(value\)/);
+  assert.match(source, /escapeHtml\(stats\.reason \|\| '达到上限'\)/);
+  assert.match(source, /escapeHtml\(result\.message \|\| ''\)/);
 });

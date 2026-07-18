@@ -62,7 +62,7 @@ function flush() {
   const tmp = `${DB_PATH}.${process.pid}.${Date.now()}.tmp`;
   try {
     const data = db.export();
-    fs.writeFileSync(tmp, Buffer.from(data));
+    fs.writeFileSync(tmp, Buffer.from(data), { mode: 0o600 });
     fs.renameSync(tmp, DB_PATH);
     dirty = false;
     logger.info(`Queue DB saved: ${DB_PATH}`);

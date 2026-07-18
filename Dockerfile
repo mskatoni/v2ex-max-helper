@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:24-bookworm-slim
 
 WORKDIR /app
 
@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     fonts-noto-cjk \
     ca-certificates \
+    tini \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -29,12 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
 
-# 复制依赖定义并安装。仓库不强制提交 package-lock，因此这里使用 npm install。
+# 复制依赖定义并按 lockfile 安装，避免每次构建漂移到不同版本。
 COPY checkin/package*.json ./checkin/
 COPY reader/package*.json ./reader/
 
-RUN cd checkin && npm install --omit=dev --no-audit --no-fund \
- && cd ../reader && npm install --omit=dev --no-audit --no-fund \
+RUN cd checkin && npm ci --omit=dev --no-audit --no-fund \
+ && cd ../reader && npm ci --omit=dev --no-audit --no-fund \
  && ./node_modules/.bin/playwright install chromium \
  && npm cache clean --force \
  && rm -rf /tmp/* ~/.npm
@@ -44,7 +45,6 @@ COPY checkin/ ./checkin/
 COPY reader/ ./reader/
 COPY lib/ ./lib/
 COPY scripts/entrypoint.sh ./entrypoint.sh
-COPY server.js ./server.js
 
 # 赋予入口脚本执行权限
 RUN chmod +x ./entrypoint.sh
@@ -58,9 +58,15 @@ USER v2ex
 
 EXPOSE 8080
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD-SHELL wget -q -O /dev/null "http://127.0.0.1:${PORT:-8080}/health" || exit 1
+
 ENV NODE_ENV=production
 ENV HOME=/app/data
 ENV V2EX_DATA_DIR=/app/data
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
 
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["./entrypoint.sh"]

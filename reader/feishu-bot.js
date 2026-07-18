@@ -5,6 +5,7 @@
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const crypto = require('crypto');
 const config = require('../lib/config');
 const profileLock = require('../lib/profile-lock');
 
@@ -13,6 +14,10 @@ const LOCK_FILE = cfg.readerLockFile;
 
 let tenantToken = '';
 let tokenExpiresAt = 0;
+const MAX_API_RESPONSE_BYTES = 64 * 1024;
+const MAX_CALLBACK_BYTES = 1024 * 1024;
+const MAX_DEBUG_READ_BYTES = 64 * 1024;
+const MAX_DEBUG_REPLY_CHARS = 6000;
 
 function maskId(id) {
   const s = String(id || '');
@@ -84,7 +89,10 @@ function buildStatusText() {
   }
 
   const lock = profileLock.readLock(LOCK_FILE);
-  if (lock && isProcessAlive(lock.pid)) {
+  const active = lock && (lock.processStartToken
+    ? profileLock.isLockOwnerAlive(lock)
+    : isProcessAlive(lock.pid));
+  if (active) {
     lines.push(`阅读任务：运行中 (profile=${lock.profile || 'unknown'}, PID ${lock.pid})`);
   } else {
     lines.push('阅读任务：残留或无效锁文件');
@@ -93,13 +101,26 @@ function buildStatusText() {
 }
 
 function readDebugText() {
+  let fd = null;
   try {
     if (!fs.existsSync(cfg.readerLog)) return '暂无 reader 日志';
-    const data = fs.readFileSync(cfg.readerLog, 'utf8');
+    fd = fs.openSync(cfg.readerLog, 'r');
+    const stat = fs.fstatSync(fd);
+    const length = Math.min(stat.size, MAX_DEBUG_READ_BYTES);
+    const start = Math.max(0, stat.size - length);
+    const buffer = Buffer.alloc(length);
+    if (length > 0) fs.readSync(fd, buffer, 0, length, start);
+    let data = buffer.toString('utf8');
+    if (start > 0) data = data.replace(/^[^\r\n]*(?:\r?\n|$)/, '');
     const lines = data.split(/\r?\n/).filter(Boolean).slice(-8);
-    return lines.length > 0 ? lines.join('\n') : '暂无 reader 日志';
+    const result = lines.map(line => line.slice(0, 1000)).join('\n');
+    return result ? result.slice(-MAX_DEBUG_REPLY_CHARS) : '暂无 reader 日志';
   } catch (e) {
     return `读取日志失败：${e.message}`;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
   }
 }
 
@@ -115,11 +136,50 @@ function stopReaderText() {
     if (lock.profile && lock.profile !== cfg.profile) {
       return `当前运行的是 profile=${lock.profile}，实验性飞书 Bot 只允许操作 profile=${cfg.profile}`;
     }
+    if (!profileLock.isLockOwnerAlive(lock)) {
+      return '锁文件中的进程身份无法安全确认，未发送停止信号；请在服务器检查任务状态';
+    }
     process.kill(lock.pid, 'SIGTERM');
-    return `已停止 profile=${lock.profile || cfg.profile} 的阅读进程`;
+    return `已向 profile=${lock.profile || cfg.profile} 的阅读进程发送停止请求`;
   } catch (e) {
     return `停止失败：${e.message}`;
   }
+}
+
+function readApiResponse(res, label, callback) {
+  let settled = false;
+  let size = 0;
+  const chunks = [];
+  const finish = (error, value) => {
+    if (settled) return;
+    settled = true;
+    callback(error, value);
+  };
+
+  res.on('data', (chunk) => {
+    if (settled) return;
+    size += chunk.length;
+    if (size > MAX_API_RESPONSE_BYTES) {
+      finish(new Error(`${label} response too large`));
+      res.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  res.on('aborted', () => finish(new Error(`${label} response aborted`)));
+  res.on('error', () => finish(new Error(`${label} response error`)));
+  res.on('end', () => {
+    if (settled) return;
+    if (!Number.isInteger(res.statusCode) || res.statusCode < 200 || res.statusCode >= 300) {
+      finish(new Error(`${label} HTTP ${res.statusCode || 'unknown'}`));
+      return;
+    }
+    try {
+      finish(null, JSON.parse(Buffer.concat(chunks, size).toString('utf8') || '{}'));
+    } catch (_) {
+      finish(new Error(`${label} invalid JSON response`));
+    }
+  });
 }
 
 function getTenantToken() {
@@ -139,21 +199,15 @@ function getTenantToken() {
         'Content-Length': Buffer.byteLength(body),
       },
     }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.code !== 0) {
-            reject(new Error(parsed.msg || `tenant token error ${parsed.code}`));
-            return;
-          }
-          tenantToken = parsed.tenant_access_token;
-          tokenExpiresAt = Date.now() + Math.max(60, (parsed.expire || 7200) - 60) * 1000;
-          resolve(tenantToken);
-        } catch (e) {
-          reject(e);
+      readApiResponse(res, 'feishu tenant token', (error, parsed) => {
+        if (error) return reject(error);
+        if (parsed.code !== 0 || !parsed.tenant_access_token) {
+          reject(new Error(`feishu tenant token rejected (${parsed.code ?? 'missing token'})`));
+          return;
         }
+        tenantToken = parsed.tenant_access_token;
+        tokenExpiresAt = Date.now() + Math.max(60, (parsed.expire || 7200) - 60) * 1000;
+        resolve(tenantToken);
       });
     });
     req.on('error', reject);
@@ -183,19 +237,13 @@ async function sendFeishuMessage(chatId, text) {
         'Content-Length': Buffer.byteLength(body),
       },
     }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data || '{}');
-          if (parsed.code && parsed.code !== 0) {
-            reject(new Error(parsed.msg || `send message error ${parsed.code}`));
-            return;
-          }
-          resolve(parsed);
-        } catch (e) {
-          reject(e);
+      readApiResponse(res, 'feishu message', (error, parsed) => {
+        if (error) return reject(error);
+        if (parsed.code === undefined || Number(parsed.code) !== 0) {
+          reject(new Error(`feishu message rejected (${parsed.code ?? 'missing code'})`));
+          return;
         }
+        resolve(parsed);
       });
     });
     req.on('error', reject);
@@ -209,11 +257,18 @@ function verifyToken(body) {
   const token = cfg.feishu.verificationToken;
   if (!token) return false;
   const received = body.token || (body.header && body.header.token) || '';
-  return received === token;
+  const expectedBuffer = Buffer.from(token);
+  const receivedBuffer = Buffer.from(String(received));
+  return expectedBuffer.length === receivedBuffer.length &&
+    crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
 }
 
-function isAuthorizedChat(chatId) {
-  return Boolean(cfg.feishu.chatId && String(chatId || '') === cfg.feishu.chatId);
+function isAuthorizedChat(chatId, chatType) {
+  return Boolean(
+    cfg.feishu.chatId &&
+    String(chatId || '') === cfg.feishu.chatId &&
+    String(chatType || '').toLowerCase() === 'p2p'
+  );
 }
 
 function parseMessage(body) {
@@ -230,12 +285,13 @@ function parseMessage(body) {
   return {
     text,
     chatId: msg.chat_id || event.chat_id || '',
+    chatType: msg.chat_type || '',
     senderId: ((event.sender || {}).sender_id || {}).open_id || '',
   };
 }
 
-async function handleCommand(text, chatId, senderId) {
-  if (!isAuthorizedChat(chatId)) {
+async function handleCommand(text, chatId, senderId, chatType) {
+  if (!isAuthorizedChat(chatId, chatType)) {
     console.log(`[feishu-bot] ignored unauthorized chat: ${maskId(chatId)}`);
     return { skipped: 'unauthorized_chat' };
   }
@@ -267,49 +323,81 @@ async function handleCommand(text, chatId, senderId) {
 
 function createServer() {
   const server = http.createServer((req, res) => {
+    const sendJson = (statusCode, value = {}) => {
+      if (res.destroyed || res.writableEnded) return;
+      const payload = JSON.stringify(value);
+      res.writeHead(statusCode, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(payload),
+        'Cache-Control': 'no-store',
+        'Connection': 'close',
+        'Content-Security-Policy': "default-src 'none'",
+        'X-Content-Type-Options': 'nosniff',
+      });
+      res.end(payload);
+    };
+
     if (req.method !== 'POST' || req.url !== '/feishu/callback') {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not Found');
+      sendJson(404);
       return;
     }
 
-    let rawBody = '';
+    const declaredLength = Number(req.headers['content-length']);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_CALLBACK_BYTES) {
+      sendJson(413);
+      req.resume();
+      return;
+    }
+
+    let size = 0;
+    let tooLarge = false;
+    const chunks = [];
+    req.on('aborted', () => {
+      tooLarge = true;
+      if (!res.headersSent) sendJson(400);
+    });
+    req.on('error', () => {
+      tooLarge = true;
+      if (!res.headersSent) sendJson(400);
+      else res.destroy();
+    });
     req.on('data', chunk => {
-      rawBody += chunk;
-      if (rawBody.length > 1024 * 1024) {
-        req.destroy();
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > MAX_CALLBACK_BYTES) {
+        tooLarge = true;
+        sendJson(413);
+        return;
       }
+      chunks.push(chunk);
     });
     req.on('end', async () => {
+      if (tooLarge) return;
       let body;
       try {
-        body = JSON.parse(rawBody || '{}');
+        body = JSON.parse(Buffer.concat(chunks, size).toString('utf8') || '{}');
       } catch (_) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end('{}');
+        sendJson(400);
         return;
       }
 
       if (!verifyToken(body)) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end('{}');
+        sendJson(401);
         return;
       }
 
       if (body.type === 'url_verification' && body.challenge) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ challenge: body.challenge }));
+        sendJson(200, { challenge: body.challenge });
         return;
       }
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{}');
+      sendJson(200);
 
       if (body.header && body.header.event_type === 'im.message.receive_v1') {
         const message = parseMessage(body);
         if (message.text.startsWith('/')) {
           try {
-            await handleCommand(message.text, message.chatId, message.senderId);
+            await handleCommand(message.text, message.chatId, message.senderId, message.chatType);
           } catch (e) {
             console.error(`[feishu-bot] command failed: ${e.message}`);
           }
@@ -319,6 +407,13 @@ function createServer() {
   });
   server.headersTimeout = 5000;
   server.requestTimeout = 10000;
+  server.keepAliveTimeout = 5000;
+  server.maxHeadersCount = 32;
+  server.maxConnections = 64;
+  server.maxRequestsPerSocket = 1;
+  server.on('clientError', (_error, socket) => {
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  });
   return server;
 }
 
@@ -339,9 +434,16 @@ function main() {
     process.exit(1);
   }
 
+  const rawPort = String(process.env.FEISHU_BOT_PORT || '6700').trim();
+  if (!/^\d+$/.test(rawPort) || Number(rawPort) < 1 || Number(rawPort) > 65535) {
+    console.error('[feishu-bot] FEISHU_BOT_PORT must be an integer between 1 and 65535');
+    process.exit(1);
+  }
+  const port = Number(rawPort);
+
   const server = createServer();
-  server.listen(cfg.feishu.port, '0.0.0.0', () => {
-    console.log(`[feishu-bot] listening on :${cfg.feishu.port} for chat ${maskId(cfg.feishu.chatId)} (callback path: /feishu/callback)`);
+  server.listen(port, '127.0.0.1', () => {
+    console.log(`[feishu-bot] listening on 127.0.0.1:${port} for private chat ${maskId(cfg.feishu.chatId)} (callback path: /feishu/callback; expose only through HTTPS reverse proxy)`);
   });
 }
 

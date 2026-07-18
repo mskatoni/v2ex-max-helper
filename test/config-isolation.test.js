@@ -8,7 +8,7 @@ const test = require('node:test');
 const config = require('../lib/config');
 
 const repoRoot = path.resolve(__dirname, '..');
-const envKeys = ['V2EX_DATA_DIR', 'V2EX_PROFILE', 'V2EX_PROFILE_LIST', 'COOKIE_FILE', 'DB_PATH', 'READER_LOG'];
+const envKeys = ['V2EX_DATA_DIR', 'V2EX_PROFILE', 'V2EX_PROFILE_LIST', 'COOKIE_FILE', 'DB_PATH', 'READER_LOG', 'TG_CHAT_ID'];
 
 function withEnv(values, fn) {
   const before = new Map(envKeys.map(key => [key, process.env[key]]));
@@ -84,4 +84,39 @@ test('profile parsing rejects path characters, de-duplicates, and caps the list 
     config.parseProfileList('a,b,c,d,e,f,g'),
     ['a', 'b', 'c', 'd', 'e', 'f']
   );
+});
+
+test('profile parsing rejects case-alias and Windows device path collisions', () => {
+  for (const profile of ['Default', 'DEFAULT', 'CON', 'nul', 'COM1', 'LPT9']) {
+    assert.throws(() => config.normalizeProfile(profile), /跨平台保留名称/);
+  }
+  assert.equal(config.normalizeProfile('default'), 'default');
+  assert.equal(config.normalizeProfile('com10'), 'com10');
+});
+
+test('Telegram authorization accepts only a private numeric chat id', () => {
+  withEnv({ TG_CHAT_ID: '123456789' }, () => {
+    assert.equal(config.getConfig().telegram.chatId, '123456789');
+  });
+  for (const value of ['-100123', '0', '00123', 'user-name', '123 456']) {
+    withEnv({ TG_CHAT_ID: value }, () => {
+      assert.throws(() => config.getConfig(), /正整数 Chat ID/);
+    });
+  }
+});
+
+test('a corrupt persisted Telegram chat id fails closed instead of reopening binding', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2ex-chat-test-'));
+  try {
+    fs.writeFileSync(path.join(dir, '.telegram_chat_id'), 'not-a-chat-id\n');
+    withEnv({ V2EX_DATA_DIR: dir }, () => {
+      assert.throws(() => config.getConfig(), /正整数 Chat ID/);
+    });
+    fs.writeFileSync(path.join(dir, '.telegram_chat_id'), '');
+    withEnv({ V2EX_DATA_DIR: dir }, () => {
+      assert.throws(() => config.getConfig(), /授权文件存在但内容为空/);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

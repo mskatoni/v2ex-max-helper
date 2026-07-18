@@ -1,6 +1,5 @@
 # 依赖
 node_modules/
-package-lock.json
 
 # 敏感数据 —— 切勿提交
 .env
@@ -29,6 +28,10 @@ data/*
 *.sqlite3
 balance_log.json
 balance_status.json
+profile_identity*.json
+profile_schedule_state.json
+log_level.txt
+.locks/
 
 # 浏览器配置（含登录态，严禁提交）
 chrome-profile/

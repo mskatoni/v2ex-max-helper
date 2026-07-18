@@ -7,6 +7,7 @@ const fingerprint = require('./fingerprint');
 const behavior    = require('./behavior');
 const config      = require('../lib/config');
 const secureProxy = require('../lib/secure-proxy');
+const profileAuth = require('../lib/profile-auth');
 
 // ===== 多账号 / 指纹隔离 =====
 // 通过 V2EX_PROFILE（或默认 'default'）区分账号。每个 profile 拥有：
@@ -16,6 +17,7 @@ const secureProxy = require('../lib/secure-proxy');
 const cfg = config.getConfig();
 const PROFILE = cfg.profile;
 const HOST    = 'www.v2ex.com';
+const V2EX_ORIGIN = `https://${HOST}`;
 
 const COOKIE_FILE   = cfg.cookieFile;
 const USER_DATA_DIR = cfg.chromeProfileDir;
@@ -40,7 +42,7 @@ const CACHE_PATHS = [
 // 为当前 profile 生成确定性指纹
 const FP = fingerprint.generate(PROFILE);
 const BEHAVIOR = behavior.resolve(PROFILE);
-const HTTP_ONLY_COOKIES = new Set(['A2', 'PB3_SESSION', 'cf_clearance']);
+const HTTP_ONLY_COOKIES = new Set(['A2', 'A2O', 'PB3_SESSION', 'cf_clearance']);
 
 // Cookie 字符串 → Playwright cookies 数组
 function parseCookieString(str) {
@@ -63,10 +65,30 @@ function parseCookieString(str) {
 
 // Playwright cookies 数组 → Cookie 字符串（写回文件）
 function serializeCookies(cookies) {
-  return cookies
-    .filter(c => c.domain && c.domain.includes('v2ex'))
-    .map(c => `${c.name}=${c.value}`)
-    .join('; ');
+  const selected = new Map();
+  for (const cookie of cookies) {
+    const domain = String(cookie.domain || '').replace(/^\./, '').toLowerCase();
+    if ((domain !== HOST && domain !== 'v2ex.com') || String(cookie.path || '/') !== '/') continue;
+    const rank = domain === HOST ? 2 : 1;
+    const existing = selected.get(cookie.name);
+    if (!existing || rank >= existing.rank) selected.set(cookie.name, { cookie, rank });
+  }
+  return Array.from(selected.values()).map(({ cookie }) => `${cookie.name}=${cookie.value}`).join('; ');
+}
+
+function normalizePostUrl(value) {
+  let parsed;
+  try { parsed = new URL(value); } catch (_) { throw new Error('帖子 URL 格式无效'); }
+  if (parsed.username || parsed.password || parsed.origin !== V2EX_ORIGIN || !/^\/t\/\d+$/.test(parsed.pathname)) {
+    throw new Error('拒绝访问非 V2EX 帖子 URL');
+  }
+  parsed.hash = '';
+  parsed.search = '';
+  return parsed;
+}
+
+function isV2exOrigin(value) {
+  try { return new URL(value).origin === V2EX_ORIGIN; } catch (_) { return false; }
 }
 
 let ctx      = null;   // BrowserContext（persistent context）
@@ -243,9 +265,12 @@ async function readPost(url) {
     return true;
   }
 
+  let target;
   try {
-    logger.info(`→ ${url}`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    target = normalizePostUrl(url);
+    logger.info(`→ ${target.pathname}`);
+    const navigationResponse = await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (!isV2exOrigin(page.url())) throw new Error('导航离开 V2EX，已拒绝继续处理');
 
     // 检测 Cloudflare 挑战页面
     const isCF = await detectCloudflareChallenge();
@@ -254,11 +279,19 @@ async function readPost(url) {
       const passed = await waitForCloudflare();
       if (!passed) return false;
     }
+    const finalUrl = new URL(page.url());
+    if (finalUrl.origin !== V2EX_ORIGIN || finalUrl.pathname !== target.pathname) {
+      throw new Error('帖子导航未停留在目标页面');
+    }
+    if (!isCF && (!navigationResponse || !navigationResponse.ok())) {
+      throw new Error(`帖子页面返回 HTTP ${navigationResponse ? navigationResponse.status() : 'unknown'}`);
+    }
 
     // 检测是否登录
     const content = await page.content();
-    if (content.includes('你要查看的页面需要先登录') || content.includes('需要先登录')) {
-      logger.error('Cookie 已失效，请重新获取');
+    const authState = profileAuth.diagnoseHomePage({ statusCode: 200, body: content });
+    if (!authState.ok) {
+      logger.error(`帖子页无法确认当前登录账号 (${authState.code || 'unknown'})`);
       return false;
     }
 
@@ -277,7 +310,8 @@ async function readPost(url) {
 
     return true;
   } catch (e) {
-    logger.warn(`读帖失败: ${e.message} → ${url}`);
+    const safeTarget = target ? target.pathname : '[invalid post URL]';
+    logger.warn(`读帖失败: ${e.message} → ${safeTarget}`);
     if (shouldResetPage(e)) {
       await resetPage();
     }
@@ -374,7 +408,7 @@ async function waitForCloudflare(timeout = 60000) {
 }
 
 // 将 Playwright context 的最新 Cookie 写回文件
-async function syncCookies() {
+async function syncCookies(options = {}) {
   if (!ctx) return;
   try {
     const cookies = await ctx.cookies();
@@ -386,6 +420,7 @@ async function syncCookies() {
     }
     atomicWriteCookie(str);
   } catch (e) {
+    if (options.throwOnError) throw e;
     logger.warn(`Cookie 同步失败: ${e.message}`);
   }
 }
@@ -398,24 +433,24 @@ function hasCookieKey(cookieStr, key) {
 }
 
 function atomicWriteCookie(cookieStr) {
-  const dir = path.dirname(COOKIE_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${COOKIE_FILE}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, cookieStr, { mode: 0o600 });
-  fs.renameSync(tmp, COOKIE_FILE);
+  const current = fs.existsSync(COOKIE_FILE) ? fs.readFileSync(COOKIE_FILE, 'utf8').trim() : '';
+  if (current === cookieStr) return false;
+  config.writeFileAtomic(COOKIE_FILE, cookieStr, { mode: 0o600 });
+  return true;
 }
 
 // 获取当前 Cookie 字符串（供 balance.js / fetcher.js 使用）
-async function getCurrentCookie() {
+async function getCurrentCookie(options = {}) {
   if (ctx) {
     try {
       const cookies = await ctx.cookies();
       const str = serializeCookies(cookies);
       if (str && hasCookieKey(str, 'A2')) return str;
       if (str) {
-        logger.warn('当前浏览器上下文缺少 A2，回退读取 Cookie 文件');
+        logger.warn(`当前浏览器上下文缺少 A2${options.requireContextAuth ? '，不使用磁盘旧值' : '，回退读取 Cookie 文件'}`);
       }
     } catch (_) {}
+    if (options.requireContextAuth) return '';
   }
   // fallback: 直接读文件
   return fs.existsSync(COOKIE_FILE)
@@ -423,22 +458,29 @@ async function getCurrentCookie() {
     : '';
 }
 
-async function close() {
+async function close(options = {}) {
+  let failure = null;
   let closed = false;
-  try {
-    if (ctx) {
-      await syncCookies();
+  if (ctx) {
+    try {
+      await syncCookies({ throwOnError: true });
+    } catch (e) {
+      failure = e;
+      logger.warn(`浏览器关闭前 Cookie 同步失败: ${e.message}`);
+    }
+    try {
       await ctx.close();
       closed = true;
+    } catch (e) {
+      failure = failure || e;
+      logger.warn(`关闭浏览器时出错: ${e.message}`);
     }
-    logger.info('浏览器已关闭');
-  } catch (e) {
-    logger.warn(`关闭浏览器时出错: ${e.message}`);
-  } finally {
-    ctx = null;
-    page = null;
   }
+  ctx = null;
+  page = null;
+  if (closed) logger.info('浏览器已关闭');
   if (closed) pruneBrowserCacheWithLog();
+  if (failure && options.throwOnError) throw failure;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -457,4 +499,6 @@ module.exports = {
   buildLaunchArgs,
   pruneBrowserCache,
   shouldResetPage,
+  serializeCookies,
+  normalizePostUrl,
 };

@@ -12,6 +12,7 @@
 #   sudo bash scripts/install-systemd.sh --uninstall --profile acc2
 #   sudo bash scripts/install-systemd.sh --no-reader     # 不安装阅读 timer
 #   sudo bash scripts/install-systemd.sh --bot           # 同时安装 Bot service
+#   sudo bash scripts/install-systemd.sh --bot-only      # 只补装 Bot，不重写 timer
 #
 # 签到、保活和阅读时间均按服务器本地时区解析。
 # =============================================================================
@@ -33,6 +34,10 @@ PROFILE="default"
 DO_UNINSTALL=0
 INSTALL_READER=1
 INSTALL_BOT=0
+BOT_ONLY=0
+ASSUME_YES=0
+RUN_USER_ARG=""
+PROJ_ROOT_ARG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +46,12 @@ while [[ $# -gt 0 ]]; do
     --uninstall)  DO_UNINSTALL=1; shift ;;
     --no-reader)  INSTALL_READER=0; shift ;;
     --bot)        INSTALL_BOT=1; shift ;;
+    --bot-only)   INSTALL_BOT=1; BOT_ONLY=1; INSTALL_READER=0; shift ;;
+    --yes)        ASSUME_YES=1; shift ;;
+    --user)       RUN_USER_ARG="${2:?--user 需要用户名}"; shift 2 ;;
+    --user=*)     RUN_USER_ARG="${1#*=}"; shift ;;
+    --project-root) PROJ_ROOT_ARG="${2:?--project-root 需要路径}"; shift 2 ;;
+    --project-root=*) PROJ_ROOT_ARG="${1#*=}"; shift ;;
     -h|--help)
       grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "未知参数：$1（用 --help 查看用法）" ;;
@@ -52,6 +63,11 @@ command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd，请改用 cr
 
 # profile 名安全校验（只允许字母数字、下划线、连字符）
 [[ "$PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] || die "profile 名非法：$PROFILE"
+PROFILE_LOWER="${PROFILE,,}"
+if [[ "$PROFILE" != "default" && "$PROFILE_LOWER" == "default" ]] ||
+   [[ "$PROFILE_LOWER" =~ ^(con|prn|aux|nul|com[1-9]|lpt[1-9])$ ]]; then
+  die "profile 不能使用跨平台保留名称：$PROFILE"
+fi
 if [[ $INSTALL_BOT -eq 1 && "$PROFILE" != "default" ]]; then
   die "Telegram 长轮询 Bot 只能安装一个；请仅用默认 profile 执行 --bot，多账号由 V2EX_PROFILE_LIST 管理"
 fi
@@ -86,7 +102,13 @@ fi
 # 交互收集配置
 # =============================================================================
 DEF_USER="${SUDO_USER:-root}"
-read -rp "运行用户 [${DEF_USER}]: " RUN_USER; RUN_USER="${RUN_USER:-$DEF_USER}"
+if [[ -n "$RUN_USER_ARG" ]]; then
+  RUN_USER="$RUN_USER_ARG"
+elif [[ $ASSUME_YES -eq 1 ]]; then
+  RUN_USER="$DEF_USER"
+else
+  read -rp "运行用户 [${DEF_USER}]: " RUN_USER; RUN_USER="${RUN_USER:-$DEF_USER}"
+fi
 id "$RUN_USER" >/dev/null 2>&1 || die "用户不存在：$RUN_USER"
 RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 [[ -n "$RUN_HOME" ]] || die "无法确定 $RUN_USER 的家目录"
@@ -94,30 +116,51 @@ RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 # 项目根目录：默认取脚本所在仓库的上级
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEF_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-read -rp "项目根目录 [${DEF_ROOT}]: " PROJ_ROOT; PROJ_ROOT="${PROJ_ROOT:-$DEF_ROOT}"
+if [[ -n "$PROJ_ROOT_ARG" ]]; then
+  PROJ_ROOT="$PROJ_ROOT_ARG"
+elif [[ $ASSUME_YES -eq 1 ]]; then
+  PROJ_ROOT="$DEF_ROOT"
+else
+  read -rp "项目根目录 [${DEF_ROOT}]: " PROJ_ROOT; PROJ_ROOT="${PROJ_ROOT:-$DEF_ROOT}"
+fi
+if [[ "$PROJ_ROOT" == *$'\n'* || "$PROJ_ROOT" == *$'\r'* || "$RUN_HOME" == *$'\n'* || "$RUN_HOME" == *$'\r'* ]]; then
+  die "项目路径或用户家目录包含不支持的控制字符"
+fi
+PROJ_ROOT="$(realpath -e -- "$PROJ_ROOT")" || die "无法解析项目根目录：$PROJ_ROOT"
 [[ -f "${PROJ_ROOT}/checkin/v2ex-checkin.js" ]] || die "在 ${PROJ_ROOT} 下找不到 checkin/v2ex-checkin.js，请确认路径"
 
 # node 路径
 NODE_BIN="$(command -v node || true)"
-[[ -n "$NODE_BIN" ]] || die "未找到 node，请先安装 Node.js 18+"
+[[ -n "$NODE_BIN" ]] || die "未找到 node，请先安装 Node.js 24+"
+NODE_MAJOR="$($NODE_BIN -p 'Number(process.versions.node.split(".")[0])')"
+[[ "$NODE_MAJOR" -ge 24 ]] || die "Node.js 版本过低（$($NODE_BIN -v)），请升级到 24+"
 ok "node: ${NODE_BIN}"
 
-# 阅读模块需要 xvfb-run（无头机器）
+# 浏览器默认 headless；仅显式使用 HEADLESS=false 时才需要 xvfb-run。
 XVFB_PREFIX=""
-if [[ $INSTALL_READER -eq 1 ]]; then
+if [[ $INSTALL_READER -eq 1 && $ASSUME_YES -eq 0 ]]; then
   if command -v xvfb-run >/dev/null 2>&1; then
     XVFB_BIN="$(command -v xvfb-run)"
-    read -rp "阅读模块用 xvfb-run 包装（无头服务器选 Y）？[Y/n]: " yn
-    [[ "${yn,,}" == "n" ]] || XVFB_PREFIX="${XVFB_BIN} -a "
-  else
-    warn "未检测到 xvfb-run。有头机器可忽略；无头服务器请先 apt-get install -y xvfb"
+    read -rp "是否为显式 HEADLESS=false 的阅读任务启用 xvfb-run？[y/N]: " yn
+    [[ "${yn,,}" == "y" ]] && XVFB_PREFIX="${XVFB_BIN} -a "
   fi
 fi
 
 # 时间配置
-read -rp "签到时间 OnCalendar [*-*-* 09:10:00]: " T_CHECKIN; T_CHECKIN="${T_CHECKIN:-*-*-* 09:10:00}"
-read -rp "保活时间 OnCalendar [*-*-* 00/6:00:00]: " T_PING;   T_PING="${T_PING:-*-*-* 00/6:00:00}"
-read -rp "阅读时间 OnCalendar [*-*-* 09:15:00]: " T_READER; T_READER="${T_READER:-*-*-* 09:15:00}"
+T_CHECKIN="*-*-* 09:10:00"
+T_PING="*-*-* 00/6:00:00"
+T_READER="*-*-* 09:15:00"
+if [[ $BOT_ONLY -eq 0 && $ASSUME_YES -eq 0 ]]; then
+  read -rp "签到时间 OnCalendar [${T_CHECKIN}]: " value; T_CHECKIN="${value:-$T_CHECKIN}"
+  read -rp "保活时间 OnCalendar [${T_PING}]: " value; T_PING="${value:-$T_PING}"
+  read -rp "阅读时间 OnCalendar [${T_READER}]: " value; T_READER="${value:-$T_READER}"
+fi
+if [[ $BOT_ONLY -eq 0 ]]; then
+  command -v systemd-analyze >/dev/null 2>&1 || die "缺少 systemd-analyze，无法安全校验 timer 时间"
+  systemd-analyze calendar "$T_CHECKIN" >/dev/null 2>&1 || die "签到 OnCalendar 无效：$T_CHECKIN"
+  systemd-analyze calendar "$T_PING" >/dev/null 2>&1 || die "保活 OnCalendar 无效：$T_PING"
+  systemd-analyze calendar "$T_READER" >/dev/null 2>&1 || die "阅读 OnCalendar 无效：$T_READER"
+fi
 
 # 所有单元都显式指定 profile；非 default 单元屏蔽共享路径和启动 Cookie 覆盖值。
 PROFILE_ENV="Environment=V2EX_PROFILE=${PROFILE}"
@@ -130,26 +173,32 @@ echo
 info "即将安装（profile=${PROFILE}）："
 echo "  用户       : ${RUN_USER} (HOME=${RUN_HOME})"
 echo "  项目根目录 : ${PROJ_ROOT}"
-echo "  签到       : ${T_CHECKIN}"
-echo "  保活       : ${T_PING}"
-[[ $INSTALL_READER -eq 1 ]] && echo "  阅读       : ${T_READER}  ${XVFB_PREFIX:+(xvfb-run)}"
-[[ $INSTALL_BOT -eq 1 ]]    && echo "  Bot        : 常驻 service（定时任务由 systemd timer 负责）"
-read -rp "确认安装？[Y/n]: " go; [[ "${go,,}" == "n" ]] && { warn "已取消"; exit 0; }
+if [[ $BOT_ONLY -eq 0 ]]; then
+  echo "  签到       : ${T_CHECKIN}"
+  echo "  保活       : ${T_PING}"
+  [[ $INSTALL_READER -eq 1 ]] && echo "  阅读       : ${T_READER}  ${XVFB_PREFIX:+(xvfb-run)}"
+fi
+[[ $INSTALL_BOT -eq 1 ]] && echo "  Bot        : 常驻 service（定时任务由 systemd timer 负责）"
+if [[ $ASSUME_YES -eq 0 ]]; then
+  read -rp "确认安装？[Y/n]: " go; [[ "${go,,}" == "n" ]] && { warn "已取消"; exit 0; }
+fi
 
 # =============================================================================
 # 生成单元文件
 # =============================================================================
 write_oneshot_service() {
-  local name="$1" desc="$2" workdir="$3" execstart="$4" extra="${5:-}"
+  local name="$1" desc="$2" workdir="$3" execstart="$4" extra="${5:-}" unit_extra="${6:-}"
   cat > "${SYSD}/${name}.service" <<EOF
 [Unit]
 Description=${desc}
 After=network-online.target
 Wants=network-online.target
+${unit_extra}
 
 [Service]
 Type=oneshot
 User=${RUN_USER}
+UMask=0077
 Environment=HOME=${RUN_HOME}
 ${PROFILE_ENV}
 ${PROFILE_ISOLATION_ENV}
@@ -178,21 +227,24 @@ EOF
 CHK_DIR="${PROJ_ROOT}/checkin"
 RDR_DIR="${PROJ_ROOT}/reader"
 
-# 签到
-write_oneshot_service "$UNIT_CHECKIN" "V2EX 每日签到 (${PROFILE})" \
-  "$CHK_DIR" "${NODE_BIN} v2ex-checkin.js"
-write_timer "$UNIT_CHECKIN" "V2EX 每日签到定时器 (${PROFILE})" "$T_CHECKIN" 600
+if [[ $BOT_ONLY -eq 0 ]]; then
+  # 签到
+  write_oneshot_service "$UNIT_CHECKIN" "V2EX 每日签到 (${PROFILE})" \
+    "$CHK_DIR" "${NODE_BIN} v2ex-checkin.js"
+  write_timer "$UNIT_CHECKIN" "V2EX 每日签到定时器 (${PROFILE})" "$T_CHECKIN" 600
 
-# 保活
-write_oneshot_service "$UNIT_PING" "V2EX 保活心跳 (${PROFILE})" \
-  "$CHK_DIR" "${NODE_BIN} v2ex-checkin.js --ping"
-write_timer "$UNIT_PING" "V2EX 保活定时器 (${PROFILE})" "$T_PING" 300
+  # 保活
+  write_oneshot_service "$UNIT_PING" "V2EX 保活心跳 (${PROFILE})" \
+    "$CHK_DIR" "${NODE_BIN} v2ex-checkin.js --ping"
+  write_timer "$UNIT_PING" "V2EX 保活定时器 (${PROFILE})" "$T_PING" 300
 
-# 阅读
-if [[ $INSTALL_READER -eq 1 ]]; then
-  write_oneshot_service "$UNIT_READER" "V2EX 自动阅读 (${PROFILE})" \
-    "$RDR_DIR" "${XVFB_PREFIX}${NODE_BIN} main.js" "TimeoutStartSec=6h"
-  write_timer "$UNIT_READER" "V2EX 自动阅读定时器 (${PROFILE})" "$T_READER" 900
+  # 阅读
+  if [[ $INSTALL_READER -eq 1 ]]; then
+    READER_UNIT_DEPS="$(printf 'Requires=%s.service\nAfter=%s.service' "$UNIT_CHECKIN" "$UNIT_CHECKIN")"
+    write_oneshot_service "$UNIT_READER" "V2EX 自动阅读 (${PROFILE})" \
+      "$RDR_DIR" "${XVFB_PREFIX}${NODE_BIN} main.js" "TimeoutStartSec=6h" "$READER_UNIT_DEPS"
+    write_timer "$UNIT_READER" "V2EX 自动阅读定时器 (${PROFILE})" "$T_READER" 900
+  fi
 fi
 
 # Bot（常驻）
@@ -206,6 +258,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=${RUN_USER}
+UMask=0077
 Environment=HOME=${RUN_HOME}
 ${PROFILE_ENV}
 Environment=V2EX_DISABLE_INTERNAL_SCHEDULER=1
@@ -224,12 +277,16 @@ fi
 # =============================================================================
 systemctl daemon-reload
 
-ENABLE_TIMERS=("${UNIT_CHECKIN}.timer" "${UNIT_PING}.timer")
-[[ $INSTALL_READER -eq 1 ]] && ENABLE_TIMERS+=("${UNIT_READER}.timer")
-systemctl enable --now "${ENABLE_TIMERS[@]}"
+if [[ $BOT_ONLY -eq 0 ]]; then
+  ENABLE_TIMERS=("${UNIT_CHECKIN}.timer" "${UNIT_PING}.timer")
+  [[ $INSTALL_READER -eq 1 ]] && ENABLE_TIMERS+=("${UNIT_READER}.timer")
+  systemctl enable --now "${ENABLE_TIMERS[@]}"
+fi
 
 if [[ $INSTALL_BOT -eq 1 ]]; then
-  systemctl enable --now "${UNIT_BOT}.service"
+  systemctl enable "${UNIT_BOT}.service"
+  systemctl restart "${UNIT_BOT}.service"
+  systemctl is-active --quiet "${UNIT_BOT}.service" || die "Bot 服务启动失败：${UNIT_BOT}.service"
 fi
 
 # =============================================================================

@@ -76,3 +76,16 @@ test('relative data directory resolves consistently from the repository root', (
   assert.equal(result.status, 0);
   assert.equal(path.normalize(result.stdout.trim()), path.join(repoRoot, 'relative-data', '.v2ex_cookie.acc1'));
 });
+
+test('reader rejects malformed or excessive explicit limits before any network access', () => {
+  for (const value of ['bad', '1001']) {
+    const result = childProcess.spawnSync(process.execPath, ['reader/main.js', '--dry-run', '--limit', value], {
+      cwd: repoRoot,
+      env: safeEnv(),
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /--limit/);
+  }
+});

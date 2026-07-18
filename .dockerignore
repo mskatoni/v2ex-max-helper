@@ -25,6 +25,10 @@ storage_state*.json
 *.sqlite3
 balance_log.json
 balance_status.json
+profile_identity*.json
+profile_schedule_state.json
+log_level.txt
+.locks/
 chrome-profile/
 **/chrome-profile/
 browser-profile/

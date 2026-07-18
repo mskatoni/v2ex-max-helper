@@ -67,10 +67,10 @@
 
 把下面的「任务说明」连同本仓库一起交给 Agent，让它按步骤执行（敏感值留到最后由你手动填）：
 
-1. **检查环境**：确认 VPS 已装 Node.js 18+，未装则安装。
+1. **检查环境**：确认 VPS 已装 Node.js 24+，未装则安装。
 2. **放置代码**：下载 / 解压本项目到 `~/v2ex-max-helper`。
 3. **生成配置**：`cp .v2ex_env.example ~/.v2ex_env`，但**保留占位符不填真实值**。
-4. **安装依赖**：在 `reader/` 执行 `npm install` 与 `npx playwright install chromium`。
+4. **安装依赖**：在 `reader/` 执行 `npm ci` 与 `npx playwright install chromium`。
 5. **干跑验证**：`cd reader && node main.js --dry-run`，确认离线调度流程无报错；该模式不需要 Cookie，也不会访问 V2EX 或写入阅读队列。
 6. **配置定时任务**：运行 `sudo bash scripts/install-systemd.sh` 安装 systemd timer（推荐；无 systemd 时回退 crontab，见 `部署指南.md`）。
 7. **交还给你手动完成**（敏感步骤，Agent 不接触）：
@@ -83,7 +83,7 @@
 请帮我在这台 Linux VPS 上部署 v2ex-max-helper 项目（代码已在 ~/v2ex-max-helper）。
 要求：
 1. 不要向你/任何外部服务发送我的真实 Cookie、Telegram Token 或服务器密钥。
-2. 完成以下环节：环境检查（Node.js 18+）、安装依赖、playwright chromium 安装、
+2. 完成以下环节：环境检查（Node.js 24+）、安装依赖、playwright chromium 安装、
    dry-run 验证、用 scripts/install-systemd.sh 配置定时任务。
 3. 涉及真实 Cookie 和 Token 的步骤，只生成命令模板并停下，由我本人手动执行。
 参考文档：docs/部署指南.md、docs/配置说明.md。

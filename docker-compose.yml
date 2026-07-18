@@ -6,6 +6,7 @@ services:
       dockerfile: Dockerfile
     container_name: v2ex-bot
     restart: unless-stopped
+    stop_grace_period: 45s
     env_file:
       - .env
     volumes:

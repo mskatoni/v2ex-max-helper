@@ -8,7 +8,7 @@ Render 免费额度在 15 分钟无 HTTP 请求时会冻结实例，导致内部
 2. 新建任务：
    - URL: https://<你的服务名>.onrender.com/health
    - 频率：每 10 分钟
-   - 超时：30 秒
+   - 超时：至少 60 秒
 3. 保存即可
 
 ## 备选方案：UptimeRobot

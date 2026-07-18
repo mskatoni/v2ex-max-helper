@@ -2,16 +2,56 @@ name: Docker Build and Publish
 
 on:
   push:
-    branches: [ "mskatoni-patch-beta", "main", "master" ]
+    branches: [ "mskatoni-patch-beta", "main" ]
     tags: [ "v*" ]
+  pull_request:
+    branches: [ "mskatoni-patch-beta", "main" ]
   workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: reader/package-lock.json
+
+      - name: Install test dependencies
+        run: npm ci --prefix reader --no-audit --no-fund
+
+      - name: Check JavaScript syntax
+        run: git ls-files -z '*.js' | xargs -0 -n1 node --check
+
+      - name: Run regression tests
+        run: npm test --prefix reader
+
+      - name: Reject unsafe TLS overrides
+        run: |
+          if git grep -nE 'rejectUnauthorized[[:space:]]*:[[:space:]]*false|NODE_TLS_REJECT_UNAUTHORIZED' -- .; then
+            echo 'Unsafe TLS override found' >&2
+            exit 1
+          fi
+
   build-and-push-image:
+    if: github.event_name != 'pull_request'
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -19,10 +59,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -30,16 +70,18 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=beta,enable=${{ github.ref == 'refs/heads/mskatoni-patch-beta' }}
             type=ref,event=tag
             type=sha
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           push: true

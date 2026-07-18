@@ -7,6 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const repoRoot = path.resolve(__dirname, '..');
+const secureProxy = require('../lib/secure-proxy');
 const script = "const value=require('./lib/secure-proxy').getPlaywrightProxy();console.log(JSON.stringify(value))";
 
 function proxyEnv(extra = {}) {
@@ -74,6 +75,24 @@ test('loopback HTTP and SOCKS5 proxies are accepted', () => {
   assert.deepEqual(JSON.parse(socks.stdout), { server: 'socks5://localhost:1080' });
 });
 
+test('IPv6 loopback is accepted while invalid explicit ports fail closed', () => {
+  const ipv6 = run({ V2EX_PROXY_ENABLE: '1', V2EX_PROXY: 'http://[::1]:7890' });
+  assert.equal(ipv6.status, 0, ipv6.stderr);
+  assert.deepEqual(JSON.parse(ipv6.stdout), { server: 'http://[::1]:7890' });
+
+  const badPort = run({ V2EX_PROXY_ENABLE: '1', V2EX_PROXY: 'http://127.0.0.1:0' });
+  assert.notEqual(badPort.status, 0);
+});
+
+test('proxy validation errors never echo path or query secrets', () => {
+  const result = run({
+    V2EX_PROXY_ENABLE: '1',
+    V2EX_PROXY: 'http://127.0.0.1:7890/private-path?token=do-not-print',
+  });
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /private-path|do-not-print/);
+});
+
 test('Docker host aliases are accepted without opening ordinary domains', () => {
   for (const host of ['host.docker.internal', 'gateway.docker.internal']) {
     const result = run({ V2EX_PROXY_ENABLE: '1', V2EX_PROXY: `http://${host}:7890` });
@@ -102,7 +121,7 @@ test('explicit proxy wins and lowercase system variables follow standard precede
   assert.deepEqual(JSON.parse(fallback.stdout), { server: 'socks5://127.0.0.1:7004' });
 });
 
-test('NO_PROXY is passed to Playwright and matches exact, suffix, wildcard and port rules', () => {
+test('NO_PROXY can bypass only explicitly named local or private destinations', () => {
   const result = run({
     V2EX_PROXY_ENABLE: '1',
     V2EX_PROXY: 'http://127.0.0.1:7890',
@@ -110,12 +129,15 @@ test('NO_PROXY is passed to Playwright and matches exact, suffix, wildcard and p
   });
   assert.deepEqual(JSON.parse(result.stdout), {
     server: 'http://127.0.0.1:7890',
-    bypass: 'localhost,.example.com,*.internal.test,api.local:8443',
+    bypass: 'localhost',
   });
 
   const bypassScript = "const p=require('./lib/secure-proxy');console.log(JSON.stringify([p.shouldBypassProxy('localhost',443),p.shouldBypassProxy('www.example.com',443),p.shouldBypassProxy('node.internal.test',443),p.shouldBypassProxy('api.local',443),p.shouldBypassProxy('api.local',8443),p.shouldBypassProxy('www.v2ex.com',443)]))";
   const bypass = run({ no_proxy: 'localhost,.example.com,*.internal.test,api.local:8443' }, bypassScript);
-  assert.deepEqual(JSON.parse(bypass.stdout), [true, true, true, false, true, false]);
+  assert.deepEqual(JSON.parse(bypass.stdout), [true, false, false, false, false, false]);
+
+  const wildcard = run({ no_proxy: '*' }, bypassScript);
+  assert.deepEqual(JSON.parse(wildcard.stdout), [true, false, false, false, false, false]);
 });
 
 test('LAN proxy requires the explicit private-network allow switch', () => {
@@ -139,6 +161,24 @@ test('public IPs, ordinary domains, and unsupported protocols stay rejected', ()
     });
     assert.notEqual(result.status, 0, proxy);
   }
+});
+
+test('IPv6 HTTPS targets retain their address through HTTP and SOCKS5 proxy framing', () => {
+  assert.equal(secureProxy.getTargetHostname({ hostname: '::1', port: 443 }), '::1');
+  assert.equal(secureProxy.getTargetHostname({ host: '[2001:db8::1]:443' }), '2001:db8::1');
+  assert.equal(secureProxy.formatConnectAuthority('::1', 443), '[::1]:443');
+  const frame = secureProxy.buildSocksConnectRequest('::1', 443);
+  assert.deepEqual([...frame.subarray(0, 4)], [0x05, 0x01, 0x00, 0x04]);
+  assert.equal(frame.length, 22);
+  assert.equal(frame.readUInt16BE(20), 443);
+});
+
+test('SOCKS5 handshake rejects malformed versions and authentication downgrade', () => {
+  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'secure-proxy.js'), 'utf8');
+  assert.match(source, /buffer\[0\] !== 0x05/);
+  assert.match(source, /buffer\[0\] === 0x01 && buffer\[1\] === 0x00/);
+  assert.match(source, /method !== 0x00 \|\| hasAuth/);
+  assert.match(source, /buffer\[0\] !== 0x05 \|\| buffer\[2\] !== 0x00/);
 });
 
 test('all first-party HTTPS and Chromium paths load the shared proxy policy', () => {

@@ -15,12 +15,39 @@ test('profile lock records task ownership and rejects a second owner', () => {
     const current = locks.readLock(file);
     assert.equal(current.profile, 'acc1');
     assert.equal(current.task, 'reader');
+    assert.equal(current.version, 2);
+    if (process.platform === 'linux') {
+      assert.ok(current.processStartToken);
+      assert.equal(locks.isLockOwnerAlive(current), true);
+    }
     assert.throws(() => locks.acquireLock(file, { profile: 'acc1', task: 'cookie-import' }), error => {
       assert.equal(error.code, 'LOCK_BUSY');
       return true;
     });
     handle.release();
     assert.equal(fs.existsSync(file), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a reused PID with a different process start token is not treated as the lock owner', () => {
+  if (process.platform !== 'linux') return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2ex-lock-test-'));
+  const file = path.join(dir, 'credential.lock');
+  try {
+    fs.writeFileSync(file, JSON.stringify({
+      version: 2,
+      pid: process.pid,
+      profile: 'default',
+      task: 'reader',
+      token: 'old-token',
+      processStartToken: '1',
+    }));
+    assert.equal(locks.isLockOwnerAlive(locks.readLock(file)), false);
+    const handle = locks.acquireLock(file, { profile: 'default', task: 'reader' });
+    assert.equal(locks.isLockOwnerAlive(handle.lock), true);
+    handle.release();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -72,6 +99,23 @@ test('waiting lock acquisition still fails after its deadline', async () => {
     );
   } finally {
     owner.release();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a stale reclamation marker fails closed and preserves the original lock', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2ex-lock-test-'));
+  const file = path.join(dir, 'credential.lock');
+  const stale = JSON.stringify({ version: 2, pid: 2147483647, task: 'reader', token: 'stale' });
+  try {
+    fs.writeFileSync(file, stale);
+    fs.writeFileSync(`${file}.reclaim`, stale);
+    assert.throws(() => locks.acquireLock(file, { profile: 'default', task: 'reader' }), error => {
+      assert.equal(error.code, 'LOCK_RECLAIM_STALE');
+      return true;
+    });
+    assert.equal(fs.existsSync(file), true);
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

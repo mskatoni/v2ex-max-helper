@@ -5,19 +5,22 @@ const fs     = require('fs');
 const logger = require('./logger');
 const notify = require('./notify');
 const config = require('../lib/config');
+const fingerprint = require('./fingerprint');
 
 const cfg = config.getConfig();
+const FP = fingerprint.generate(cfg.profile);
 const DATA_DIR = cfg.readerDataDir;
 const BALANCE_LOG = cfg.balanceLog;
 const BALANCE_STATUS = cfg.balanceStatus;
 
 const HOST = 'www.v2ex.com';
 const BALANCE_ORIGIN = `https://${HOST}`;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 const HEADERS = {
   'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'User-Agent':      FP.userAgent,
   'Referer':         'https://www.v2ex.com/',
 };
 
@@ -33,7 +36,7 @@ function writeBalanceStatus(status) {
     config.writeFileAtomic(BALANCE_STATUS, JSON.stringify({
       time: new Date().toISOString(),
       ...status,
-    }, null, 2));
+    }, null, 2), { mode: 0o600 });
   } catch (e) {
     logger.warn(`Balance status write failed: ${e.message}`);
   }
@@ -56,7 +59,7 @@ function localDateKey(date = new Date()) {
 function fetchBalance(cookie, targetUrl = `https://${HOST}/balance`, redirects = 0) {
   return new Promise((resolve, reject) => {
     const url = new URL(targetUrl, BALANCE_ORIGIN);
-    if (url.origin !== BALANCE_ORIGIN) {
+    if (url.origin !== BALANCE_ORIGIN || url.username || url.password) {
       reject(new Error(`Balance redirect refused outside V2EX HTTPS origin: ${url.origin}`));
       return;
     }
@@ -66,28 +69,55 @@ function fetchBalance(cookie, targetUrl = `https://${HOST}/balance`, redirects =
       method:   'GET',
       headers:  Object.assign({}, HEADERS, { Cookie: cookie }),
     };
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(value);
+    };
     const req = https.request(opts, (res) => {
       let body = '';
-      res.on('data', c => body += c);
+      let received = 0;
+      res.on('data', (c) => {
+        received += Buffer.byteLength(c);
+        if (received > MAX_RESPONSE_BYTES) {
+          req.destroy(new Error('balance response too large'));
+          return;
+        }
+        body += c;
+      });
+      res.on('aborted', () => finish(new Error('balance response aborted')));
+      res.on('error', finish);
       res.on('end', () => {
+        if (settled) return;
         const statusCode = res.statusCode || 0;
         const location = res.headers.location;
         if ([301, 302, 303, 307, 308].includes(statusCode) && location && redirects < 3) {
-          const nextUrl = new URL(location, url).toString();
-          fetchBalance(cookie, nextUrl, redirects + 1).then(resolve, reject);
+          let nextUrl;
+          try {
+            nextUrl = new URL(location, url).toString();
+          } catch (_) {
+            finish(new Error('Balance redirect URL is invalid'));
+            return;
+          }
+          fetchBalance(cookie, nextUrl, redirects + 1).then(
+            value => finish(null, value),
+            finish
+          );
           return;
         }
-        resolve({
+        finish(null, {
           statusCode,
           headers: res.headers,
           body,
-          finalUrl: url.toString(),
+          finalUrl: url.pathname,
           redirected: redirects > 0,
           redirectCount: redirects,
         });
       });
     });
-    req.on('error', reject);
+    req.on('error', finish);
     req.setTimeout(20000, () => req.destroy(new Error('balance timeout')));
     req.end();
   });
@@ -156,6 +186,7 @@ function parseBalance(html) {
   if (!block) return null;
 
   let gold = 0, silver = 0, copper = 0;
+  let copperFound = false;
   const re = /(\d+)\s*<img[^>]+alt="([A-Z])"/gi;
   let m;
   while ((m = re.exec(block)) !== null) {
@@ -163,9 +194,12 @@ function parseBalance(html) {
     const coin = m[2].toUpperCase();
     if (coin === 'G') gold = val;
     else if (coin === 'S') silver = val;
-    else if (coin === 'B') copper = val;
+    else if (coin === 'B') {
+      copper = val;
+      copperFound = true;
+    }
   }
-  return { gold, silver, copper };
+  return copperFound ? { gold, silver, copper } : null;
 }
 
 // 状态
@@ -181,12 +215,14 @@ function saveBalanceLog(html) {
     const today = localDateKey();
     let log = {};
     if (fs.existsSync(BALANCE_LOG)) {
-      log = JSON.parse(fs.readFileSync(BALANCE_LOG, 'utf8'));
+      try {
+        const parsed = JSON.parse(fs.readFileSync(BALANCE_LOG, 'utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) log = parsed;
+        else logger.warn('Balance log format invalid; rebuilding current-day record');
+      } catch (_) {
+        logger.warn('Balance log is not valid JSON; rebuilding current-day record');
+      }
     }
-    // 滚动：只保留最近 7 天
-    const keys = Object.keys(log).sort();
-    while (keys.length >= 7) { delete log[keys.shift()]; }
-
     log[today] = {
       last: balance.copper,
       gold: balance.gold,
@@ -194,7 +230,10 @@ function saveBalanceLog(html) {
       copper: balance.copper,
       lastTime: new Date().toISOString()
     };
-    config.writeFileAtomic(BALANCE_LOG, JSON.stringify(log, null, 2));
+    // 先更新当天，再滚动；重复更新当天不能把 7 天记录误删成 6 天。
+    const keys = Object.keys(log).filter(key => /^\d{4}-\d{2}-\d{2}$/.test(key)).sort();
+    while (keys.length > 7) { delete log[keys.shift()]; }
+    config.writeFileAtomic(BALANCE_LOG, JSON.stringify(log, null, 2), { mode: 0o600 });
   } catch (e) {
     logger.warn(`Balance log write failed: ${e.message}`);
   }
@@ -301,4 +340,6 @@ module.exports = {
   fetchBalance,
   parseBalance,
   diagnoseResponse,
+  saveBalanceLog,
+  localDateKey,
 };

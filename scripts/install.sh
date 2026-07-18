@@ -3,7 +3,7 @@
 # V2EX Max Helper — 一键部署脚本（给 mjj 用）
 #
 # 一条命令在全新 Linux VPS 上完成：
-#   装 Node.js → 拉取项目 → 装依赖 → （可选）装 xvfb/Chromium → 引导存 Cookie
+#   装 Node.js → 拉取项目 → 装依赖/Chromium → 引导存 Cookie
 #   → 用 systemd timer 配好签到/保活/（可选）阅读定时任务
 #   → （可选）安装 Telegram Bot 常驻服务
 #
@@ -30,6 +30,13 @@ REPO_RAW="https://github.com/mskatoni/${REPO_NAME}"
 BRANCH="${BRANCH:-mskatoni-patch-beta}"
 ZIP_URL="${REPO_RAW}/archive/refs/heads/${BRANCH}.zip"
 PROFILE="${V2EX_PROFILE:-default}"
+[[ "$PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "非法 V2EX_PROFILE：$PROFILE" >&2; exit 1; }
+PROFILE_LOWER="${PROFILE,,}"
+if [[ "$PROFILE" != "default" && "$PROFILE_LOWER" == "default" ]] ||
+   [[ "$PROFILE_LOWER" =~ ^(con|prn|aux|nul|com[1-9]|lpt[1-9])$ ]]; then
+  echo "V2EX_PROFILE 不能使用跨平台保留名称：$PROFILE" >&2
+  exit 1
+fi
 
 # ---------- 参数解析 ----------
 UPDATE_MODE=0
@@ -56,8 +63,52 @@ step() { echo; echo "${B}==== $* ====${N}"; }
 
 [[ $EUID -eq 0 ]] || die "请用 root 运行（sudo bash 或切到 root）"
 
+TARGET_USER="${V2EX_RUN_USER:-${SUDO_USER:-root}}"
+id "$TARGET_USER" >/dev/null 2>&1 || die "运行用户不存在：${TARGET_USER}"
+TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
+if [[ -z "$TARGET_HOME" ]]; then
+  TARGET_HOME="$(awk -F: -v user="$TARGET_USER" '$1 == user { print $6; exit }' /etc/passwd)"
+fi
+[[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || die "无法确定运行用户 ${TARGET_USER} 的家目录"
+TARGET_GROUP="$(id -gn "$TARGET_USER")"
+
+run_as_target() {
+  if [[ "$TARGET_USER" == "root" ]]; then
+    HOME="$TARGET_HOME" "$@"
+  elif command -v runuser >/dev/null 2>&1; then
+    runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" "$@"
+  else
+    local home_q command_q=''
+    printf -v home_q '%q' "$TARGET_HOME"
+    printf -v command_q '%q ' "$@"
+    su -s "$(command -v bash)" "$TARGET_USER" -c "HOME=${home_q} ${command_q}"
+  fi
+}
+
+validate_project_path() {
+  local target="$1" resolved parent
+  [[ -n "$target" ]] || die "项目路径不能为空"
+  resolved="$(realpath -m -- "$target" 2>/dev/null)" || die "无法解析项目路径：${target}"
+  parent="$(dirname -- "$resolved")"
+  [[ "$parent" != "/" ]] || die "拒绝在根目录下的一级路径安装：${resolved}"
+  case "$resolved" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|"$TARGET_HOME")
+      die "拒绝对系统目录或用户家目录操作：${resolved}"
+      ;;
+  esac
+  printf '%s\n' "$resolved"
+}
+
+prepare_project_owner() {
+  local target
+  target="$(validate_project_path "$1")"
+  if [[ "$TARGET_USER" != "root" ]]; then
+    chown -R "$TARGET_USER:$TARGET_GROUP" "$target" || die "无法将项目目录交给运行用户 ${TARGET_USER}"
+  fi
+}
+
 # ---------- 自动检测更新模式 ----------
-DEFAULT_DIR="${INSTALL_DIR:-$HOME/v2ex-max-helper}"
+DEFAULT_DIR="${INSTALL_DIR:-$TARGET_HOME/v2ex-max-helper}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo '')"
 
 # 如果项目目录已存在，自动进入更新模式
@@ -92,27 +143,76 @@ info "包管理器：${PM}"
 # =============================================================================
 step "1/8 基础工具"
 $UPDATE >/dev/null 2>&1 || true
-for pkg in curl unzip git; do
-  command -v "$pkg" >/dev/null 2>&1 || { info "安装 $pkg"; $INSTALL "$pkg" >/dev/null 2>&1 || true; }
+for pkg in curl unzip git rsync; do
+  if ! command -v "$pkg" >/dev/null 2>&1; then
+    info "安装 $pkg"
+    $INSTALL "$pkg" >/dev/null 2>&1 || die "安装 $pkg 失败"
+  fi
+  command -v "$pkg" >/dev/null 2>&1 || die "缺少必要工具：$pkg"
 done
 ok "基础工具就绪"
 
+run_nodesource_setup() {
+  local setup_url="$1" setup_script
+  setup_script="$(mktemp)" || die "无法创建 NodeSource 临时文件"
+  if ! curl -fsSL "$setup_url" -o "$setup_script"; then
+    rm -f -- "$setup_script"
+    die "NodeSource 安装脚本下载失败"
+  fi
+  if ! bash "$setup_script" >/dev/null 2>&1; then
+    rm -f -- "$setup_script"
+    die "NodeSource 软件源配置失败"
+  fi
+  rm -f -- "$setup_script"
+}
+
+sync_zip_branch() {
+  local target="$1" tmp src_dir
+  target="$(validate_project_path "$target")"
+  tmp="$(mktemp -d)" || die "无法创建代码更新临时目录"
+  if ! curl -fsSL "$ZIP_URL" -o "${tmp}/source.zip"; then
+    rm -rf -- "$tmp"
+    die "下载更新失败"
+  fi
+  if ! unzip -q "${tmp}/source.zip" -d "$tmp"; then
+    rm -rf -- "$tmp"
+    die "更新包解压失败"
+  fi
+  src_dir="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  if [[ -z "$src_dir" ]]; then
+    rm -rf -- "$tmp"
+    die "解压后未找到项目目录"
+  fi
+  mkdir -p -- "$target"
+  if ! rsync -a --delete-delay \
+      --exclude='node_modules/' --exclude='.git/' \
+      --exclude='.env' --exclude='.v2ex_env' \
+      --exclude='data/' --exclude='reader/data/' --exclude='checkin/data/' \
+      "${src_dir}/" "${target}/"; then
+    rm -rf -- "$tmp"
+    die "项目文件更新失败"
+  fi
+  rm -rf -- "$tmp"
+}
+
 # =============================================================================
-# Step 2/8 — Node.js 18+
+# Step 2/8 — Node.js 24+
 # =============================================================================
 step "2/8 Node.js"
 need_node=1
 if command -v node >/dev/null 2>&1; then
   major="$(node -v | sed 's/v\([0-9]*\).*/\1/')"
-  if [[ "$major" -ge 18 ]]; then need_node=0; ok "已安装 Node $(node -v)"; else warn "Node 版本过低（$(node -v)），将升级"; fi
+  if [[ "$major" -ge 24 ]]; then need_node=0; ok "已安装 Node $(node -v)"; else warn "Node 版本过低（$(node -v)），将升级"; fi
 fi
 if [[ $need_node -eq 1 ]]; then
   case "$PM" in
-    apt)        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; $INSTALL nodejs >/dev/null 2>&1 ;;
-    dnf|yum)    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; $INSTALL nodejs >/dev/null 2>&1 ;;
+    apt)        run_nodesource_setup https://deb.nodesource.com/setup_24.x; $INSTALL nodejs >/dev/null 2>&1 ;;
+    dnf|yum)    run_nodesource_setup https://rpm.nodesource.com/setup_24.x; $INSTALL nodejs >/dev/null 2>&1 ;;
     apk)        $INSTALL nodejs npm >/dev/null 2>&1 ;;
   esac
   command -v node >/dev/null 2>&1 || die "Node.js 安装失败，请手动安装后重试"
+  major="$(node -p 'Number(process.versions.node.split(".")[0])')"
+  [[ "$major" -ge 24 ]] || die "系统仓库只提供 Node $(node -v)，请手动安装 Node.js 24+ 后重试"
   ok "Node $(node -v) 安装完成"
 fi
 
@@ -126,37 +226,31 @@ if [[ -n "$SCRIPT_DIR" && -f "${SCRIPT_DIR}/../checkin/v2ex-checkin.js" ]]; then
   PROJ_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
   if [[ $UPDATE_MODE -eq 1 && -d "${PROJ_DIR}/.git" ]]; then
     info "从 git 拉取最新代码..."
-    ( cd "$PROJ_DIR" && git pull --ff-only ) || warn "git pull 失败，继续使用当前版本"
+    prepare_project_owner "$PROJ_DIR"
+    run_as_target git -C "$PROJ_DIR" pull --ff-only || die "git pull 失败，未完成更新"
     SUMMARY_COMPONENTS+=("项目代码（git pull 更新）")
+  elif [[ $UPDATE_MODE -eq 1 ]]; then
+    info "本地项目没有 .git，从分支 ${BRANCH} 下载并同步代码..."
+    sync_zip_branch "$PROJ_DIR"
+    SUMMARY_COMPONENTS+=("项目代码（zip 重新下载）")
+    ok "代码已更新：${PROJ_DIR}"
   else
     ok "检测到本地项目：${PROJ_DIR}"
-    [[ $UPDATE_MODE -eq 1 ]] && SUMMARY_COMPONENTS+=("项目代码（本地，无 .git）") || SUMMARY_COMPONENTS+=("项目代码")
+    SUMMARY_COMPONENTS+=("项目代码")
   fi
 else
-  PROJ_DIR="$DEFAULT_DIR"
+  PROJ_DIR="$(validate_project_path "$DEFAULT_DIR")"
   if [[ -f "${PROJ_DIR}/checkin/v2ex-checkin.js" ]]; then
     if [[ $UPDATE_MODE -eq 1 ]]; then
       if [[ -d "${PROJ_DIR}/.git" ]]; then
         info "从 git 拉取最新代码..."
-        ( cd "$PROJ_DIR" && git pull --ff-only ) || warn "git pull 失败，继续使用当前版本"
+        prepare_project_owner "$PROJ_DIR"
+        run_as_target git -C "$PROJ_DIR" pull --ff-only || die "git pull 失败，未完成更新"
         SUMMARY_COMPONENTS+=("项目代码（git pull 更新）")
       else
         info "重新下载最新代码（分支：${BRANCH}）..."
-        tmp="$(mktemp -d)"
-        curl -fsSL "$ZIP_URL" -o "${tmp}/source.zip" || { warn "下载失败，继续使用当前版本"; rm -rf "$tmp"; }
-        if [[ -f "${tmp}/source.zip" ]]; then
-          unzip -q "${tmp}/source.zip" -d "$tmp"
-          src_dir="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-          [[ -n "$src_dir" ]] || { warn "解压后未找到项目目录，继续使用当前版本"; rm -rf "$tmp"; }
-          # 保留用户数据目录，只更新代码文件
-          if [[ -n "${src_dir:-}" ]]; then
-            rsync -a --exclude='node_modules' --exclude='.git' \
-              "${src_dir}/" "$PROJ_DIR/" 2>/dev/null \
-              || cp -a "${src_dir}/." "$PROJ_DIR/" 2>/dev/null || true
-          fi
-          rm -rf "$tmp"
-          SUMMARY_COMPONENTS+=("项目代码（zip 重新下载）")
-        fi
+        sync_zip_branch "$PROJ_DIR"
+        SUMMARY_COMPONENTS+=("项目代码（zip 重新下载）")
         ok "代码已更新：${PROJ_DIR}"
       fi
     else
@@ -171,13 +265,18 @@ else
     src_dir="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
     [[ -n "$src_dir" ]] || die "解压后未找到项目目录"
     mkdir -p "$(dirname "$PROJ_DIR")"
-    rm -rf "$PROJ_DIR"
+    if [[ -e "$PROJ_DIR" || -L "$PROJ_DIR" ]]; then
+      rm -rf -- "$tmp"
+      die "目标路径已存在但不是已识别的项目，拒绝删除：${PROJ_DIR}"
+    fi
     mv "$src_dir" "$PROJ_DIR"
     rm -rf "$tmp"
     ok "项目就绪：${PROJ_DIR}"
     SUMMARY_COMPONENTS+=("项目代码（全新安装）")
   fi
 fi
+
+prepare_project_owner "$PROJ_DIR"
 
 # ---------- 选择是否安装阅读模块 ----------
 INSTALL_READER=1
@@ -192,19 +291,22 @@ fi
 # =============================================================================
 step "4/8 安装依赖"
 if [[ $INSTALL_READER -eq 1 ]]; then
-  # 无头机器需要 xvfb
-  if ! command -v xvfb-run >/dev/null 2>&1; then
-    info "安装 xvfb（无头服务器跑有头浏览器用）"
-    case "$PM" in
-      apt)     $INSTALL xvfb >/dev/null 2>&1 || warn "xvfb 安装失败，可后续手动装" ;;
-      dnf|yum) $INSTALL xorg-x11-server-Xvfb >/dev/null 2>&1 || warn "xvfb 安装失败" ;;
-      apk)     $INSTALL xvfb >/dev/null 2>&1 || warn "xvfb 安装失败" ;;
-    esac
-  fi
   info "安装 reader 依赖（playwright + sql.js），可能较慢..."
-  ( cd "${PROJ_DIR}/reader" && npm install --no-audit --no-fund >/dev/null 2>&1 ) || die "npm install 失败"
+  run_as_target bash -c 'cd "$1" && npm ci --no-audit --no-fund' _ "${PROJ_DIR}/reader" \
+    >/dev/null 2>&1 || die "npm ci 失败"
+  if [[ "$PM" == "apt" ]]; then
+    info "安装 Playwright 系统依赖..."
+    ( cd "${PROJ_DIR}/reader" && npx playwright install-deps chromium ) \
+      >/dev/null 2>&1 || die "Playwright 系统依赖安装失败"
+  else
+    warn "当前包管理器不是 apt；请确认 Chromium 所需共享库已安装"
+  fi
   info "安装 Chromium 内核..."
-  ( cd "${PROJ_DIR}/reader" && npx playwright install chromium >/dev/null 2>&1 ) || warn "Chromium 安装失败，可手动 npx playwright install chromium"
+  run_as_target bash -c 'cd "$1" && npx playwright install chromium' _ "${PROJ_DIR}/reader" \
+    >/dev/null 2>&1 || die "Chromium 安装失败，请检查磁盘空间和网络后重试"
+  info "验证 Chromium 能否启动..."
+  run_as_target bash -c 'cd "$1" && node -e "const { chromium } = require(\"playwright\"); chromium.launch({ headless: true, args: [\"--no-sandbox\"] }).then(browser => browser.close()).catch(error => { console.error(error.message); process.exit(1); });"' _ "${PROJ_DIR}/reader" \
+    >/dev/null 2>&1 || die "Chromium 启动验证失败，请安装缺失的系统共享库后重试"
   ok "阅读模块依赖就绪"
   SUMMARY_COMPONENTS+=("阅读模块依赖")
 else
@@ -216,8 +318,8 @@ fi
 # Step 5/8 — 保存 V2EX Cookie
 # =============================================================================
 step "5/8 保存 V2EX Cookie"
-CK_FILE="$HOME/.v2ex_cookie"
-[[ "$PROFILE" != "default" ]] && CK_FILE="$HOME/.v2ex_cookie.${PROFILE}"
+CK_FILE="$TARGET_HOME/.v2ex_cookie"
+[[ "$PROFILE" != "default" ]] && CK_FILE="$TARGET_HOME/.v2ex_cookie.${PROFILE}"
 
 if [[ $UPDATE_MODE -eq 1 ]]; then
   # 更新模式：保留现有 Cookie
@@ -233,9 +335,10 @@ elif [[ -s "$CK_FILE" ]]; then
   SUMMARY_COMPONENTS+=("Cookie")
 elif [[ -t 0 ]]; then
   echo "请粘贴登录后的 V2EX Cookie 字符串（浏览器 F12 → Network → 任意请求 → Request Headers 的 Cookie）："
-  read -rp "Cookie: " ck
+  read -rsp "Cookie（输入不会回显）: " ck
+  echo
   if [[ -n "$ck" ]]; then
-    V2EX_PROFILE="$PROFILE" V2EX_COOKIE="$ck" node "${PROJ_DIR}/checkin/v2ex-checkin.js" --save-cookie \
+    run_as_target env V2EX_PROFILE="$PROFILE" V2EX_COOKIE="$ck" node "${PROJ_DIR}/checkin/v2ex-checkin.js" --save-cookie \
       && { ok "Cookie 已保存到 ${CK_FILE}"; SUMMARY_COMPONENTS+=("Cookie"); } \
       || warn "保存失败，稍后手动执行 --save-cookie"
   else
@@ -258,13 +361,14 @@ if [[ $UPDATE_MODE -eq 1 ]]; then
   command -v systemctl >/dev/null 2>&1 && HAS_SYSTEMD=1
 elif command -v systemctl >/dev/null 2>&1; then
   HAS_SYSTEMD=1
-  SYSD_ARGS=()
+  SYSD_ARGS=(--user "$TARGET_USER" --project-root "$PROJ_DIR")
   [[ "$PROFILE" != "default" ]] && SYSD_ARGS+=(--profile "$PROFILE")
   [[ $INSTALL_READER -eq 0 ]]   && SYSD_ARGS+=(--no-reader)
+  [[ ! -t 0 ]] && SYSD_ARGS+=(--yes)
   info "调用 install-systemd.sh ${SYSD_ARGS[*]:-}"
   bash "${PROJ_DIR}/scripts/install-systemd.sh" "${SYSD_ARGS[@]}" \
     && SUMMARY_COMPONENTS+=("systemd 定时任务") \
-    || warn "systemd 安装未完成，可稍后手动运行 scripts/install-systemd.sh"
+    || die "systemd 安装未完成，请修复上方错误后重试"
 else
   warn "无 systemd，跳过。请参考 docs/部署指南.md 的 crontab 回退方案。"
 fi
@@ -300,10 +404,16 @@ fi
 # =============================================================================
 step "7/8 Telegram Bot 常驻服务（可选）"
 if [[ $UPDATE_MODE -eq 1 ]]; then
-  # 更新模式下，若 Bot 已安装则跳过
-  if [[ $HAS_SYSTEMD -eq 1 ]] && systemctl list-unit-files 2>/dev/null | grep -q 'v2ex-bot.*\.service'; then
-    ok "Bot 服务已安装，保留现有配置"
-    SUMMARY_SKIPPED+=("Telegram Bot（保留现有）")
+  # 更新模式下重写受管 Bot unit，确保加载当前安全参数和新代码。
+  if [[ $HAS_SYSTEMD -eq 1 ]] && systemctl list-unit-files 2>/dev/null | grep -q '^v2ex-bot\.service'; then
+    BOT_ARGS=(--bot-only --yes --user "$TARGET_USER" --project-root "$PROJ_DIR")
+    if bash "${PROJ_DIR}/scripts/install-systemd.sh" "${BOT_ARGS[@]}"; then
+      ok "Bot 服务单元已更新并加载新代码"
+      SUMMARY_COMPONENTS+=("Telegram Bot（单元已更新）")
+    else
+      warn "Bot 服务单元更新失败，请检查：systemctl status v2ex-bot"
+      SUMMARY_SKIPPED+=("Telegram Bot（单元更新失败）")
+    fi
   else
     ok "更新模式：跳过 Bot 安装"
     SUMMARY_SKIPPED+=("Telegram Bot")
@@ -311,22 +421,20 @@ if [[ $UPDATE_MODE -eq 1 ]]; then
 elif [[ $HAS_SYSTEMD -eq 1 && -t 0 ]]; then
   read -rp "是否安装 Telegram Bot 常驻服务？需先配好 ~/.v2ex_env [y/N]: " yn_bot
   if [[ "${yn_bot,,}" == "y" ]]; then
-    BOT_ARGS=(--bot)
-    [[ "$PROFILE" != "default" ]] && BOT_ARGS+=(--profile "$PROFILE")
-    [[ $INSTALL_READER -eq 0 ]]   && BOT_ARGS+=(--no-reader)
+    BOT_ARGS=(--bot-only --yes --user "$TARGET_USER" --project-root "$PROJ_DIR")
     info "调用 install-systemd.sh ${BOT_ARGS[*]}"
     bash "${PROJ_DIR}/scripts/install-systemd.sh" "${BOT_ARGS[@]}" \
       && { ok "Bot 服务安装完成"; INSTALLED_BOT=1; SUMMARY_COMPONENTS+=("Telegram Bot 常驻服务"); } \
-      || warn "Bot 安装失败，可稍后手动运行：bash ${PROJ_DIR}/scripts/install-systemd.sh --bot"
+      || warn "Bot 安装失败，可稍后手动运行：bash ${PROJ_DIR}/scripts/install-systemd.sh --bot-only"
   else
-    ok "跳过 Bot 安装（后续可运行：bash ${PROJ_DIR}/scripts/install-systemd.sh --bot）"
+    ok "跳过 Bot 安装（后续可运行：bash ${PROJ_DIR}/scripts/install-systemd.sh --bot-only）"
     SUMMARY_SKIPPED+=("Telegram Bot")
   fi
 elif [[ $HAS_SYSTEMD -eq 0 ]]; then
   warn "无 systemd，无法安装 Bot 常驻服务。"
   SUMMARY_SKIPPED+=("Telegram Bot（无 systemd）")
 else
-  ok "非交互环境，跳过 Bot 安装。后续可运行：bash ${PROJ_DIR}/scripts/install-systemd.sh --bot"
+  ok "非交互环境，跳过 Bot 安装。后续可运行：bash ${PROJ_DIR}/scripts/install-systemd.sh --bot-only"
   SUMMARY_SKIPPED+=("Telegram Bot")
 fi
 

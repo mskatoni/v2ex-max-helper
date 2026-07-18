@@ -7,6 +7,8 @@
 // 设计原则：只在「合理且常见」的取值范围内选择，避免生成罕见组合反而更显眼。
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 // 基于种子字符串生成一个确定性 PRNG（mulberry32）
 function makeRng(seedStr) {
@@ -29,8 +31,31 @@ function pick(rng, arr) {
 
 // ===== 候选池（均为常见、低风险的真实组合）=====
 
-// 近期主流稳定版 Chrome 大版本
-const CHROME_VERSIONS = ['122.0.0.0', '123.0.0.0', '124.0.0.0', '125.0.0.0', '126.0.0.0'];
+function bundledChromiumVersion() {
+  try {
+    const playwrightRoot = path.dirname(require.resolve('playwright/package.json'));
+    const candidates = [
+      path.join(playwrightRoot, 'node_modules', 'playwright-core', 'browsers.json'),
+      path.join(playwrightRoot, '..', 'playwright-core', 'browsers.json'),
+    ];
+    for (const file of candidates) {
+      if (!fs.existsSync(file)) continue;
+      const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const chromium = Array.isArray(manifest.browsers)
+        ? manifest.browsers.find(item => item.name === 'chromium')
+        : null;
+      const major = chromium && String(chromium.browserVersion || '').match(/^(\d+)\./);
+      if (major) return `${major[1]}.0.0.0`;
+    }
+    const desktopChrome = require('playwright').devices['Desktop Chrome'];
+    const deviceMajor = desktopChrome && String(desktopChrome.userAgent || '').match(/Chrome\/(\d+)\./);
+    if (deviceMajor) return `${deviceMajor[1]}.0.0.0`;
+  } catch (_) {}
+  return '';
+}
+
+// UA 主版本必须与 Playwright 实际携带的 Chromium 一致，避免长期写死后产生明显矛盾。
+const CHROME_VERSION = bundledChromiumVersion();
 
 // 平台维度：UA 片段 + navigator.platform + UA-CH platform
 const PLATFORMS = [
@@ -92,7 +117,7 @@ const WEBGL = [
 function generate(profileName) {
   const rng = makeRng(`v2ex-fp::${profileName}`);
 
-  const chromeVer = pick(rng, CHROME_VERSIONS);
+  const chromeVer = CHROME_VERSION;
   const platform  = pick(rng, PLATFORMS);
   const viewport  = pick(rng, VIEWPORTS);
   const lang      = pick(rng, LANGUAGES);
@@ -106,11 +131,12 @@ function generate(profileName) {
     gl = WEBGL[0]; // 回退到 Intel
   }
 
-  const userAgent =
-    `Mozilla/5.0 (${platform.uaOS}) AppleWebKit/537.36 (KHTML, like Gecko) ` +
-    `Chrome/${chromeVer} Safari/537.36`;
+  const userAgent = chromeVer
+    ? `Mozilla/5.0 (${platform.uaOS}) AppleWebKit/537.36 (KHTML, like Gecko) ` +
+      `Chrome/${chromeVer} Safari/537.36`
+    : 'Mozilla/5.0';
 
-  const majorVersion = chromeVer.split('.')[0];
+  const majorVersion = chromeVer ? chromeVer.split('.')[0] : '';
 
   return {
     profileName,
@@ -170,4 +196,4 @@ function buildInitScript(fp) {
   };
 }
 
-module.exports = { generate, buildInitScript };
+module.exports = { generate, buildInitScript, bundledChromiumVersion };

@@ -1,16 +1,19 @@
 {
   "name": "v2ex-max-helper-reader",
-  "version": "1.3.8",
+  "version": "1.4.9",
   "description": "V2EX 自动阅读活跃度脚本 - Playwright + SQLite",
   "main": "main.js",
   "scripts": {
     "start":   "node main.js",
     "dry-run": "node main.js --dry-run",
     "bot":     "node bot.js",
-    "test":    "node --test ../test/profile-auth.test.js ../test/profile-lock.test.js ../test/profile-schedule.test.js ../test/multi-profile-entry.test.js ../test/bot-isolation-source.test.js ../test/secure-proxy.test.js ../test/notify.test.js ../test/config-isolation.test.js ../test/queue-persistence.test.js ../test/behavior.test.js ../test/browser-resource.test.js"
+    "test":    "node --test ../test/profile-auth.test.js ../test/profile-lock.test.js ../test/profile-schedule.test.js ../test/multi-profile-entry.test.js ../test/bot-isolation-source.test.js ../test/secure-proxy.test.js ../test/notify.test.js ../test/config-isolation.test.js ../test/queue-persistence.test.js ../test/behavior.test.js ../test/browser-resource.test.js ../test/checkin-safety.test.js ../test/balance-state.test.js ../test/network-response.test.js ../test/deployment-source.test.js ../test/feishu-bot.test.js ../test/server.test.js"
+  },
+  "engines": {
+    "node": ">=24"
   },
   "dependencies": {
-    "playwright": "^1.44.0",
-    "sql.js":     "^1.10.0"
+    "playwright": "1.61.1",
+    "sql.js":     "1.14.1"
   }
 }

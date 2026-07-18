@@ -27,9 +27,16 @@ function stripHtml(text) {
     .replace(/&amp;/g, '&');
 }
 
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function withProfile(text) {
   if (cfg.profile === 'default') return text;
-  return `👤 <b>Profile</b>: <code>${cfg.profile}</code>\n${text}`;
+  return `👤 <b>Profile</b>: <code>${escapeHtml(cfg.profile)}</code>\n${text}`;
 }
 
 function warnPushFailure(channel, detail) {
@@ -56,11 +63,38 @@ function sendTelegram(text) {
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {
-      res.resume();
+      let data = '';
+      let received = 0;
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (settled) return;
+        received += Buffer.byteLength(chunk);
+        if (received > 64 * 1024) {
+          warnPushFailure('Telegram', 'response too large');
+          req.destroy();
+          finish();
+          return;
+        }
+        data += chunk;
+      });
+      res.on('aborted', () => {
+        warnPushFailure('Telegram', 'response aborted');
+        finish();
+      });
+      res.on('error', () => {
+        warnPushFailure('Telegram', 'response error');
+        finish();
+      });
       res.on('end', () => {
         if (settled) return;
         if (!isSuccessStatus(res.statusCode)) {
           warnPushFailure('Telegram', `HTTP ${res.statusCode || 'unknown'}`);
+        } else {
+          try {
+            if (!JSON.parse(data || '{}').ok) warnPushFailure('Telegram', 'API rejected request');
+          } catch (_) {
+            warnPushFailure('Telegram', 'invalid API response');
+          }
         }
         finish();
       });
@@ -87,6 +121,7 @@ function sendFeishu(text) {
     let target;
     try {
       target = new URL(cfg.feishu.webhook);
+      if (target.protocol !== 'https:' || target.username || target.password) throw new Error('unsafe URL');
     } catch (_) {
       warnPushFailure('Feishu', 'invalid webhook URL');
       resolve();
@@ -105,6 +140,7 @@ function sendFeishu(text) {
     });
     const req = https.request({
       hostname: target.hostname,
+      port: target.port || 443,
       path: `${target.pathname}${target.search}`,
       method: 'POST',
       headers: {
@@ -112,11 +148,40 @@ function sendFeishu(text) {
         'Content-Length': Buffer.byteLength(body),
       },
     }, (res) => {
-      res.resume();
+      let data = '';
+      let received = 0;
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (settled) return;
+        received += Buffer.byteLength(chunk);
+        if (received > 64 * 1024) {
+          warnPushFailure('Feishu', 'response too large');
+          req.destroy();
+          finish();
+          return;
+        }
+        data += chunk;
+      });
+      res.on('aborted', () => {
+        warnPushFailure('Feishu', 'response aborted');
+        finish();
+      });
+      res.on('error', () => {
+        warnPushFailure('Feishu', 'response error');
+        finish();
+      });
       res.on('end', () => {
         if (settled) return;
         if (!isSuccessStatus(res.statusCode)) {
           warnPushFailure('Feishu', `HTTP ${res.statusCode || 'unknown'}`);
+        } else {
+          try {
+            const parsed = JSON.parse(data);
+            const code = parsed.code !== undefined ? parsed.code : parsed.StatusCode;
+            if (code === undefined || Number(code) !== 0) warnPushFailure('Feishu', 'API rejected request');
+          } catch (_) {
+            warnPushFailure('Feishu', 'invalid API response');
+          }
         }
         finish();
       });
@@ -149,10 +214,10 @@ async function notifyReaderDone(stats) {
   const emoji = stats.changed >= 2 ? '🎉' : '✅';
   await sendMessage(
     `${emoji} <b>V2EX 阅读完成</b>\n` +
-    `📖 阅读: ${stats.read} 篇\n` +
-    `💰 余额变化: ${stats.changed} 次\n` +
-    `⏱ 耗时: ${stats.elapsed}\n` +
-    `🛑 原因: ${stats.reason || '达到上限'}`
+    `📖 阅读: ${escapeHtml(stats.read)} 篇\n` +
+    `💰 余额变化: ${escapeHtml(stats.changed)} 次\n` +
+    `⏱ 耗时: ${escapeHtml(stats.elapsed)}\n` +
+    `🛑 原因: ${escapeHtml(stats.reason || '达到上限')}`
   );
 }
 
@@ -164,9 +229,9 @@ async function notifyReaderError(stats) {
     : '已跳过异常帖子，请查看日志确认网络/CF/重定向状态';
   await sendMessage(
     `⚠️ <b>V2EX 阅读中止</b>\n` +
-    `❌ ${reason}\n` +
-    `📖 已读: ${stats.read} 篇\n` +
-    `💡 ${hint}`
+    `❌ ${escapeHtml(reason)}\n` +
+    `📖 已读: ${escapeHtml(stats.read)} 篇\n` +
+    `💡 ${escapeHtml(hint)}`
   );
 }
 
@@ -175,7 +240,7 @@ async function notifySessionExpired() {
   await sendMessage(
     `🔴 <b>V2EX Session 失效</b>\n` +
     `Cookie 已过期，请重新登录并更新 Cookie\n` +
-    `更新方式：通过 Telegram 面板为 profile <code>${cfg.profile}</code> 重新导入 Cookie`
+    `更新方式：通过 Telegram 面板为 profile <code>${escapeHtml(cfg.profile)}</code> 重新导入 Cookie`
   );
 }
 
@@ -183,8 +248,8 @@ async function notifySessionExpired() {
 async function notifyBalanceChanged(from, to, count) {
   await sendMessage(
     `💰 <b>V2EX 活跃度奖励</b>\n` +
-    `铜币: ${from} → ${to} (+${to - from})\n` +
-    `今日第 ${count} 次奖励`
+    `铜币: ${escapeHtml(from)} → ${escapeHtml(to)} (+${escapeHtml(to - from)})\n` +
+    `今日第 ${escapeHtml(count)} 次奖励`
   );
 }
 
@@ -193,7 +258,7 @@ async function notifyCheckin(result) {
   const ok = result.success;
   await sendMessage(
     `${ok ? '✅' : '❌'} <b>V2EX 签到${ok ? '成功' : '失败'}</b>\n` +
-    `${result.message || ''}`
+    `${escapeHtml(result.message || '')}`
   );
 }
 

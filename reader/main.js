@@ -34,6 +34,7 @@ const DEADLINE_LOCAL_HOUR = 14;   // 本机时间 14:00 超时退出
 const cfg = config.getConfig();
 const PROFILE_LIST = config.parseProfileList();
 const BEHAVIOR = behavior.resolve(cfg.profile);
+const FP = fingerprint.generate(cfg.profile);
 const BALANCE_CHECK_INTERVAL = BEHAVIOR.balanceCheckInterval; // 每读多少篇检查一次余额
 
 const isDryRun = process.argv.includes('--dry-run');
@@ -49,9 +50,14 @@ const READ_DISABLE_DEADLINE = /^(1|true|yes|on)$/i.test(String(process.env.READ_
 // --limit N 覆盖最大阅读数（测试用）
 function parseLimit() {
   const idx = process.argv.indexOf('--limit');
-  if (idx >= 0 && process.argv[idx + 1]) {
-    const n = parseInt(process.argv[idx + 1], 10);
-    if (n > 0) return n;
+  if (idx >= 0) {
+    const raw = String(process.argv[idx + 1] || '').trim();
+    if (!/^\d+$/.test(raw)) throw new Error('--limit 必须是正整数');
+    const n = Number(raw);
+    if (!Number.isSafeInteger(n) || n < 1 || n > MAX_READ_COUNT) {
+      throw new Error(`--limit 必须在 1 到 ${MAX_READ_COUNT} 之间`);
+    }
+    return n;
   }
   return isDryRun ? 10 : MAX_READ_COUNT;
 }
@@ -62,6 +68,16 @@ let readerLockHandle = null;
 let credentialLockHandle = null;
 let queueInitialized = false;
 let browserStarted = false;
+let activeStats = null;
+let activeStartTime = 0;
+
+async function requireBrowserCookie() {
+  const cookie = await browser.getCurrentCookie({ requireContextAuth: true });
+  if (cookie) return cookie;
+  const error = new Error('Chromium 上下文缺少认证 Cookie');
+  error.code = 'SESSION_EXPIRED';
+  throw error;
+}
 
 // ========== 锁文件 ==========
 function acquireLock() {
@@ -102,41 +118,16 @@ function isPastRuntime(startTime) {
 
 // ========== 优雅退出 ==========
 let isShuttingDown = false;
-async function shutdown(reason, stats, exitCode = 0) {
+async function shutdown(reason, stats, exitCode = 0, options = {}) {
   if (isShuttingDown) return;
   isShuttingDown = true;
-  logger.sep();
-  if (exitCode === 0) {
-    logger.ok(`停止原因: ${reason}`);
-    logger.ok(`📊 统计: 阅读 ${stats.read} 篇 | 余额变化 ${stats.changed} 次 | 耗时 ${stats.elapsed}`);
-  } else {
-    logger.warn(`停止原因: ${reason}`);
-    logger.warn(`📊 统计: 阅读 ${stats.read} 篇 | 余额变化 ${stats.changed} 次 | 耗时 ${stats.elapsed}`);
-  }
-  if (!isDryRun && queueInitialized) {
-    try {
-      const s = queue.stats();
-      logger.ok(`📦 队列: 可读 ${s.readable} | 已读满 ${s.exhausted} | 总计 ${s.total}`);
-    } catch (e) {
-      logger.warn(`读取队列统计失败: ${e.message}`);
-    }
-  }
-  logger.sep();
-  // Telegram 通知：仅报错时推送
-  stats.reason = reason;
-  if (!isDryRun) {
-    if (exitCode !== 0 || stats.consecutiveErrors >= 3) {
-      await notify.notifyReaderError(stats);
-    } else {
-      await notify.notifyReaderDone(stats);
-    }
-  }
+  let cleanupFailed = false;
   // 退出前最后一次余额检查（保证余额日志始终最新）
-  if (!isDryRun && browserStarted) {
+  if (exitCode === 0 && !isDryRun && browserStarted) {
     try {
-      const cookie = await browser.getCurrentCookie();
+      const cookie = await requireBrowserCookie();
       if (cookie) {
-        await balance.check(cookie);
+        stats.changed = await balance.check(cookie);
         const balanceStatus = balance.getLastStatus();
         if (balanceStatus && balanceStatus.ok) {
           logger.info('退出前余额已更新');
@@ -148,21 +139,62 @@ async function shutdown(reason, stats, exitCode = 0) {
       logger.warn(`退出前余额更新失败: ${e.message}`);
     }
   }
-  if (browserStarted) await browser.close();
+  if (browserStarted) {
+    try {
+      await browser.close({ throwOnError: true });
+    } catch (e) {
+      logger.error(`浏览器关闭或状态保存失败: ${e.message}`);
+      reason = `${reason}；浏览器状态保存失败`;
+      exitCode = 1;
+      cleanupFailed = true;
+    }
+  }
   browserStarted = false;
+  let queueStats = null;
   if (!isDryRun && queueInitialized) {
-    try { queue.close(); } catch (e) { logger.warn(`Queue close failed: ${e.message}`); }
+    try {
+      queueStats = queue.stats();
+    } catch (e) {
+      logger.warn(`读取队列统计失败: ${e.message}`);
+    }
+    try {
+      queue.close();
+    } catch (e) {
+      logger.error(`Queue close failed: ${e.message}`);
+      reason = `${reason}；队列保存失败`;
+      exitCode = 1;
+      cleanupFailed = true;
+    }
     queueInitialized = false;
   }
+  logger.sep();
+  if (exitCode === 0) {
+    logger.ok(`停止原因: ${reason}`);
+    logger.ok(`📊 统计: 阅读 ${stats.read} 篇 | 余额变化 ${stats.changed} 次 | 耗时 ${stats.elapsed}`);
+  } else {
+    logger.warn(`停止原因: ${reason}`);
+    logger.warn(`📊 统计: 阅读 ${stats.read} 篇 | 余额变化 ${stats.changed} 次 | 耗时 ${stats.elapsed}`);
+  }
+  if (queueStats) {
+    logger.ok(`📦 队列: 可读 ${queueStats.readable} | 已读满 ${queueStats.exhausted} | 总计 ${queueStats.total}`);
+  }
+  logger.sep();
+  stats.reason = reason;
   releaseLock();
+  if (!isDryRun) {
+    if (cleanupFailed || stats.consecutiveErrors >= 3 || (exitCode !== 0 && !options.expectedStop)) {
+      await notify.notifyReaderError(stats);
+    } else if (!options.expectedStop) {
+      await notify.notifyReaderDone(stats);
+    }
+  }
   process.exit(exitCode);
 }
 
 async function verifyAndBindProfile(cookie) {
-  const fp = fingerprint.generate(cfg.profile);
   const result = await profileAuth.verifyAndCompare(cfg, cookie, {
-    userAgent: fp.userAgent,
-    acceptLanguage: fp.acceptLanguage,
+    userAgent: FP.userAgent,
+    acceptLanguage: FP.acceptLanguage,
   });
   if (!result.ok) throw new Error(`Profile ${cfg.profile} 认证失败: ${result.message}`);
   if (result.identityState === 'different') {
@@ -188,12 +220,14 @@ async function main() {
 
   const stats = { read: 0, changed: 0, elapsed: '0s', consecutiveErrors: 0 };
   const startTime = Date.now();
+  activeStats = stats;
+  activeStartTime = startTime;
 
   // 注册退出信号处理
   const onExit = async (sig, exitCode) => {
     logger.warn(`收到 ${sig}，正在退出...`);
     stats.elapsed = elapsed(startTime);
-    await shutdown(sig, stats, exitCode);
+    await shutdown(sig, stats, exitCode, { expectedStop: true });
   };
   process.once('SIGTERM', () => onExit('SIGTERM', 143).catch(e => logger.error(`SIGTERM 退出失败: ${e.message}`)));
   process.once('SIGINT',  () => onExit('SIGINT', 130).catch(e => logger.error(`SIGINT 退出失败: ${e.message}`)));
@@ -230,7 +264,7 @@ async function main() {
 
     await browser.launch(false);
     browserStarted = true;
-    const browserCookie = await browser.getCurrentCookie();
+    const browserCookie = await requireBrowserCookie();
 
     const balanceState = await balance.init(browserCookie);
     if (!balanceState.ok && balanceState.fatal) {
@@ -278,7 +312,7 @@ async function main() {
     // 队列为空时才补充（fetchAll 内部有 5 分钟冷却）
     if (!isDryRun && !url) {
       logger.info('队列为空，尝试补充...');
-      const freshCookie = await browser.getCurrentCookie();
+      const freshCookie = await requireBrowserCookie();
       const urls = await fetcher.fetchAll(freshCookie);
       if (urls.length > 0) queue.add(urls);
       url = queue.pop();
@@ -301,11 +335,11 @@ async function main() {
     } else {
       if (!isDryRun) queue.skip(url);
       stats.consecutiveErrors = (stats.consecutiveErrors || 0) + 1;
-      logger.warn(`读帖失败 (连续 ${stats.consecutiveErrors}/3 次): ${url}`);
+      logger.warn(`读帖失败 (连续 ${stats.consecutiveErrors}/3 次): ${safePostLabel(url)}`);
       logger.warn('当前失败 URL 已跳过，避免重复触发同一异常帖');
 
       if (stats.consecutiveErrors >= 3) {
-        const freshCookie = await browser.getCurrentCookie();
+        const freshCookie = await requireBrowserCookie();
         const loginState = isDryRun ? 'unknown' : await probeLogin(freshCookie);
 
         if (loginState === 'logged_in') {
@@ -324,7 +358,7 @@ async function main() {
 
     // 每 BALANCE_CHECK_INTERVAL 篇检查一次余额
     if (!isDryRun && stats.read > 0 && stats.read % BALANCE_CHECK_INTERVAL === 0) {
-      const freshCookie = await browser.getCurrentCookie();
+      const freshCookie = await requireBrowserCookie();
       const changes = await balance.check(freshCookie);
       stats.changed = changes;
 
@@ -340,7 +374,7 @@ async function main() {
 
     // 每 200 篇主动补充队列（避免等到完全空了）
     if (!isDryRun && stats.read > 0 && stats.read % 200 === 0) {
-      const freshCookie = await browser.getCurrentCookie();
+      const freshCookie = await requireBrowserCookie();
       const urls = await fetcher.fetchAll(freshCookie);
       if (urls.length > 0) queue.add(urls);
     }
@@ -363,6 +397,17 @@ function elapsed(start) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function safePostLabel(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.origin === 'https://www.v2ex.com' && /^\/t\/\d+$/.test(parsed.pathname)
+      ? parsed.pathname
+      : '[invalid post URL]';
+  } catch (_) {
+    return '[invalid post URL]';
+  }
+}
+
 function probeLoginOnce(cookie) {
   if (!cookie) return Promise.resolve('logged_out');
 
@@ -373,22 +418,36 @@ function probeLoginOnce(cookie) {
       method: 'GET',
       headers: {
         Cookie: cookie,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': FP.userAgent,
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
       },
     }, (res) => {
       let body = '';
-      res.on('data', c => body += c);
+      let received = 0;
+      let settled = false;
+      const finish = (state) => {
+        if (settled) return;
+        settled = true;
+        resolve(state);
+      };
+      res.on('data', (c) => {
+        received += Buffer.byteLength(c);
+        if (received > 2 * 1024 * 1024) {
+          req.destroy();
+          finish('unknown');
+          return;
+        }
+        body += c;
+      });
+      res.on('aborted', () => finish('unknown'));
+      res.on('error', () => finish('unknown'));
       res.on('end', () => {
-        if (res.statusCode >= 500) return resolve('unknown');
-        const loggedOut = body.includes('你要查看的页面需要先登录') ||
-                          body.includes('需要先登录') ||
-                          body.includes('/signin');
-        if (loggedOut) return resolve('logged_out');
-        const loggedIn = body.includes('/notifications') && body.includes('/signout');
-        if (loggedIn) return resolve('logged_in');
-        resolve('unknown');
+        if (settled || res.statusCode !== 200) return finish('unknown');
+        const diagnosis = profileAuth.diagnoseHomePage({ statusCode: res.statusCode, body });
+        if (diagnosis.ok) return finish('logged_in');
+        if (diagnosis.code === 'logged_out') return finish('logged_out');
+        finish('unknown');
       });
     });
     req.on('error', () => resolve('unknown'));
@@ -418,5 +477,13 @@ main().catch(async (e) => {
     try { queue.close(); } catch (closeErr) { logger.warn(`Queue close failed: ${closeErr.message}`); }
   }
   releaseLock();
+  if (!isDryRun) {
+    const stats = activeStats || { read: 0, changed: 0, consecutiveErrors: 0 };
+    stats.elapsed = activeStartTime ? elapsed(activeStartTime) : '0s';
+    stats.reason = e.code === 'SESSION_EXPIRED'
+      ? 'Chromium 登录态已失效，请更新 Cookie'
+      : '阅读进程遇到未捕获错误，请查看服务器日志';
+    try { await notify.notifyReaderError(stats); } catch (_) {}
+  }
   process.exit(1);
 });

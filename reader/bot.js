@@ -32,13 +32,14 @@ const SETUP_CODE     = cfg.telegram.setupCode;
 const DATA_DIR       = cfg.readerDataDir;
 const LOCK_FILE       = cfg.readerLockFile;
 const READER_LOG      = cfg.readerLog;
-const AUTH_CHAT_FILE  = cfg.authChatFile;
 const INTERNAL_SCHEDULER_DISABLED = config.boolEnv('V2EX_DISABLE_INTERNAL_SCHEDULER');
 const MAX_PROFILE_COUNT = config.MAX_PROFILE_COUNT;
 const PROFILE_LIST = config.parseProfileList();
 const MULTI_PROFILE_MODE = PROFILE_LIST.length > 0;
 const CONTROL_PROFILES = MULTI_PROFILE_MODE ? PROFILE_LIST : [cfg.profile];
 const PROFILE_SELECTION_REQUIRED = CONTROL_PROFILES.length > 1;
+let STARTUP_COOKIE = process.env.V2EX_COOKIE || '';
+delete process.env.V2EX_COOKIE;
 
 let ALLOWED_CHAT_ID = loadAuthorizedChatId();   // 硬锁，唯一授权用户
 
@@ -65,13 +66,7 @@ function shouldWriteLog(lineLevel) {
 }
 
 function loadAuthorizedChatId() {
-  if (cfg.telegram.chatIdSource === 'env') return cfg.telegram.chatId;
-  try {
-    if (fs.existsSync(AUTH_CHAT_FILE)) {
-      return fs.readFileSync(AUTH_CHAT_FILE, 'utf8').trim();
-    }
-  } catch (_) {}
-  return '';
+  return cfg.telegram.chatId;
 }
 
 function saveAuthorizedChatId(chatId) {
@@ -100,14 +95,35 @@ function maskId(id) {
   return `${s.slice(0, 2)}***${s.slice(-2)}`;
 }
 
+function safeSecretEqual(actual, expected) {
+  const actualBuffer = Buffer.from(String(actual || ''));
+  const expectedBuffer = Buffer.from(String(expected || ''));
+  return actualBuffer.length === expectedBuffer.length &&
+    crypto.timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
 function isProcessAlive(pid) {
   return profileLock.isProcessAlive(pid);
+}
+
+function isReaderLockActive(lock) {
+  if (!lock) return false;
+  return lock.processStartToken
+    ? profileLock.isLockOwnerAlive(lock)
+    : isProcessAlive(lock.pid);
 }
 
 
 // ========== Telegram API（含重启容错）==========
 function tgRequest(method, params) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(value);
+    };
     const body = JSON.stringify(params);
     const req = https.request({
       hostname: 'api.telegram.org',
@@ -116,21 +132,33 @@ function tgRequest(method, params) {
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {
       let data = '';
-      res.on('data', c => data += c);
+      let received = 0;
+      res.setEncoding('utf8');
+      res.on('data', (c) => {
+        received += Buffer.byteLength(c);
+        if (received > 2 * 1024 * 1024) {
+          req.destroy(new Error('Telegram response too large'));
+          return;
+        }
+        data += c;
+      });
+      res.on('aborted', () => finish(new Error('Telegram response aborted')));
+      res.on('error', finish);
       res.on('end', () => {
+        if (settled) return;
         try {
           const parsed = JSON.parse(data);
           // 处理 Telegram 409 冲突（上一个实例的长轮询还没断开）
           if (res.statusCode === 409) {
             console.warn('[BOT] Telegram 409 冲突，上一个实例连接未断开，1秒后重试...');
-            resolve({ ok: false, conflict: true });
+            finish(null, { ok: false, conflict: true });
             return;
           }
-          resolve(parsed);
-        } catch { resolve({}); }
+          finish(null, parsed);
+        } catch { finish(null, {}); }
       });
     });
-    req.on('error', reject);
+    req.on('error', finish);
     req.setTimeout(40000, () => req.destroy(new Error('timeout')));
     req.write(body);
     req.end();
@@ -204,10 +232,63 @@ function hasUsableCookie(file) {
   }
 }
 
+let activeControlProfile = null;
+
+function getProfileAccountState(profile) {
+  const profileCfg = getProfileConfig(profile);
+  const occupied = hasUsableCookie(profileCfg.cookieFile);
+  if (!occupied) return { occupied: false, hint: '空' };
+  const identity = profileAuth.readIdentity(profileCfg.identityFile);
+  return { occupied: true, hint: profileAuth.getIdentityHint(identity) || '已登录' };
+}
+
+function getActiveControlProfile() {
+  if (activeControlProfile && CONTROL_PROFILES.includes(activeControlProfile)) return activeControlProfile;
+  const preferred = CONTROL_PROFILES.includes(cfg.profile) && getProfileAccountState(cfg.profile).occupied
+    ? cfg.profile
+    : CONTROL_PROFILES.find(profile => getProfileAccountState(profile).occupied);
+  activeControlProfile = preferred || (CONTROL_PROFILES.includes(cfg.profile) ? cfg.profile : getOnlyProfile());
+  return activeControlProfile;
+}
+
+function setActiveControlProfile(profile) {
+  if (!CONTROL_PROFILES.includes(profile)) return false;
+  activeControlProfile = profile;
+  return true;
+}
+
+function profileButtonText(profile) {
+  const state = getProfileAccountState(profile);
+  const selected = getActiveControlProfile() === profile ? '●' : '○';
+  return `${selected} ${state.hint} · 位置 ${profileTitle(profile)}`;
+}
+
+function buildMainPanelText(notice = '') {
+  const profile = getActiveControlProfile();
+  const state = getProfileAccountState(profile);
+  return `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n` +
+    `${notice ? `${notice}\n\n` : ''}` +
+    `👤 当前操作账号：<code>${escapeHtml(state.hint)}</code>\n` +
+    `📍 账号位置：<code>${escapeHtml(profileTitle(profile))}</code>`;
+}
+
 const INTERACTION_TTL_MS = 10 * 60 * 1000;
+const MAX_INTERACTION_SESSIONS = 128;
 const interactionSessions = new Map();
 
+function pruneInteractionSessions(now = Date.now()) {
+  for (const [id, session] of interactionSessions) {
+    if (session.expiresAt <= now) interactionSessions.delete(id);
+  }
+  while (interactionSessions.size >= MAX_INTERACTION_SESSIONS) {
+    const oldestId = interactionSessions.keys().next().value;
+    if (!oldestId) break;
+    interactionSessions.delete(oldestId);
+  }
+}
+
 function createInteractionSession(action, extraValue = null, messageId = null, profiles = CONTROL_PROFILES) {
+  pruneInteractionSessions();
   const id = crypto.randomBytes(9).toString('base64url');
   const session = {
     action,
@@ -240,22 +321,43 @@ function clearInteractionSessions() {
 function getProfilePickerMarkup(action, extraValue = null, messageId = null) {
   const sessionId = createInteractionSession(action, extraValue, messageId);
   const rows = CONTROL_PROFILES.map((profile, index) => {
-    const hasCookie = hasUsableCookie(getProfileConfig(profile).cookieFile);
     return [{
-      text: `${hasCookie ? '✅' : '⚠️'} ${profile}`,
+      text: profileButtonText(profile),
       callback_data: `ps:${sessionId}:${index}`,
     }];
   });
-  rows.push([{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]);
+  const returnAction = action === 'kp' && extraValue ? `ci:${extraValue}:cancel` : 'go_to_start';
+  rows.push([{ text: '◀️ 返回面板', callback_data: returnAction }]);
   return { inline_keyboard: rows };
 }
 
 function showProfilePicker(action, prompt, messageId = null, extraValue = null) {
-  const text = `👥 <b>${escapeHtml(prompt)}</b>\n\n请选择 profile：`;
+  const text = `👥 <b>${escapeHtml(prompt)}</b>\n\n请选择账号位置：`;
   const markup = getProfilePickerMarkup(action, extraValue, messageId);
   return messageId
     ? editMsgText(messageId, text, markup)
     : sendMsgWithKeyboard(text, markup);
+}
+
+function getAccountSwitcherMarkup(messageId = null) {
+  const sessionId = createInteractionSession('s', null, messageId);
+  const rows = CONTROL_PROFILES.map((profile, index) => [{
+    text: profileButtonText(profile),
+    callback_data: `ps:${sessionId}:${index}`,
+  }]);
+  const activeIndex = getProfileIndex(getActiveControlProfile());
+  if (activeIndex >= 0 && getProfileAccountState(CONTROL_PROFILES[activeIndex]).occupied) {
+    rows.push([{ text: '🍪 更新当前账号 Cookie', callback_data: `ps:${sessionId}:${activeIndex}:u` }]);
+  }
+  rows.push([{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]);
+  return { inline_keyboard: rows };
+}
+
+function showAccountSwitcher(messageId = null) {
+  const profile = getActiveControlProfile();
+  const account = getProfileAccountState(profile);
+  const text = `👥 <b>账号管理</b>\n\n当前：<code>${escapeHtml(account.hint)}</code> · 位置 <code>${escapeHtml(profileTitle(profile))}</code>`;
+  return sendOrEdit(messageId, text, getAccountSwitcherMarkup(messageId));
 }
 
 function sendOrEdit(messageId, text, replyMarkup = null) {
@@ -263,15 +365,17 @@ function sendOrEdit(messageId, text, replyMarkup = null) {
   return replyMarkup ? sendMsgWithKeyboard(text, replyMarkup) : sendMsg(text);
 }
 
-function getMainKeyboardMarkup() {
+function getMainKeyboardMarkup(messageId = null) {
+  const profile = getActiveControlProfile();
+  const sessionId = createInteractionSession('m', getActiveTaskSnapshot(), messageId, [profile]);
   return {
     inline_keyboard: [
       [
-        { text: '✅ 运行签到', callback_data: 'run_checkin' },
-        { text: '📖 运行阅读', callback_data: 'run_read_panel' }
+        { text: '✅ 运行签到', callback_data: `ma:${sessionId}:c` },
+        { text: '📖 运行阅读', callback_data: `ma:${sessionId}:r` }
       ],
       [
-        { text: '💰 余额查询', callback_data: 'query_balance' },
+        { text: '💰 余额查询', callback_data: `ma:${sessionId}:b` },
         { text: '📦 任务状态', callback_data: 'query_tasks' }
       ],
       [
@@ -279,8 +383,8 @@ function getMainKeyboardMarkup() {
         { text: '⚙️ 日志级别', callback_data: 'config_debug' }
       ],
       [
-        { text: '🛑 停止运行', callback_data: 'stop_task' },
-        { text: '🍪 导入 Cookie', callback_data: 'show_cookie_help' }
+        { text: '🛑 停止运行', callback_data: `ma:${sessionId}:x` },
+        { text: '👤 切换账号', callback_data: 'switch_account' }
       ],
       [
         { text: 'ℹ️ 命令帮助', callback_data: 'show_help' }
@@ -292,35 +396,62 @@ function getMainKeyboardMarkup() {
 async function handleStart() {
   clearPendingCookieImport();
   clearInteractionSessions();
-  const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n欢迎回来！你可以直接使用下方按钮完成常用操作；也可以直接粘贴 Cookie 文本，Bot 会自动识别并导入。`;
-  return sendMsgWithKeyboard(text, getMainKeyboardMarkup());
+  return sendMsgWithKeyboard(buildMainPanelText(), getMainKeyboardMarkup());
+}
+
+function buildHelpText() {
+  const profile = getActiveControlProfile();
+  const account = getProfileAccountState(profile);
+  return [
+    'ℹ️ <b>V2EX Max Helper 命令帮助说明</b>',
+    '',
+    `👤 当前账号：<code>${escapeHtml(account.hint)}</code> · 位置 <code>${escapeHtml(profileTitle(profile))}</code>`,
+    '命令中的 <code>[profile]</code> 是可选账号位置；省略时操作当前账号。',
+    '',
+    '🤖 <b>主面板与账号</b>',
+    '• <code>/start</code>：打开主面板，查看当前账号、任务入口和账号切换。',
+    '• <code>/help</code>：显示本帮助。',
+    '• 面板「切换账号」：已有位置直接切换；空位置直接进入 Cookie 导入。',
+    '• 面板「时段分块」：按本机时区查看各位置的起止时间、空闲/任务分配，并可启动串行签到 + 阅读。',
+    '',
+    '💰 <b>余额与状态</b>',
+    '• <code>/sou</code>：读取当前账号最近保存的余额记录，不会立即访问 V2EX。',
+    '• <code>/sou 1</code>：读取账号位置 <code>1</code> 的余额记录。',
+    '• <code>/tasks</code>：查看当前签到、阅读或多账号串行任务，以及正在运行的 profile 和 PID。',
+    '',
+    '⚙️ <b>签到与阅读</b>',
+    '• <code>/checkin</code>：为当前账号手动签到。',
+    '• <code>/checkin 1</code>：为账号位置 <code>1</code> 手动签到。',
+    '• <code>/read</code>：为当前账号打开 5 / 10 / 50 / 250 篇选择面板。',
+    '• <code>/read 50</code>：当前账号直接阅读 50 篇。',
+    '• <code>/read 1 50</code>：账号位置 <code>1</code> 直接阅读 50 篇；数量仅支持 5、10、50、250。',
+    '• 同一时间只允许一个阅读任务；缺少 Cookie 或任务繁忙时会直接返回原因。',
+    '',
+    '🛑 <b>停止任务</b>',
+    '• <code>/stop</code>：停止当前签到/阅读子进程；串行运行时同时取消后续账号。',
+    '• <code>/stop 1</code>：只在当前任务属于账号位置 <code>1</code> 时停止，避免误停其他账号。',
+    '',
+    '🍪 <b>Cookie 管理</b>',
+    '• <code>/cookie</code>：为当前账号进入 Cookie 导入等待。',
+    '• <code>/cookie 1</code>：为账号位置 <code>1</code> 进入 Cookie 导入等待。',
+    '• <code>/cookie 1 A2=...</code>：直接为位置 <code>1</code> 导入 Cookie。也可以直接粘贴完整 Cookie，再选择保存位置。',
+    '• Bot 会先尝试删除含 Cookie 的 Telegram 原消息，并在线验证账号；验证成功后才原子替换，检测到换绑时会再次确认。',
+    '',
+    '🧰 <b>日志</b>',
+    '• <code>/debug</code>：查看当前日志级别并打开选择面板。',
+    '• <code>/debug OFF</code>、<code>ERROR</code>、<code>WARN</code>、<code>INFO</code>：直接设置日志级别。',
+    '',
+    '🔐 <b>首次绑定</b>',
+    '• <code>/bind 你的口令</code>：仅在 Bot 尚未绑定且已配置 <code>TG_SETUP_CODE</code> 时使用。已配置 <code>TG_CHAT_ID</code> 或已完成绑定后无需重复执行。',
+  ].join('\n');
 }
 
 async function handleHelp() {
-  const text = `ℹ️ <b>V2EX Max Helper 命令帮助说明</b>\n\n` +
-               `🤖 <b>主控制面板</b>: \n` +
-               `- <code>/start</code>: 打开主交互遥控面板\n` +
-               `- <code>/help</code>: 显示当前命令说明\n\n` +
-               `💰 <b>数据与状态</b>: \n` +
-               `- <code>/sou [profile]</code>: 查询今日与昨日的 V2EX 余额记录\n` +
-               `- <code>/tasks</code>: 实时查询后台签到 / 阅读的运行状态\n\n` +
-               `⚙️ <b>脚本控制</b>: \n` +
-               `- <code>/checkin [profile]</code>: 立刻开跑手动签到测试\n` +
-               `- <code>/read [数量]</code> 或 <code>/read profile [数量]</code>: 触发手动阅读测试（默认 5 篇）\n` +
-               `- 面板「时段分块」: 查看多账号窗口，并手动启动串行签到 + 阅读\n` +
-               `- <code>/stop [profile]</code>: 打断当前任务；串行运行时取消后续账号\n\n` +
-               `🔧 <b>日志与设置</b>: \n` +
-               `- <code>/debug [级别]</code>: 查看/修改日志级别（OFF / ERROR / WARN / INFO）\n` +
-               `- <code>/cookie [profile] [内容]</code>: 手动识别并导入新的 V2EX Cookie\n\n` +
-               `💡 <b>小提示</b>：你也可以直接粘贴完整 Cookie；验证通过后才会原子替换目标 profile。`;
-  return sendMsgWithKeyboard(text, getMainKeyboardMarkup());
+  return sendMsgWithKeyboard(buildHelpText(), getMainKeyboardMarkup());
 }
 
 async function handleCookieHelp(messageId = null, profile = null) {
-  if (!profile && PROFILE_SELECTION_REQUIRED) {
-    return showProfilePicker('k', '导入 Cookie', messageId);
-  }
-  return beginCookieImport(profile || getOnlyProfile(), messageId);
+  return beginCookieImport(profile || getActiveControlProfile(), messageId);
 }
 
 async function handleTasks() {
@@ -329,7 +460,7 @@ async function handleTasks() {
     return sendMsg('ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)');
   }
   const taskName = runningTaskName() || (profileSequenceRunning ? '多账号串行队列' : '外部阅读任务');
-  const profile = (runningTask && runningTask.profile) || (lock && lock.profile);
+  const profile = (runningTask && runningTask.profile) || (lock && lock.profile) || sequenceActiveProfile;
   const pid = (runningTask && runningTask.child && runningTask.child.pid) || (lock && lock.pid);
   return sendMsg(
     `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n` +
@@ -427,14 +558,21 @@ async function handleDebug(levelArg, messageId = null) {
   if (levelArg) {
     const targetLevel = levelArg.toUpperCase();
     if (!levels.includes(targetLevel)) {
-      const errorMsg = `❌ 无效的级别 <code>${levelArg}</code>。请选择以下之一：<code>OFF</code>, <code>ERROR</code>, <code>WARN</code>, <code>INFO</code>`;
+      const errorMsg = `❌ 无效的级别 <code>${escapeHtml(levelArg)}</code>。请选择以下之一：<code>OFF</code>, <code>ERROR</code>, <code>WARN</code>, <code>INFO</code>`;
       if (messageId) return editMsgText(messageId, errorMsg);
       return sendMsg(errorMsg);
     }
+    const previousLevel = currentLogLevel;
     currentLogLevel = targetLevel;
     try {
       config.writeFileAtomic(LOG_LEVEL_FILE, currentLogLevel, 'utf8');
-    } catch (_) {}
+    } catch (error) {
+      currentLogLevel = previousLevel;
+      console.error(`[BOT] 日志级别保存失败: ${error.message}`);
+      const errorMsg = '❌ 日志级别保存失败，原设置未改变。请检查数据目录权限。';
+      if (messageId) return editMsgText(messageId, errorMsg);
+      return sendMsg(errorMsg);
+    }
     if (messageId) {
       return renderDebugKeyboard(messageId);
     }
@@ -479,7 +617,7 @@ function parseReadLimit(value) {
   const text = String(value || '').trim();
   if (!/^\d+$/.test(text)) return null;
   const limit = Number(text);
-  return Number.isSafeInteger(limit) && limit > 0 ? limit : null;
+  return [5, 10, 50, 250].includes(limit) ? limit : null;
 }
 
 function getReadCountPickerMarkup(profile, messageId = null) {
@@ -501,23 +639,37 @@ function getReadCountPickerMarkup(profile, messageId = null) {
 }
 
 function showReadCountPicker(profile, messageId = null) {
-  const text = `📖 <b>手动阅读控制面板</b>\n\nProfile：<code>${escapeHtml(profileTitle(profile))}</code>\n请选择本次阅读的文章篇数：`;
+  const account = getProfileAccountState(profile);
+  const text = `📖 <b>手动阅读控制面板</b>\n\n账号：<code>${escapeHtml(account.hint)}</code>\n位置：<code>${escapeHtml(profileTitle(profile))}</code>\n请选择本次阅读的文章篇数：`;
   return sendOrEdit(messageId, text, getReadCountPickerMarkup(profile, messageId));
 }
 
 function hasActiveReaderLock() {
   if (!fs.existsSync(LOCK_FILE)) return false;
   const lock = profileLock.readLock(LOCK_FILE);
-  if (lock && isProcessAlive(lock.pid)) return true;
+  if (isReaderLockActive(lock)) return true;
   try { profileLock.clearStaleLock(LOCK_FILE); } catch (_) {}
   return fs.existsSync(LOCK_FILE);
 }
 
 function getActiveReaderLock() {
   const lock = profileLock.readLock(LOCK_FILE);
-  if (lock && isProcessAlive(lock.pid)) return lock;
+  if (isReaderLockActive(lock)) return lock;
   try { profileLock.clearStaleLock(LOCK_FILE); } catch (_) {}
   return null;
+}
+
+function getActiveCredentialLock(profile) {
+  const file = getProfileConfig(profile).credentialLockFile;
+  if (!fs.existsSync(file)) return null;
+  const lock = profileLock.readLock(file);
+  if (isReaderLockActive(lock)) return lock;
+  try {
+    profileLock.clearStaleLock(file);
+  } catch (_) {
+    return { profile, task: '无法安全确认的凭证任务' };
+  }
+  return fs.existsSync(file) ? { profile, task: '无法清理的凭证任务' } : null;
 }
 
 function getTaskStartError(profile, readerTask = false) {
@@ -525,6 +677,10 @@ function getTaskStartError(profile, readerTask = false) {
   if (profileSequenceRunning) return '多账号串行任务正在运行';
   if (runningTask) return `任务 ${runningTaskName()} 正在运行`;
   if (readerTask && hasActiveReaderLock()) return '已有阅读进程正在运行';
+  const credentialLock = getActiveCredentialLock(profile);
+  if (credentialLock) {
+    return `Profile ${profile} 正在执行 ${credentialLock.task || '其他凭证任务'}`;
+  }
   const profileCfg = getProfileConfig(profile);
   if (!hasUsableCookie(profileCfg.cookieFile)) {
     return `Profile ${profile} 缺少 Cookie，请先导入`;
@@ -534,6 +690,24 @@ function getTaskStartError(profile, readerTask = false) {
 
 function reportManualTaskResult(profile, taskLabel, result) {
   if (!result) return;
+  if (result.status === 'ok') {
+    if (taskLabel === '签到') {
+      sendMsgWithKeyboard(
+        `✅ <code>${escapeHtml(profile)}</code> 手动签到已完成`,
+        getMainKeyboardMarkup()
+      ).catch(() => {});
+    }
+    return;
+  }
+  const stoppedByRequest = result.status !== 'timed_out' &&
+    (['SIGINT', 'SIGTERM'].includes(result.signal) || [130, 143].includes(result.code));
+  if (stoppedByRequest) {
+    sendMsgWithKeyboard(
+      `ℹ️ <code>${escapeHtml(profile)}</code> ${taskLabel}已停止`,
+      getMainKeyboardMarkup()
+    ).catch(() => {});
+    return;
+  }
   let detail = '';
   if (result.skipped) {
     const reasons = {
@@ -597,53 +771,66 @@ async function handleRead(profile, limitArg = null, messageId = null) {
   if (limitArg !== null && limitArg !== undefined && String(limitArg).trim() !== '') {
     const limit = parseReadLimit(limitArg);
     if (!limit) {
-      return sendOrEdit(messageId, '❌ 阅读数量必须是大于 0 的整数', getMainKeyboardMarkup());
+      return sendOrEdit(messageId, '❌ 阅读数量仅支持 5、10、50、250', getMainKeyboardMarkup());
     }
     return startProfileRead(profile, limit, messageId);
   }
   return showReadCountPicker(profile, messageId);
 }
 
-// /stop [profile] — 停止当前子任务，并取消尚未运行的串行账号。
-async function handleStop(profile = null) {
-  if (profile && !CONTROL_PROFILES.includes(profile)) return sendUnknownProfile(profile);
-
+async function requestTaskStop(profile = null, expectedSnapshot = null) {
+  if (profile && !CONTROL_PROFILES.includes(profile)) {
+    return `❌ 未知 profile：<code>${escapeHtml(profile)}</code>`;
+  }
+  const currentSnapshot = getActiveTaskSnapshot();
+  if (expectedSnapshot !== null && expectedSnapshot !== currentSnapshot) {
+    return '⚠️ 按钮对应的任务已经变化，未停止任何进程。请重新打开任务状态后再操作。';
+  }
   if (runningTask && runningTask.child) {
     if (profile && runningTask.profile && runningTask.profile !== profile) {
-      return sendMsg(`⚠️ 当前运行的是 <code>${escapeHtml(runningTask.profile)}</code>，未停止其他账号任务`);
+      return `⚠️ 当前运行的是 <code>${escapeHtml(runningTask.profile)}</code>，未停止其他账号任务`;
     }
+    const task = runningTask;
+    const wasSequence = profileSequenceRunning;
     if (profileSequenceRunning) sequenceCancelRequested = true;
-    try {
-      runningTask.child.kill('SIGTERM');
-      return sendMsg(
-        `🛑 已停止 <code>${escapeHtml(runningTaskName())}</code>` +
-        `${profileSequenceRunning ? '，并取消后续串行账号' : ''}`
-      );
-    } catch (e) {
-      return sendMsg(`停止失败: ${escapeHtml(e.message)}`);
-    }
+    const stopped = await stopManagedTask(task);
+    return stopped
+      ? `🛑 已确认停止 <code>${escapeHtml(task.name)}</code>${wasSequence ? '，并取消后续串行账号' : ''}`
+      : `❌ 已发送强制停止信号，但未能在限时内确认 <code>${escapeHtml(task.name)}</code> 已退出；请立即检查任务状态。`;
   }
 
   const lock = getActiveReaderLock();
   if (profile && lock && lock.profile && lock.profile !== profile) {
-    return sendMsg(`⚠️ 当前阅读账号是 <code>${escapeHtml(lock.profile)}</code>，未停止 <code>${escapeHtml(profile)}</code>`);
+    return `⚠️ 当前阅读账号是 <code>${escapeHtml(lock.profile)}</code>，未停止 <code>${escapeHtml(profile)}</code>`;
+  }
+  if (profile && profileSequenceRunning && sequenceActiveProfile && sequenceActiveProfile !== profile) {
+    return `⚠️ 串行队列当前等待或执行 <code>${escapeHtml(sequenceActiveProfile)}</code>，未取消 <code>${escapeHtml(profile)}</code>`;
   }
   if (profileSequenceRunning) sequenceCancelRequested = true;
   if (!lock) {
-    return sendMsg(profileSequenceRunning
+    return profileSequenceRunning
       ? '🛑 已取消多账号串行队列，当前没有活动子进程'
-      : 'ℹ️ 阅读脚本未在运行');
+      : 'ℹ️ 阅读脚本未在运行';
   }
   try {
+    if (!profileLock.isLockOwnerAlive(lock)) {
+      return '⚠️ 锁文件中的进程身份无法安全确认，未发送停止信号；请检查任务状态或重启服务清理残留锁。';
+    }
     process.kill(lock.pid, 'SIGTERM');
-    await sendMsg(`🛑 已停止阅读任务${lock.profile ? `（<code>${escapeHtml(lock.profile)}</code>）` : ''}`);
+    return `⏳ 已向阅读任务发送停止请求${lock.profile ? `（<code>${escapeHtml(lock.profile)}</code>）` : ''}，请稍后查看任务状态。`;
   } catch (e) {
     if (e.code === 'ESRCH') {
       try { profileLock.clearStaleLock(LOCK_FILE); } catch (_) {}
-      return sendMsg('ℹ️ 进程已不存在，锁文件已清理');
+      return 'ℹ️ 进程已不存在，锁文件已清理';
     }
-    return sendMsg(`停止失败: ${e.message}`);
+    return `停止失败: ${escapeHtml(e.message)}`;
   }
+}
+
+// /stop [profile] — 停止当前子任务，并取消尚未运行的串行账号。
+async function handleStop(profile = null) {
+  if (profile && !CONTROL_PROFILES.includes(profile)) return sendUnknownProfile(profile);
+  return sendMsg(await requestTaskStop(profile));
 }
 
 function escapeHtml(str) {
@@ -675,8 +862,23 @@ async function deleteCookieSourceMessage(message) {
 
   console.warn('[BOT] Cookie 来源消息自动删除失败，未记录消息内容');
   try {
-    await sendMsg('⚠️ 已识别 Cookie，但未能自动删除原消息，请立即在 Telegram 中手动删除。');
+    await sendDirectMsg(chatId, '⚠️ 已识别 Cookie，但未能自动删除原消息，请立即在 Telegram 中手动删除。');
   } catch (_) {}
+}
+
+async function deleteBindingSourceMessage(message) {
+  const chatId = message && message.chat && message.chat.id;
+  const messageId = message && message.message_id;
+  if (!chatId || !Number.isInteger(messageId)) return false;
+  try {
+    const result = await tgRequest('deleteMessage', { chat_id: chatId, message_id: messageId });
+    if (result && result.ok) return true;
+  } catch (_) {}
+  console.warn('[BOT] 绑定口令消息自动删除失败，未记录消息内容');
+  try {
+    await sendDirectMsg(chatId, '⚠️ 未能自动删除包含绑定口令的原消息，请立即在 Telegram 中手动删除。');
+  } catch (_) {}
+  return false;
 }
 
 function setPendingCookieImport(state) {
@@ -712,21 +914,27 @@ async function beginCookieImport(profile, messageId = null) {
   if (!CONTROL_PROFILES.includes(profile)) {
     return sendOrEdit(messageId, '❌ 未知或已失效的 profile', getMainKeyboardMarkup());
   }
+  clearPendingCookieImport();
   const pending = setPendingCookieImport({ profile, candidate: null, state: 'awaiting_cookie' });
   activeCookieInputId = pending.id;
-  const text = `🍪 <b>导入 Cookie</b>\n\nProfile：<code>${escapeHtml(profileTitle(profile))}</code>\n请在 5 分钟内粘贴完整 V2EX Cookie。候选凭证会先验证，成功后才原子替换，不会与旧账号字段混合。\n\n也可以使用：<code>/cookie ${escapeHtml(profile)} 你的Cookie内容</code>`;
+  const text = `🍪 <b>导入 Cookie</b>\n\n账号位置：<code>${escapeHtml(profileTitle(profile))}</code>\n请在 5 分钟内粘贴完整 V2EX Cookie。候选凭证会先验证，成功后才原子替换，不会与旧账号字段混合。\n\n也可以使用：<code>/cookie ${escapeHtml(profile)} 你的Cookie内容</code>`;
   return sendOrEdit(messageId, text, {
-    inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]],
+    inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: `ci:${pending.id}:cancel` }]],
   });
 }
 
 function readOptionalFile(file) {
-  try { return fs.existsSync(file) ? fs.readFileSync(file) : null; } catch (_) { return null; }
+  try {
+    return fs.readFileSync(file);
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
 }
 
 function restoreOptionalFile(file, content) {
   if (content === null) {
-    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (_) {}
+    if (fs.existsSync(file)) fs.unlinkSync(file);
   } else {
     config.writeFileAtomic(file, content, { mode: 0o600 });
   }
@@ -745,12 +953,44 @@ function stageChromeProfileReset(profileCfg) {
   return { target, backup };
 }
 
+function cleanupStaleChromeBackups(profileCfg) {
+  const target = path.resolve(profileCfg.chromeProfileDir);
+  const root = path.resolve(path.join(profileCfg.readerDataDir, 'chrome-profile'));
+  const relative = path.relative(root, target);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || !fs.existsSync(root)) return 0;
+  const prefix = `${path.basename(target)}.rebind.`;
+  const backups = [];
+  for (const name of fs.readdirSync(root)) {
+    if (!name.startsWith(prefix)) continue;
+    const candidate = path.resolve(root, name);
+    const candidateRelative = path.relative(root, candidate);
+    if (!candidateRelative || candidateRelative.startsWith('..') || path.isAbsolute(candidateRelative)) continue;
+    const stat = fs.lstatSync(candidate);
+    backups.push({ candidate, mtimeMs: stat.mtimeMs });
+  }
+
+  if (!fs.existsSync(target) && backups.length > 0) {
+    backups.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const recovered = backups.shift();
+    fs.renameSync(recovered.candidate, target);
+    console.warn('[BOT] 检测到上次换绑中断，已恢复 Chromium 状态备份');
+  }
+
+  let removed = 0;
+  for (const { candidate } of backups) {
+    fs.rmSync(candidate, { recursive: true, force: true });
+    removed++;
+  }
+  return removed;
+}
+
 function commitProfileCredentials(profileCfg, candidate, verification, replaceIdentity) {
   const oldCookie = readOptionalFile(profileCfg.cookieFile);
   const oldIdentity = readOptionalFile(profileCfg.identityFile);
   let chromeBackup = null;
   try {
     if (replaceIdentity || verification.identityState === 'unbound') {
+      cleanupStaleChromeBackups(profileCfg);
       chromeBackup = stageChromeProfileReset(profileCfg);
     }
     config.writeFileAtomic(profileCfg.cookieFile, candidate, { mode: 0o600 });
@@ -759,21 +999,30 @@ function commitProfileCredentials(profileCfg, candidate, verification, replaceId
       replaceIdentity ? null : verification.current
     );
     profileAuth.writeIdentity(profileCfg.identityFile, record);
-    if (chromeBackup) fs.rmSync(chromeBackup.backup, { recursive: true, force: false });
+    if (chromeBackup) {
+      try {
+        fs.rmSync(chromeBackup.backup, { recursive: true, force: false });
+      } catch (_) {
+        console.warn('[BOT] 旧 Chromium 换绑备份清理失败，将在下次启动时重试');
+      }
+    }
   } catch (e) {
-    try { restoreOptionalFile(profileCfg.cookieFile, oldCookie); } catch (_) {}
-    try { restoreOptionalFile(profileCfg.identityFile, oldIdentity); } catch (_) {}
+    const rollbackFailures = [];
+    try { restoreOptionalFile(profileCfg.cookieFile, oldCookie); } catch (_) { rollbackFailures.push('Cookie'); }
+    try { restoreOptionalFile(profileCfg.identityFile, oldIdentity); } catch (_) { rollbackFailures.push('身份记录'); }
     if (chromeBackup && fs.existsSync(chromeBackup.backup) && !fs.existsSync(chromeBackup.target)) {
-      try { fs.renameSync(chromeBackup.backup, chromeBackup.target); } catch (_) {}
+      try { fs.renameSync(chromeBackup.backup, chromeBackup.target); } catch (_) { rollbackFailures.push('Chromium 状态'); }
+    }
+    if (rollbackFailures.length > 0) {
+      console.error(`[BOT] 凭据更新回滚不完整: ${rollbackFailures.join(', ')}`);
+      throw new Error('凭据更新失败且回滚不完整；请停止该账号任务并检查运行时数据目录');
     }
     throw e;
   }
 }
 
 function maskAccount(identity) {
-  const value = String(identity || '');
-  if (value.length <= 2) return '**';
-  return `${value.slice(0, 1)}***${value.slice(-1)}`;
+  return profileAuth.maskIdentity(identity);
 }
 
 async function importCookieResult(candidateMap, profile, pendingId = null, forceReplace = false) {
@@ -796,25 +1045,51 @@ async function importCookieResult(candidateMap, profile, pendingId = null, force
 
   try {
     const fp = fingerprint.generate(profile);
-    const verification = await profileAuth.verifyAndCompare(profileCfg, candidate, {
+    const verifyOptions = {
       userAgent: fp.userAgent,
       acceptLanguage: fp.acceptLanguage,
-    });
+    };
+    let verification = await profileAuth.verifyAndCompare(profileCfg, candidate, verifyOptions);
     if (!verification.ok) {
       if (pendingId) clearPendingCookieImport(pendingId);
       await sendMsg(`❌ Profile <code>${escapeHtml(profile)}</code> Cookie 未写入：${escapeHtml(verification.message)}`);
       return true;
     }
 
-    if (verification.identityState === 'different' && !forceReplace) {
+    if (verification.identityState === 'unbound' && hasUsableCookie(profileCfg.cookieFile)) {
+      const existingCookie = readOptionalFile(profileCfg.cookieFile);
+      if (existingCookie && existingCookie.toString('utf8').trim() === candidate) {
+        verification = { ...verification, identityState: 'same' };
+      } else {
+        let existingVerification = null;
+        try {
+          existingVerification = existingCookie
+            ? await profileAuth.verifyCookie(existingCookie.toString('utf8').trim(), verifyOptions)
+            : null;
+        } catch (_) {}
+        verification = {
+          ...verification,
+          identityState: existingVerification && existingVerification.ok
+            ? (existingVerification.identity === verification.identity ? 'same' : 'different')
+            : 'unknown_existing',
+        };
+      }
+    }
+
+    const requiresReplacement = verification.identityState === 'different' ||
+      verification.identityState === 'unknown_existing';
+    if (requiresReplacement && !forceReplace) {
       const pending = pendingId ? getPendingCookieImport(pendingId) : null;
       const state = pending || setPendingCookieImport({ profile, candidate: candidateMap, state: 'replace_confirmation' });
       state.profile = profile;
       state.candidate = candidateMap;
       state.state = 'replace_confirmation';
       pendingCookieImports.set(state.id, state);
+      const reason = verification.identityState === 'unknown_existing'
+        ? '当前位置已有 Cookie，但旧账号身份记录缺失或无法验证。'
+        : '检测到新 Cookie 属于另一个账号。';
       await sendMsgWithKeyboard(
-        `⚠️ <b>检测到账号换绑</b>\n\nProfile：<code>${escapeHtml(profile)}</code>\n新账号：<code>${escapeHtml(maskAccount(verification.identity))}</code>\n\n确认后会替换整套 Cookie，并清空该 profile 的旧 Chromium 登录状态。`,
+        `⚠️ <b>需要确认账号换绑</b>\n\n${reason}\n账号位置：<code>${escapeHtml(profile)}</code>\n新账号：<code>${escapeHtml(maskAccount(verification.identity))}</code>\n\n确认后会替换整套 Cookie，并清空该 profile 的旧 Chromium 登录状态。`,
         { inline_keyboard: [[
           { text: '确认换绑', callback_data: `ci:${state.id}:replace` },
           { text: '取消', callback_data: `ci:${state.id}:cancel` },
@@ -823,14 +1098,16 @@ async function importCookieResult(candidateMap, profile, pendingId = null, force
       return true;
     }
 
-    commitProfileCredentials(profileCfg, candidate, verification, verification.identityState === 'different');
+    commitProfileCredentials(profileCfg, candidate, verification, requiresReplacement);
+    setActiveControlProfile(profile);
     if (pendingId) clearPendingCookieImport(pendingId);
     const fields = Array.from(candidateMap.keys()).filter(key => V2EX_COOKIE_KEYS.includes(key));
-    await sendMsg(
+    await sendMsgWithKeyboard(
       `✅ <b>Cookie 已验证并原子更新</b>\n\n` +
-      `Profile：<code>${escapeHtml(profile)}</code>\n` +
+      `账号位置：<code>${escapeHtml(profile)}</code>\n` +
       `账号：<code>${escapeHtml(maskAccount(verification.identity))}</code>\n` +
-      `字段：<code>${escapeHtml(fields.join(', ') || 'A2')}</code>`
+      `字段：<code>${escapeHtml(fields.join(', ') || 'A2')}</code>`,
+      getMainKeyboardMarkup()
     );
     return true;
   } catch (e) {
@@ -852,9 +1129,9 @@ async function applyPendingCookie(profile, messageId, pendingId) {
 }
 
 async function handleCookieImport(text, profile = null, sourceMessage = null) {
+  if (sourceMessage && looksLikeCookieText(text)) await deleteCookieSourceMessage(sourceMessage);
   const candidate = extractCookie(text);
   if (!candidate) return false;
-  if (sourceMessage) await deleteCookieSourceMessage(sourceMessage);
 
   if (profile) return importCookieResult(candidate, profile);
 
@@ -867,6 +1144,7 @@ async function handleCookieImport(text, profile = null, sourceMessage = null) {
   }
 
   if (PROFILE_SELECTION_REQUIRED) {
+    clearPendingCookieImport();
     const staged = setPendingCookieImport({ profile: null, candidate, state: 'choose_profile' });
     await showProfilePicker('kp', 'Cookie 已识别，请选择保存账号', null, staged.id);
     return true;
@@ -875,20 +1153,49 @@ async function handleCookieImport(text, profile = null, sourceMessage = null) {
   return importCookieResult(candidate, getOnlyProfile());
 }
 
+function looksLikeCookieText(text) {
+  return /(?:^|[;\s])(?:A2|A2O|PB3_SESSION|V2EX_LANG|V2EX_TAB)\s*=/i.test(String(text || ''));
+}
+
+async function scrubSkippedSensitiveUpdates(updates) {
+  for (const update of Array.isArray(updates) ? updates : []) {
+    const message = update && update.message;
+    if (!message || !message.chat || message.chat.type !== 'private' || !message.text) continue;
+    if (looksLikeCookieText(message.text)) {
+      await deleteCookieSourceMessage(message);
+    } else if (/^\/bind(?:@[A-Za-z0-9_]+)?\s+\S+/i.test(message.text.trim())) {
+      await deleteBindingSourceMessage(message);
+    }
+  }
+}
+
 // ========== 内置调度器（替代 Docker cron，Render 友好）==========
 
 let runningTask = null; // { name, profile, type, child, startedAt }
 let profileSequenceRunning = false;
 let sequenceCancelRequested = false;
+let sequenceActiveProfile = null;
+let sequenceRunId = null;
 
 function runningTaskName() {
   return runningTask ? runningTask.name : '';
 }
 
-const PROFILE_TIME_SLOT_HOURS = profileSchedule.validateSlotHours(
-  parseFloat(process.env.PROFILE_TIME_SLOT_HOURS || '4'),
-  PROFILE_LIST.length
-);
+function getActiveTaskSnapshot() {
+  if (runningTask && runningTask.id) return `task:${runningTask.id}`;
+  if (profileSequenceRunning && sequenceRunId) return `sequence:${sequenceRunId}`;
+  const lock = getActiveReaderLock();
+  if (lock) {
+    return `lock:${lock.pid}:${lock.processStartToken || 'legacy'}:${lock.token || 'legacy'}`;
+  }
+  return 'idle';
+}
+
+const rawProfileSlotHours = String(process.env.PROFILE_TIME_SLOT_HOURS || '4').trim();
+if (!/^\d+(?:\.\d+)?$/.test(rawProfileSlotHours)) {
+  throw new Error('PROFILE_TIME_SLOT_HOURS 必须是大于等于 1 的有限数字');
+}
+const PROFILE_TIME_SLOT_HOURS = profileSchedule.validateSlotHours(Number(rawProfileSlotHours), PROFILE_LIST.length);
 const PROFILE_TIME_SLOT_MS = Math.round(PROFILE_TIME_SLOT_HOURS * 60 * 60 * 1000);
 const PROFILE_SEQUENCE_START_LOCAL_MINUTES = 9 * 60 + 10;
 
@@ -909,7 +1216,7 @@ function childEnvForProfile(profile, extra = {}) {
 function appendTaskLog(name, lineLevel, line) {
   if (!shouldWriteLog(lineLevel)) return;
   try {
-    fs.appendFileSync(READER_LOG, `[${new Date().toISOString()}] [${name}] [${lineLevel}] ${line}\n`);
+    fs.appendFileSync(READER_LOG, `[${new Date().toISOString()}] [${name}] [${lineLevel}] ${line}\n`, { encoding: 'utf8', mode: 0o600 });
   } catch (_) {}
 }
 
@@ -966,6 +1273,7 @@ function runScriptAsync(name, command, args, cwd, options = {}) {
 
   console.log(`[调度器] 启动 ${name}`);
   const task = {
+    id: crypto.randomBytes(12).toString('hex'),
     name,
     profile: options.profile || null,
     type: options.type || 'task',
@@ -980,6 +1288,7 @@ function runScriptAsync(name, command, args, cwd, options = {}) {
       cwd,
       env: options.env || { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
     task.child = child;
   } catch (e) {
@@ -989,7 +1298,7 @@ function runScriptAsync(name, command, args, cwd, options = {}) {
 
   pipeTaskOutput(child, name);
 
-  return new Promise((resolve) => {
+  const completion = new Promise((resolve) => {
     let settled = false;
     let timeout = null;
     let forceKillTimeout = null;
@@ -1007,10 +1316,10 @@ function runScriptAsync(name, command, args, cwd, options = {}) {
       timeout = setTimeout(() => {
         timedOut = true;
         console.warn(`[调度器] ${name} 超过 ${Math.round(options.timeoutMs / 60000)} 分钟，发送 SIGTERM`);
-        try { child.kill('SIGTERM'); } catch (_) {}
+        signalManagedTask(task, 'SIGTERM');
         forceKillTimeout = setTimeout(() => {
           console.warn(`[调度器] ${name} 在 SIGTERM 后 30 秒仍未退出，强制结束`);
-          try { child.kill('SIGKILL'); } catch (_) {}
+          signalManagedTask(task, 'SIGKILL');
         }, 30000);
       }, options.timeoutMs);
     }
@@ -1029,6 +1338,44 @@ function runScriptAsync(name, command, args, cwd, options = {}) {
       finish({ error: err, status: 'spawn_failed' });
     });
   });
+  task.completion = completion;
+  return completion;
+}
+
+function signalManagedTask(task, signal) {
+  if (!task || !task.child || !task.child.pid) return false;
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-task.child.pid, signal);
+      return true;
+    } catch (e) {
+      if (e.code === 'ESRCH') return true;
+    }
+  }
+  try {
+    return task.child.kill(signal);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function waitForManagedTask(task, timeoutMs) {
+  if (!task || !task.completion) return true;
+  const timeout = Symbol('timeout');
+  const result = await Promise.race([
+    task.completion,
+    new Promise(resolve => setTimeout(resolve, timeoutMs, timeout)),
+  ]);
+  return result !== timeout;
+}
+
+async function stopManagedTask(task) {
+  if (!task || !task.child) return true;
+  signalManagedTask(task, 'SIGTERM');
+  if (await waitForManagedTask(task, 30000)) return true;
+  console.warn(`[调度器] ${task.name} 在 SIGTERM 后 30 秒仍未退出，强制结束进程组`);
+  signalManagedTask(task, 'SIGKILL');
+  return waitForManagedTask(task, 5000);
 }
 
 function runScript(name, command, args, cwd, options = {}) {
@@ -1049,7 +1396,14 @@ function waitUntil(targetMs) {
 }
 
 function readScheduleState() {
-  try { return JSON.parse(fs.readFileSync(cfg.scheduleStateFile, 'utf8')); } catch (_) { return null; }
+  if (!fs.existsSync(cfg.scheduleStateFile)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cfg.scheduleStateFile, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid state');
+    return parsed;
+  } catch (_) {
+    return { invalid: true };
+  }
 }
 
 function writeScheduleState(state) {
@@ -1076,11 +1430,13 @@ async function runProfileDailySequence(options = {}) {
 
   profileSequenceRunning = true;
   sequenceCancelRequested = false;
+  sequenceRunId = crypto.randomBytes(12).toString('hex');
   const results = [];
   const sequenceStartMs = Number.isFinite(options.startTimeMs) ? options.startTimeMs : Date.now();
   const cycleId = options.cycleId || null;
-  let scheduleState = cycleId && readScheduleState();
-  if (!scheduleState || scheduleState.cycleId !== cycleId) {
+  const previousScheduleState = cycleId && readScheduleState();
+  let scheduleState = previousScheduleState;
+  if (!scheduleState || (!scheduleState.invalid && scheduleState.cycleId !== cycleId)) {
     scheduleState = {
       version: 1,
       cycleId,
@@ -1089,9 +1445,14 @@ async function runProfileDailySequence(options = {}) {
       profiles: {},
       cancelled: false,
       completed: false,
+      multiPingSlot: previousScheduleState && previousScheduleState.multiPingSlot || null,
     };
   }
   try {
+    if (scheduleState.invalid) {
+      console.error('[调度器] 调度状态文件无法读取或格式损坏，已拒绝自动重跑；请检查后手动删除该文件重建。');
+      return { skipped: true, reason: 'invalid_schedule_state', results: [] };
+    }
     if (cycleId && scheduleState.profileOrder && scheduleState.profileOrder.join(',') !== PROFILE_LIST.join(',')) {
       scheduleState.cancelled = true;
       scheduleState.completed = true;
@@ -1108,6 +1469,7 @@ async function runProfileDailySequence(options = {}) {
 
     for (let index = 0; index < PROFILE_LIST.length; index++) {
       const profile = PROFILE_LIST[index];
+      sequenceActiveProfile = profile;
       if (sequenceCancelRequested) break;
       if (cycleId && scheduleState.profiles[profile] && scheduleState.profiles[profile].completed) continue;
 
@@ -1191,20 +1553,24 @@ async function runProfileDailySequence(options = {}) {
   } finally {
     profileSequenceRunning = false;
     sequenceCancelRequested = false;
+    sequenceActiveProfile = null;
+    sequenceRunId = null;
   }
 }
 
 async function runProfilePingSequence() {
-  if (profileSequenceRunning || runningTask) {
-    console.log('[调度器] 跳过多账号保活，已有任务运行');
+  if (profileSequenceRunning || runningTask || hasActiveReaderLock()) {
+    console.log('[调度器] 跳过多账号保活，已有任务或外部阅读进程运行');
     return { skipped: true, reason: 'busy' };
   }
 
   profileSequenceRunning = true;
   sequenceCancelRequested = false;
+  sequenceRunId = crypto.randomBytes(12).toString('hex');
   const results = [];
   try {
     for (const profile of PROFILE_LIST) {
+      sequenceActiveProfile = profile;
       if (sequenceCancelRequested) break;
       const cookieFile = getProfileCookieFile(profile);
       const result = await runScriptAsync(`保活(${profile})`, process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname, {
@@ -1221,6 +1587,8 @@ async function runProfilePingSequence() {
   } finally {
     profileSequenceRunning = false;
     sequenceCancelRequested = false;
+    sequenceActiveProfile = null;
+    sequenceRunId = null;
   }
 }
 
@@ -1259,14 +1627,17 @@ function formatLocalClock(totalLocalMinutes) {
 
 function buildProfileSlotMessage() {
   const busyText = profileSequenceRunning
-    ? '🟡 多账号串行中'
+    ? `🟡 多账号串行中${sequenceActiveProfile ? `（${escapeHtml(sequenceActiveProfile)}）` : ''}`
     : runningTask
       ? `🟡 ${escapeHtml(runningTaskName())} 运行中`
       : '🟢 空闲';
 
   if (!MULTI_PROFILE_MODE) {
+    const profile = getActiveControlProfile();
+    const account = getProfileAccountState(profile);
     return `🧩 <b>多账号时段分块</b>\n\n` +
       `当前未启用多账号串行。\n\n` +
+      `当前位置：<code>${escapeHtml(profileTitle(profile))}</code> · ${account.occupied ? `<code>${escapeHtml(account.hint)}</code>` : '<b>空</b>'}\n` +
       `配置 <code>V2EX_PROFILE_LIST=acc1,acc2</code> 后，每个 profile 会按顺序执行：签到 → 阅读 → 下一个 profile。\n` +
       `最多支持 <b>${MAX_PROFILE_COUNT}</b> 个账户；每个账户默认窗口 <code>${formatHours(PROFILE_TIME_SLOT_HOURS)}</code> 小时，可用 <code>PROFILE_TIME_SLOT_HOURS</code> 调整。\n\n` +
       `状态：${busyText}`;
@@ -1275,15 +1646,19 @@ function buildProfileSlotMessage() {
   const slotMinutes = Math.max(60, Math.round(PROFILE_TIME_SLOT_HOURS * 60));
   const totalHours = formatHours((slotMinutes * PROFILE_LIST.length) / 60);
   const timeZoneLabel = getLocalTimeZoneInfo();
+  const occupiedCount = PROFILE_LIST.filter(profile => getProfileAccountState(profile).occupied).length;
   const lines = PROFILE_LIST.map((profile, index) => {
     const start = PROFILE_SEQUENCE_START_LOCAL_MINUTES + index * slotMinutes;
     const end = start + slotMinutes;
-    const cookieStatus = hasUsableCookie(getProfileCookieFile(profile)) ? '✅ Cookie' : '⚠️ 缺 Cookie';
-    return `${index + 1}. <code>${escapeHtml(profile)}</code> | 本机时间 ${formatLocalClock(start)}-${formatLocalClock(end)} | ${cookieStatus}`;
+    const account = getProfileAccountState(profile);
+    const assignment = account.occupied
+      ? `位置 <code>${escapeHtml(profileTitle(profile))}</code> · <code>${escapeHtml(account.hint)}</code> 有任务`
+      : `空（位置 <code>${escapeHtml(profileTitle(profile))}</code>）`;
+    return `${formatLocalClock(start)}-${formatLocalClock(end)} | ${assignment}`;
   });
 
   return `🧩 <b>多账号时段分块</b>\n\n` +
-    `账户：<b>${PROFILE_LIST.length}/${MAX_PROFILE_COUNT}</b>\n` +
+    `账号位置：<b>${occupiedCount}/${PROFILE_LIST.length}</b> 已使用（最多 ${MAX_PROFILE_COUNT}）\n` +
     `单账号窗口：<code>${formatHours(PROFILE_TIME_SLOT_HOURS)}</code> 小时\n` +
     `总串行窗口：约 <code>${totalHours}</code> 小时\n` +
     `本机时区：<code>${escapeHtml(timeZoneLabel)}</code>\n` +
@@ -1295,7 +1670,7 @@ function buildProfileSlotMessage() {
 function getProfileSlotKeyboard() {
   const keyboard = [];
   if (MULTI_PROFILE_MODE) {
-    keyboard.push([{ text: '▶️ 串行签到+阅读', callback_data: 'run_profile_sequence' }]);
+    keyboard.push([{ text: '▶️ 立即串行签到+阅读', callback_data: 'run_profile_sequence' }]);
   }
   keyboard.push([{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]);
   return { inline_keyboard: keyboard };
@@ -1320,7 +1695,7 @@ async function startProfileSequenceFromPanel(messageId) {
   }
 
   const text = `⏳ 已启动多账号串行任务。\n\n` +
-    `本次将按时段依次执行 ${PROFILE_LIST.length} 个 profile：签到 → 阅读 → 下一个 profile。\n` +
+    `手动任务从本机当前时间起，依次执行 ${PROFILE_LIST.length} 个 profile：签到 → 阅读 → 下一个 profile。\n` +
     `单账号窗口约 ${formatHours(PROFILE_TIME_SLOT_HOURS)} 小时。`;
   await editMsgText(messageId, text, {
     inline_keyboard: [
@@ -1349,10 +1724,53 @@ function getProfileCycle(now = new Date()) {
 }
 
 function startScheduler() {
-  let lastCheckinDate = '';
-  let lastReadDate = '';
-  let lastPingSlot = '';
+  const saved = readScheduleState();
+  if (saved && saved.invalid) {
+    console.error('[调度器] 调度状态文件无法读取或格式损坏，自动调度已停用；Telegram 手动任务仍可使用。');
+    sendMsg('❌ 调度状态文件损坏，自动任务已停用；请检查服务器日志并修复或删除状态文件后重启 Bot。').catch(() => {});
+    return;
+  }
+  const savedSingle = saved && saved.mode === 'single' && saved.profile === cfg.profile ? saved : {};
+  let lastCheckinDate = /^\d{4}-\d{2}-\d{2}$/.test(savedSingle.checkinDate || '') ? savedSingle.checkinDate : '';
+  let lastReadDate = /^\d{4}-\d{2}-\d{2}$/.test(savedSingle.readDate || '') ? savedSingle.readDate : '';
+  const savedPingSlot = MULTI_PROFILE_MODE ? (saved && saved.multiPingSlot) : savedSingle.pingSlot;
+  let lastPingSlot = /^\d{4}-\d{2}-\d{2}:\d{1,2}$/.test(savedPingSlot || '') ? savedPingSlot : '';
+  let nextCheckinAttempt = 0;
+  let nextReadAttempt = 0;
+  let nextPingAttempt = 0;
   let tickActive = false;
+  let invalidStateReported = false;
+  const RETRY_DELAY_MS = 5 * 60 * 1000;
+
+  const persistSingleState = () => {
+    if (MULTI_PROFILE_MODE) return;
+    try {
+      writeScheduleState({
+        version: 1,
+        mode: 'single',
+        profile: cfg.profile,
+        checkinDate: lastCheckinDate || null,
+        readDate: lastReadDate || null,
+        pingSlot: lastPingSlot || null,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.warn(`[调度器] 保存单账号调度状态失败: ${e.message}`);
+    }
+  };
+
+  const persistMultiPingSlot = () => {
+    if (!MULTI_PROFILE_MODE) return;
+    try {
+      const state = readScheduleState() || { version: 1 };
+      if (state.invalid) throw new Error('调度状态文件损坏');
+      state.multiPingSlot = lastPingSlot || null;
+      state.updatedAt = new Date().toISOString();
+      writeScheduleState(state);
+    } catch (e) {
+      console.warn(`[调度器] 保存多账号保活状态失败: ${e.message}`);
+    }
+  };
 
   const tick = async () => {
     if (tickActive) return;
@@ -1366,6 +1784,15 @@ function startScheduler() {
     if (MULTI_PROFILE_MODE) {
       const cycle = getProfileCycle(now);
       const state = readScheduleState();
+      if (state && state.invalid) {
+        if (!invalidStateReported) {
+          invalidStateReported = true;
+          console.error('[调度器] 调度状态文件在运行期间变得无效，自动任务已暂停');
+          sendMsg('❌ 调度状态文件在运行期间损坏，自动任务已暂停；请检查服务器日志。').catch(() => {});
+        }
+        return;
+      }
+      invalidStateReported = false;
       const cycleDone = state && state.cycleId === cycle.id && (state.completed || state.cancelled);
       if (now.getTime() >= cycle.startTimeMs && now.getTime() < cycle.endTimeMs &&
           !cycleDone && !profileSequenceRunning && !runningTask && !hasActiveReaderLock()) {
@@ -1376,40 +1803,72 @@ function startScheduler() {
       const pingSlot = `${dateKey}:${h}`;
       if ([0, 6, 12, 18].includes(h) && m < 10 && pingSlot !== lastPingSlot && !profileSequenceRunning && !runningTask) {
         const result = await runProfilePingSequence().catch(e => ({ error: e }));
-        if (!result.skipped && !result.error) lastPingSlot = pingSlot;
+        const completed = !result.skipped && !result.error && Array.isArray(result.results) &&
+          result.results.every(item => item.result && (
+            item.result.status === 'ok' || (item.result.skipped && item.result.reason === 'missing_cookie')
+          ));
+        if (completed) {
+          lastPingSlot = pingSlot;
+          persistMultiPingSlot();
+        }
       }
       return;
     }
 
-    // 每天本机时间 09:10 签到（当天只执行一次）
-    if (h === 9 && m === 10 && dateKey !== lastCheckinDate) {
-      lastCheckinDate = dateKey;
+    // 本机时间 09:10 后补跑当天签到；状态落盘，重启不会重复执行。
+    const localMinutes = h * 60 + m;
+    if (localMinutes >= PROFILE_SEQUENCE_START_LOCAL_MINUTES && dateKey !== lastCheckinDate && Date.now() >= nextCheckinAttempt) {
       const result = await runScript('签到', process.execPath, ['../checkin/v2ex-checkin.js'], __dirname, {
         profile: cfg.profile,
         type: 'checkin',
       });
-      if (result.skipped || result.error) lastCheckinDate = '';
+      if (result.status === 'ok') {
+        lastCheckinDate = dateKey;
+        nextCheckinAttempt = 0;
+        persistSingleState();
+      } else {
+        nextCheckinAttempt = Date.now() + RETRY_DELAY_MS;
+        console.warn(`[调度器] 当日签到未完成 (${summarizeTaskResult(result)})，5 分钟后重试`);
+      }
     }
 
-    // 每天本机时间 09:15 阅读（当天只执行一次）
-    if (h === 9 && m === 15 && dateKey !== lastReadDate) {
-      lastReadDate = dateKey;
-      // Render 环境下直接 node，VPS Docker 里可以用 xvfb-run
-      const result = await runScript('阅读', process.execPath, ['main.js'], __dirname, {
-        profile: cfg.profile,
-        type: 'reader',
-      });
-      if (result.skipped || result.error) lastReadDate = '';
+    // 本机时间 09:15 后补跑当天阅读；状态落盘，重启不会重复执行。
+    if (localMinutes >= PROFILE_SEQUENCE_START_LOCAL_MINUTES + 5 && dateKey !== lastReadDate && Date.now() >= nextReadAttempt) {
+      if (localMinutes >= 14 * 60) {
+        console.warn('[调度器] 已超过本机 14:00，记录当日阅读窗口错过，不启动零篇任务');
+        lastReadDate = dateKey;
+        persistSingleState();
+      } else {
+        const result = await runScript('阅读', process.execPath, ['main.js'], __dirname, {
+          profile: cfg.profile,
+          type: 'reader',
+        });
+        if (result.status === 'ok') {
+          lastReadDate = dateKey;
+          nextReadAttempt = 0;
+          persistSingleState();
+        } else {
+          nextReadAttempt = Date.now() + RETRY_DELAY_MS;
+          console.warn(`[调度器] 当日阅读未完成 (${summarizeTaskResult(result)})，5 分钟后重试`);
+        }
+      }
     }
 
     // 每 6 小时保活（V2EX session 保活，非 Render 保活）
     const pingSlot = `${dateKey}:${h}`;
-    if ([0, 6, 12, 18].includes(h) && m === 0 && pingSlot !== lastPingSlot) {
+    if ([0, 6, 12, 18].includes(h) && m < 10 && pingSlot !== lastPingSlot && Date.now() >= nextPingAttempt) {
       const result = await runScript('保活', process.execPath, ['../checkin/v2ex-checkin.js', '--ping'], __dirname, {
         profile: cfg.profile,
         type: 'ping',
       });
-      if (!result.skipped && !result.error) lastPingSlot = pingSlot;
+      if (result.status === 'ok') {
+        lastPingSlot = pingSlot;
+        nextPingAttempt = 0;
+        persistSingleState();
+      } else {
+        nextPingAttempt = Date.now() + RETRY_DELAY_MS;
+        console.warn(`[调度器] 本次保活未完成 (${summarizeTaskResult(result)})，5 分钟后重试`);
+      }
     }
     } finally {
       tickActive = false;
@@ -1433,19 +1892,26 @@ function startHttpWall() {
     console.log('[HTTP] HTTP 铁墙服务器已被 DISABLE_HTTP_WALL=1 禁用');
     return;
   }
-  const RENDER_PORT = process.env.PORT || 10000;
+  const rawPort = String(process.env.PORT || '8080').trim();
+  if (!/^\d+$/.test(rawPort) || Number(rawPort) < 1 || Number(rawPort) > 65535) {
+    throw new Error('PORT 必须是 1 到 65535 之间的整数');
+  }
+  const renderPort = Number(rawPort);
 
   const server = http.createServer((req, res) => {
+    req.on('error', () => {});
+    req.resume();
     // 安全头
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Connection', 'close');
     res.setHeader('Content-Security-Policy', "default-src 'none'");
 
     // 唯一允许的路径
-    if (req.method === 'GET' && req.url === '/') {
+    if ((req.method === 'GET' || req.method === 'HEAD') && (req.url === '/' || req.url === '/health')) {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('OK');
+      res.end(req.method === 'HEAD' ? undefined : 'OK');
       return;
     }
 
@@ -1457,9 +1923,15 @@ function startHttpWall() {
   server.maxHeadersCount = 20;
   server.headersTimeout = 5000;
   server.requestTimeout = 5000;
+  server.keepAliveTimeout = 5000;
+  server.maxConnections = 64;
+  server.maxRequestsPerSocket = 1;
+  server.on('clientError', (_error, socket) => {
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  });
 
-  server.listen(RENDER_PORT, () => {
-    console.log(`[HTTP] 铁墙服务器已启动 (端口 ${RENDER_PORT})`);
+  server.listen(renderPort, '0.0.0.0', () => {
+    console.log(`[HTTP] 铁墙服务器已启动 (端口 ${renderPort})`);
   });
 }
 
@@ -1472,15 +1944,30 @@ function startKeepAlive() {
     return;
   }
 
-  setInterval(() => {
-    https.get(extUrl, (res) => {
-      res.resume(); // 读完响应，不处理
-    }).on('error', () => {
-      // 保活 ping 失败不影响主流程
-    });
-  }, 10 * 60 * 1000); // 每 10 分钟
+  let target;
+  try {
+    target = new URL(extUrl);
+    if (target.protocol !== 'https:' || target.username || target.password) throw new Error('unsafe URL');
+  } catch (_) {
+    console.warn('[KEEP-ALIVE] RENDER_EXTERNAL_URL 无效或不是安全 HTTPS 地址，已禁用自保活');
+    return;
+  }
 
-  console.log(`[KEEP-ALIVE] 自保活已启用，每 10 分钟 ping ${extUrl}`);
+  setInterval(() => {
+    let req;
+    try {
+      req = https.get(target, (res) => {
+        res.resume();
+        res.on('error', () => {});
+      });
+      req.setTimeout(15000, () => req.destroy(new Error('keepalive timeout')));
+      req.on('error', () => {});
+    } catch (_) {
+      if (req) req.destroy();
+    }
+  }, 10 * 60 * 1000).unref();
+
+  console.log(`[KEEP-ALIVE] 自保活已启用，每 10 分钟 ping ${target.hostname}`);
 }
 
 // ========== 长轮询主循环（含重启容错）==========
@@ -1496,15 +1983,10 @@ async function shutdownBot(reason, exitCode) {
   botShuttingDown = true;
   sequenceCancelRequested = true;
   console.warn(`[BOT] 正在退出: ${reason}`);
-  const child = runningTask && runningTask.child;
-  if (child) {
-    try { child.kill('SIGTERM'); } catch (_) {}
-    await Promise.race([
-      new Promise(resolve => child.once('close', resolve)),
-      sleep(30000).then(() => {
-        try { child.kill('SIGKILL'); } catch (_) {}
-      }),
-    ]);
+  const task = runningTask;
+  if (task && task.child) {
+    const stopped = await stopManagedTask(task);
+    if (!stopped) console.error(`[BOT] 退出前未能确认子进程组已终止: ${task.name}`);
   } else {
     await sleep(100);
   }
@@ -1527,17 +2009,13 @@ function sendUnknownProfile(value) {
 
 async function handleReadCommand(args) {
   if (args.length === 0) {
-    return PROFILE_SELECTION_REQUIRED
-      ? showProfilePicker('r', '运行阅读')
-      : handleRead(getOnlyProfile());
+    return handleRead(getActiveControlProfile());
   }
 
   if (args.length === 1) {
     const limit = parseReadLimit(args[0]);
     if (limit) {
-      return PROFILE_SELECTION_REQUIRED
-        ? showProfilePicker('r', `运行阅读（限制 ${limit} 篇）`, null, limit)
-        : handleRead(getOnlyProfile(), limit);
+      return handleRead(getActiveControlProfile(), limit);
     }
     const profile = resolveControlProfile(args[0]);
     if (!profile) return sendUnknownProfile(args[0]);
@@ -1563,6 +2041,10 @@ async function handleMessage(msg) {
   if (cmd === '/start') {
     await handleStart();
   }
+  else if (cmd === '/bind') {
+    await deleteBindingSourceMessage(msg);
+    await sendMsg('ℹ️ Bot 已绑定当前授权用户，无需再次发送绑定口令。');
+  }
   else if (cmd === '/help') {
     await handleHelp();
   }
@@ -1571,10 +2053,8 @@ async function handleMessage(msg) {
       const profile = resolveControlProfile(arg);
       if (!profile) await sendUnknownProfile(arg);
       else await handleSou(profile);
-    } else if (PROFILE_SELECTION_REQUIRED) {
-      await showProfilePicker('b', '查询余额');
     } else {
-      await handleSou(getOnlyProfile());
+      await handleSou(getActiveControlProfile());
     }
   }
   else if (cmd === '/debug') {
@@ -1588,10 +2068,8 @@ async function handleMessage(msg) {
       const profile = resolveControlProfile(arg);
       if (!profile) await sendUnknownProfile(arg);
       else await startProfileCheckin(profile);
-    } else if (PROFILE_SELECTION_REQUIRED) {
-      await showProfilePicker('c', '运行签到');
     } else {
-      await startProfileCheckin(getOnlyProfile());
+      await startProfileCheckin(getActiveControlProfile());
     }
   }
   else if (cmd === '/read') {
@@ -1605,14 +2083,23 @@ async function handleMessage(msg) {
     if (!cookieText) {
       await handleCookieHelp();
     } else {
+      await deleteCookieSourceMessage(msg);
+      clearPendingCookieImport();
       const firstToken = cookieText.split(/\s+/, 1)[0];
       const profile = resolveControlProfile(firstToken);
-      const remaining = profile ? cookieText.slice(firstToken.length).trim() : cookieText;
+      const tail = cookieText.slice(firstToken.length).trim();
+      const startsWithCookieHeader = /^cookie:$/i.test(firstToken);
+      if (!profile && tail && !startsWithCookieHeader &&
+          !looksLikeCookieText(firstToken) && looksLikeCookieText(tail)) {
+        await sendUnknownProfile(firstToken);
+        return;
+      }
+      const remaining = profile ? tail : cookieText;
       if (profile && !remaining) {
         await beginCookieImport(profile);
         return;
       }
-      const handled = await handleCookieImport(remaining, profile, msg);
+      const handled = await handleCookieImport(remaining, profile, null);
       if (!handled) {
         await sendMsg('❌ 未能从中识别出有效的 V2EX Cookie（如 A2 字段）。请确认格式。');
       }
@@ -1639,7 +2126,11 @@ async function handleCallbackQuery(query) {
   const messageId = query.message ? query.message.message_id : null;
   
   console.log(`[BOT] 收到 Callback: ${data}`);
-  await tgRequest('answerCallbackQuery', { callback_query_id: query.id });
+  try {
+    await tgRequest('answerCallbackQuery', { callback_query_id: query.id });
+  } catch (_) {
+    console.warn('[BOT] Callback ACK 失败，继续处理本地操作');
+  }
   
   try {
     if (data.startsWith('ps:')) {
@@ -1651,6 +2142,18 @@ async function handleCallbackQuery(query) {
       const extraValue = callbackExtra || (session && session.extraValue) || null;
       if (!session || !profile || !CONTROL_PROFILES.includes(profile)) {
         await sendOrEdit(messageId, '⚠️ Profile 选择已失效，请重新打开面板', getMainKeyboardMarkup());
+      } else if (action === 's') {
+        const account = getProfileAccountState(profile);
+        if (extraValue === 'u' || !account.occupied) {
+          await beginCookieImport(profile, messageId);
+        } else {
+          setActiveControlProfile(profile);
+          await editMsgText(
+            messageId,
+            buildMainPanelText(`✅ 已切换到 <code>${escapeHtml(account.hint)}</code>`),
+            getMainKeyboardMarkup(messageId)
+          );
+        }
       } else if (action === 'c') {
         await startProfileCheckin(profile, messageId);
       } else if (action === 'r') {
@@ -1667,14 +2170,43 @@ async function handleCallbackQuery(query) {
         await sendOrEdit(messageId, '⚠️ 操作已失效，请重新打开面板', getMainKeyboardMarkup());
       }
     }
+    else if (data.startsWith('ma:')) {
+      const [, sessionId, action] = data.split(':');
+      const session = getInteractionSession(sessionId, messageId);
+      const profile = session && session.action === 'm' ? session.profiles[0] : null;
+      if (!session || !profile || !CONTROL_PROFILES.includes(profile)) {
+        await editMsgText(
+          messageId,
+          buildMainPanelText('⚠️ 面板已过期，已刷新为当前账号'),
+          getMainKeyboardMarkup(messageId)
+        );
+      } else if (action === 'c') {
+        await startProfileCheckin(profile, messageId);
+      } else if (action === 'r') {
+        await handleRead(profile, null, messageId);
+      } else if (action === 'b') {
+        await editMsgText(messageId, buildBalanceMessage(profile), {
+          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]],
+        });
+      } else if (action === 'x') {
+        const statusText = await requestTaskStop(profile, session.extraValue);
+        await editMsgText(messageId, statusText, {
+          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]],
+        });
+      } else {
+        await sendOrEdit(messageId, '⚠️ 主面板操作无效', getMainKeyboardMarkup(messageId));
+      }
+    }
     else if (data.startsWith('ci:')) {
       const [, pendingId, action] = data.split(':');
       const pending = getPendingCookieImport(pendingId);
-      if (!pending || pending.state !== 'replace_confirmation' || !pending.profile || !pending.candidate) {
+      if (!pending) {
         await sendOrEdit(messageId, '⚠️ Cookie 换绑确认已过期，请重新导入', getMainKeyboardMarkup());
       } else if (action === 'cancel') {
         clearPendingCookieImport(pendingId);
-        await sendOrEdit(messageId, 'ℹ️ 已取消账号换绑，原 Cookie 和 Chromium 状态未修改', getMainKeyboardMarkup());
+        await sendOrEdit(messageId, 'ℹ️ 已取消 Cookie 导入，原账号数据未修改', getMainKeyboardMarkup());
+      } else if (pending.state !== 'replace_confirmation' || !pending.profile || !pending.candidate) {
+        await sendOrEdit(messageId, '⚠️ Cookie 换绑确认已过期，请重新导入', getMainKeyboardMarkup());
       } else if (action === 'replace') {
         await sendOrEdit(messageId, `⏳ 正在重新验证并换绑 <code>${escapeHtml(pending.profile)}</code>...`);
         await importCookieResult(pending.candidate, pending.profile, pendingId, true);
@@ -1685,28 +2217,12 @@ async function handleCallbackQuery(query) {
     else if (data.startsWith('p:') || data.startsWith('trigger_read_')) {
       await sendOrEdit(messageId, '⚠️ 旧版按钮未携带可靠的账号信息，请重新打开面板', getMainKeyboardMarkup());
     }
-    else if (data === 'run_checkin') {
-      if (PROFILE_SELECTION_REQUIRED) {
-        await showProfilePicker('c', '运行签到', messageId);
-      } else {
-        await startProfileCheckin(getOnlyProfile(), messageId);
-      }
-    }
-    else if (data === 'run_read_panel') {
-      if (PROFILE_SELECTION_REQUIRED) {
-        await showProfilePicker('r', '运行阅读', messageId);
-      } else {
-        await handleRead(getOnlyProfile(), null, messageId);
-      }
-    }
-    else if (data === 'query_balance') {
-      if (PROFILE_SELECTION_REQUIRED) {
-        await showProfilePicker('b', '查询余额', messageId);
-      } else {
-        await editMsgText(messageId, buildBalanceMessage(getOnlyProfile()), {
-          inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]],
-        });
-      }
+    else if (data === 'run_checkin' || data === 'run_read_panel' || data === 'query_balance') {
+      await sendOrEdit(
+        messageId,
+        '⚠️ 旧版主面板未绑定账号位置，已拒绝执行，请使用刷新后的按钮',
+        getMainKeyboardMarkup(messageId)
+      );
     }
     else if (data === 'show_profile_slots') {
       await editMsgText(messageId, buildProfileSlotMessage(), getProfileSlotKeyboard());
@@ -1717,22 +2233,14 @@ async function handleCallbackQuery(query) {
     else if (data === 'config_debug') {
       await handleDebug(null, messageId);
     }
+    else if (data === 'switch_account') {
+      await showAccountSwitcher(messageId);
+    }
     else if (data === 'show_cookie_help') {
-      await handleCookieHelp(messageId);
+      await showAccountSwitcher(messageId);
     }
     else if (data === 'show_help') {
-      const text = `ℹ️ <b>V2EX Max Helper 命令帮助说明</b>\n\n` +
-                   `所有常用操作都已集成到主面板按钮；也可以继续使用文本命令：\n\n` +
-                   `<code>/start</code> 打开主面板\n` +
-                   `<code>/sou [profile]</code> 查询余额\n` +
-                   `<code>/tasks</code> 查看任务状态\n` +
-                   `<code>/checkin [profile]</code> 手动签到\n` +
-                   `<code>/read [数量]</code> 或 <code>/read profile [数量]</code> 手动阅读\n` +
-                   `面板「时段分块」查看/启动多账号串行\n` +
-                   `<code>/debug [级别]</code> 日志级别\n` +
-                   `<code>/stop [profile]</code> 停止任务并取消后续串行账号\n` +
-                   `<code>/cookie [profile] [内容]</code> 导入 Cookie`;
-      await editMsgText(messageId, text, {
+      await editMsgText(messageId, buildHelpText(), {
         inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
       });
     }
@@ -1743,7 +2251,7 @@ async function handleCallbackQuery(query) {
     else if (data === 'query_tasks') {
       const lock = getActiveReaderLock();
       const taskName = runningTaskName() || (profileSequenceRunning ? '多账号串行队列' : (lock ? '外部阅读任务' : ''));
-      const profile = (runningTask && runningTask.profile) || (lock && lock.profile);
+      const profile = (runningTask && runningTask.profile) || (lock && lock.profile) || sequenceActiveProfile;
       const pid = (runningTask && runningTask.child && runningTask.child.pid) || (lock && lock.pid);
       let statusText = taskName
         ? `ℹ️ <b>当前任务状态</b>: 🟡 <b>正在运行中</b>\n- 当前任务: <code>${escapeHtml(taskName)}</code>` +
@@ -1752,41 +2260,46 @@ async function handleCallbackQuery(query) {
         : 'ℹ️ <b>当前任务状态</b>: 🟢 <b>空闲</b> (无后台任务在运行)';
       let keyboard = [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]];
       if (taskName) {
+        const stopSessionId = createInteractionSession(
+          'x',
+          getActiveTaskSnapshot(),
+          messageId,
+          profile ? [profile] : []
+        );
         keyboard = [
-          [{ text: '🛑 停止任务', callback_data: 'stop_task' }],
+          [{ text: '🛑 停止任务', callback_data: `st:${stopSessionId}` }],
           [{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]
         ];
       }
       await editMsgText(messageId, statusText, { inline_keyboard: keyboard });
     }
-    else if (data === 'stop_task') {
-      if (profileSequenceRunning) sequenceCancelRequested = true;
-      const lock = getActiveReaderLock();
-      const pid = (runningTask && runningTask.child && runningTask.child.pid) || (lock && lock.pid);
-      let statusText = profileSequenceRunning ? '🛑 已取消多账号串行队列。' : 'ℹ️ 当前没有运行任务。';
-      if (pid) {
-        try {
-          if (runningTask && runningTask.child) runningTask.child.kill('SIGTERM');
-          else process.kill(pid, 'SIGTERM');
-          const profile = (runningTask && runningTask.profile) || (lock && lock.profile);
-          statusText = `🛑 已停止当前任务${profile ? `（<code>${escapeHtml(profile)}</code>）` : ''}。` +
-            `${profileSequenceRunning ? '\n后续串行账号也已取消。' : ''}`;
-        } catch (e) {
-          statusText = `❌ 停止失败: ${escapeHtml(e.message)}`;
-        }
-      }
+    else if (data.startsWith('st:')) {
+      const [, sessionId] = data.split(':');
+      const session = getInteractionSession(sessionId, messageId);
+      const profile = session && session.profiles.length > 0 ? session.profiles[0] : null;
+      const statusText = session && session.action === 'x'
+        ? await requestTaskStop(profile, session.extraValue)
+        : '⚠️ 停止按钮已过期，未停止任何进程。请重新查看任务状态。';
       await editMsgText(messageId, statusText, {
         inline_keyboard: [[{ text: '◀️ 返回面板', callback_data: 'go_to_start' }]]
       });
     }
+    else if (data === 'stop_task') {
+      await sendOrEdit(messageId, '⚠️ 旧版停止按钮未绑定具体任务，已拒绝执行。请重新查看任务状态。', getMainKeyboardMarkup(messageId));
+    }
     else if (data === 'go_to_start') {
-      clearPendingCookieImport();
-      clearInteractionSessions();
-      const text = `🤖 <b>V2EX Max Helper 遥控中心</b>\n\n常用操作都在这里。你也可以直接粘贴 Cookie 文本，Bot 会自动识别并导入。`;
-      await editMsgText(messageId, text, getMainKeyboardMarkup());
+      await editMsgText(messageId, buildMainPanelText(), getMainKeyboardMarkup(messageId));
+    }
+    else {
+      await sendOrEdit(messageId, '⚠️ 操作已失效，请重新打开面板', getMainKeyboardMarkup(messageId));
     }
   } catch (e) {
     console.error(`[BOT] Callback 处理出错: ${e.message}`);
+    await sendOrEdit(
+      messageId,
+      '❌ 操作执行失败，请稍后重试或使用 <code>/debug</code> 查看日志。',
+      getMainKeyboardMarkup(messageId)
+    ).catch(() => {});
   }
 }
 
@@ -1797,6 +2310,9 @@ async function handleUnboundMessage(msg) {
   }
 
   const text = (msg.text || '').trim();
+  if (/^\/bind(?:\s|$)/i.test(text) && msg.message_id) {
+    await deleteBindingSourceMessage(msg);
+  }
   if (!SETUP_CODE) {
     await sendDirectMsg(
       msg.chat.id,
@@ -1807,7 +2323,7 @@ async function handleUnboundMessage(msg) {
   }
 
   const bindMatch = text.match(/^\/bind\s+(.+)$/);
-  if (!bindMatch || bindMatch[1].trim() !== SETUP_CODE) {
+  if (!bindMatch || !safeSecretEqual(bindMatch[1].trim(), SETUP_CODE)) {
     await sendDirectMsg(
       msg.chat.id,
       '🔐 <b>Bot 尚未绑定授权用户</b>\n\n请发送 <code>/bind 你的绑定口令</code> 完成绑定。'
@@ -1825,7 +2341,7 @@ async function handleUnboundMessage(msg) {
     await handleStart();
   } catch (e) {
     console.error(`[BOT] 绑定授权用户失败: ${e.message}`);
-    await sendDirectMsg(msg.chat.id, `❌ 绑定失败: ${e.message}`);
+    await sendDirectMsg(msg.chat.id, `❌ 绑定失败: ${escapeHtml(e.message)}`);
   }
 }
 
@@ -1845,10 +2361,22 @@ async function poll() {
       return;
     }
 
+    if (!res.ok || !Array.isArray(res.result)) {
+      const errorCode = Number(res.error_code || 0);
+      const retryAfter = Number(res.parameters && res.parameters.retry_after);
+      const delay = errorCode === 429 && Number.isFinite(retryAfter)
+        ? Math.min(300000, Math.max(1000, retryAfter * 1000))
+        : errorCode === 401
+          ? 30000
+          : pollRetryDelay;
+      console.error(`[BOT] Telegram API 返回错误${errorCode ? ` (HTTP/API ${errorCode})` : ''}，${Math.ceil(delay / 1000)}秒后重试`);
+      await sleep(delay);
+      pollRetryDelay = Math.min(Math.max(delay * 2, 2000), 30000);
+      return;
+    }
+
     pollRetryDelay = 1000;
     pollConflictCount = 0;
-
-    if (!res.ok || !res.result) return;
 
     for (const update of res.result) {
       offset = update.update_id + 1;
@@ -1860,11 +2388,16 @@ async function poll() {
           await handleUnboundMessage(msg);
           continue;
         }
-        if (String(msg.chat.id) !== ALLOWED_CHAT_ID) {
-          console.log(`[BOT] 忽略非授权消息, 来源 chat_id: ${maskId(msg.chat.id)}`);
+        if (!msg.chat || msg.chat.type !== 'private' || String(msg.chat.id) !== ALLOWED_CHAT_ID) {
+          console.log(`[BOT] 忽略非授权消息, 来源 chat_id: ${maskId(msg.chat && msg.chat.id)}`);
           continue;
         }
-        await handleMessage(msg);
+        try {
+          await handleMessage(msg);
+        } catch (e) {
+          console.error(`[BOT] 消息处理失败: ${e.message}`);
+          await sendMsg('❌ 操作执行失败，请稍后重试或使用 <code>/debug</code> 查看日志。').catch(() => {});
+        }
       }
       
       if (update.callback_query) {
@@ -1873,8 +2406,10 @@ async function poll() {
           console.log('[BOT] 未绑定状态下忽略 CallbackQuery');
           continue;
         }
-        if (String(query.from.id) !== ALLOWED_CHAT_ID) {
-          console.log(`[BOT] 忽略非授权 CallbackQuery, 来源 user_id: ${maskId(query.from.id)}`);
+        if (!query.message || !query.message.chat || query.message.chat.type !== 'private' ||
+            String(query.message.chat.id) !== ALLOWED_CHAT_ID ||
+            !query.from || String(query.from.id) !== ALLOWED_CHAT_ID) {
+          console.log(`[BOT] 忽略非授权 CallbackQuery, 来源 user_id: ${maskId(query.from && query.from.id)}`);
           continue;
         }
         await handleCallbackQuery(query);
@@ -1902,7 +2437,9 @@ if (ALLOWED_CHAT_ID) {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
-    fs.appendFileSync(READER_LOG, `[${new Date().toISOString()}] [BOT] Bot started\n`);
+    if (shouldWriteLog('INFO')) {
+      fs.appendFileSync(READER_LOG, `[${new Date().toISOString()}] [BOT] Bot started\n`, { encoding: 'utf8', mode: 0o600 });
+    }
   } catch (e) {
     console.error(`[BOT] 初始化 DATA_DIR / READER_LOG 失败: ${e.message}`);
   }
@@ -1923,14 +2460,17 @@ if (ALLOWED_CHAT_ID) {
   let telegramOwnershipConfirmed = false;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const init = await tgRequest('getUpdates', { offset: -1, timeout: 0 });
+      const init = await tgRequest('getUpdates', { offset: -100, limit: 100, timeout: 0 });
       if (init.conflict) {
         console.log(`[BOT] 初始化遇到 409 冲突，${attempt + 1}/5 次重试...`);
         await sleep(2000 * (attempt + 1));
         continue;
       }
-      if (init.ok && init.result.length > 0) {
-        offset = init.result[init.result.length - 1].update_id + 1;
+      if (init.ok && Array.isArray(init.result)) {
+        await scrubSkippedSensitiveUpdates(init.result);
+        if (init.result.length > 0) {
+          offset = init.result[init.result.length - 1].update_id + 1;
+        }
       }
       if (init.ok) telegramOwnershipConfirmed = true;
       break;
@@ -1943,21 +2483,27 @@ if (ALLOWED_CHAT_ID) {
     throw new Error('无法取得 Telegram getUpdates 所有权，拒绝启动内部调度器');
   }
 
+  let staleBackupCount = 0;
+  for (const profile of CONTROL_PROFILES) {
+    try {
+      staleBackupCount += cleanupStaleChromeBackups(getProfileConfig(profile));
+    } catch (e) {
+      console.warn(`[BOT] Chromium 换绑备份恢复或清理失败: ${e.message}`);
+    }
+  }
+  if (staleBackupCount > 0) console.log(`[BOT] 已清理 ${staleBackupCount} 个遗留 Chromium 换绑备份`);
+
   // 仅由取得 Telegram 所有权的实例处理环境启动凭证。
-  const startupCookie = process.env.V2EX_COOKIE || '';
-  try {
-    if (startupCookie) {
+  if (STARTUP_COOKIE) {
       if (MULTI_PROFILE_MODE && (!cfg.profileExplicit || !CONTROL_PROFILES.includes(cfg.profile))) {
         console.warn('[BOT] 多账号模式下 V2EX_COOKIE 必须同时显式指定列表内的 V2EX_PROFILE，已忽略该启动凭证');
       } else if (!hasUsableCookie(getProfileConfig(cfg.profile).cookieFile)) {
-        const candidate = extractCookie(startupCookie);
+        const candidate = extractCookie(STARTUP_COOKIE);
         if (!candidate) console.error('[BOT] V2EX_COOKIE 格式无效，未写入任何 profile');
         else await importCookieResult(candidate, cfg.profile);
       }
-    }
-  } finally {
-    delete process.env.V2EX_COOKIE;
   }
+  STARTUP_COOKIE = '';
 
   // 检查 Cookie 状态，构建启动消息
   const readyProfiles = CONTROL_PROFILES.filter(profile => hasUsableCookie(getProfileConfig(profile).cookieFile));
@@ -1969,7 +2515,7 @@ if (ALLOWED_CHAT_ID) {
       startupMsg += `\n⚠️ 缺少 Cookie：<code>${missingProfiles.map(escapeHtml).join(', ')}</code>`;
     }
   } else if (readyProfiles.length === 0) {
-    startupMsg += '\n\n⚠️ 未检测到 Cookie 文件\n💡 请从面板选择「导入 Cookie」或直接粘贴 Cookie 文本';
+    startupMsg += '\n\n⚠️ 未检测到 Cookie 文件\n💡 请从面板选择「切换账号」进入空位置，或直接粘贴 Cookie 文本';
   } else {
     startupMsg += '\n✅ Cookie 文件已就绪';
   }

@@ -24,4 +24,4 @@ services:
         value: /app/data
       - key: TZ
         value: Asia/Shanghai
-    autoDeployTrigger: commit
+    autoDeployTrigger: checksPass

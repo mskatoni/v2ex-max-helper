@@ -73,13 +73,13 @@ test('a sign-in string does not override explicit authenticated navigation', () 
   assert.equal(page.ok, true);
 });
 
-test('home fallback accepts private navigation paths without assuming an exact href shape', () => {
+test('home fallback rejects private-route strings that are not navigation links', () => {
   const page = auth.diagnoseHomePage({
     statusCode: 200,
     body: '<a class="top" href="/member/Alice">A</a><div data-route="/notifications"></div><script>const logout="/signout"</script>',
   });
-  assert.equal(page.ok, true);
-  assert.equal(page.identity, 'alice');
+  assert.equal(page.ok, false);
+  assert.equal(page.code, 'logged_out');
 });
 
 test('public member links alone never prove an authenticated session', () => {
@@ -94,8 +94,8 @@ test('public member links alone never prove an authenticated session', () => {
     statusCode: 200,
     body: '<div class="balance_area bigger"></div><a href="/member/Alice">Alice</a>',
   });
-  assert.equal(balancePage.ok, true);
-  assert.equal(balancePage.identity, 'alice');
+  assert.equal(balancePage.ok, false);
+  assert.equal(balancePage.code, 'identity_unverified');
 });
 
 test('identity metadata stores no plaintext account name', () => {
@@ -106,8 +106,31 @@ test('identity metadata stores no plaintext account name', () => {
     auth.writeIdentity(file, record);
     const raw = fs.readFileSync(file, 'utf8');
     assert.equal(raw.includes('SecretAccount'), false);
+    assert.equal(raw.toLowerCase().includes('secretaccount'), false);
+    assert.equal(record.identityHint, 'S***t');
+    assert.equal(auth.getIdentityHint(auth.readIdentity(file)), 'S***t');
+    assert.equal(auth.getIdentityHint({ identityHint: 'SecretAccount' }), '');
     assert.equal(auth.identityMatches(auth.readIdentity(file), 'secretaccount'), true);
     assert.equal(auth.identityMatches(auth.readIdentity(file), 'another'), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an existing corrupt identity record cannot become a silent first binding', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2ex-identity-corrupt-'));
+  const identityFile = path.join(dir, 'profile_identity.json');
+  try {
+    fs.writeFileSync(identityFile, '{broken');
+    await assert.rejects(
+      auth.verifyAndCompare({ identityFile }, 'A2=test', {
+        requestPage: async () => ({
+          statusCode: 200,
+          body: '<a class="top" href="/member/alice">alice</a><div class="balance_area bigger"></div>',
+        }),
+      }),
+      /身份记录存在但无法读取或校验/
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
