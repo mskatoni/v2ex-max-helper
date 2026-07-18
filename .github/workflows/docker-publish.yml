@@ -44,7 +44,9 @@ jobs:
 
       - name: Reject unsafe TLS overrides
         run: |
-          if git grep -nE 'rejectUnauthorized[[:space:]]*:[[:space:]]*false|NODE_TLS_REJECT_UNAUTHORIZED' -- .; then
+          tls_option='rejectUnauthori''zed[[:space:]]*:[[:space:]]*false'
+          tls_env='NODE_TLS_''REJECT_UNAUTHORIZED'
+          if git grep -nE "${tls_option}|${tls_env}" -- .; then
             echo 'Unsafe TLS override found' >&2
             exit 1
           fi
