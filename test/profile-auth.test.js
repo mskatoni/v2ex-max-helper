@@ -65,6 +65,14 @@ test('home fallback rejects public or logged-out pages', () => {
   assert.equal(missingTopIdentity.code, 'identity_unverified');
 });
 
+test('login probe aggregation requires repeated logged-out results', () => {
+  assert.equal(auth.resolveLoginProbeStates(['logged_in', 'unknown']), 'logged_in');
+  assert.equal(auth.resolveLoginProbeStates(['logged_out', 'logged_out', 'logged_out', 'logged_out']), 'logged_out');
+  assert.equal(auth.resolveLoginProbeStates(['logged_out', 'unknown', 'logged_out', 'logged_out']), 'unknown');
+  assert.equal(auth.resolveLoginProbeStates(['unknown', 'unknown', 'unknown', 'unknown']), 'unknown');
+  assert.equal(auth.resolveLoginProbeStates([]), 'unknown');
+});
+
 test('a sign-in string does not override explicit authenticated navigation', () => {
   const page = auth.diagnoseHomePage({
     statusCode: 200,

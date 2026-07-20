@@ -10,6 +10,7 @@ const DB_PATH = cfg.dbPath;
 
 let db = null;
 let dirty = false;
+const QUEUE_SAVE_RETRY_COUNT = 3;
 
 async function init() {
   const initSqlJs = require('sql.js');
@@ -59,19 +60,26 @@ function flush() {
   if (!dirty || !db) return false;
   const dir = path.dirname(DB_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${DB_PATH}.${process.pid}.${Date.now()}.tmp`;
-  try {
-    const data = db.export();
-    fs.writeFileSync(tmp, Buffer.from(data), { mode: 0o600 });
-    fs.renameSync(tmp, DB_PATH);
-    dirty = false;
-    logger.info(`Queue DB saved: ${DB_PATH}`);
-    return true;
-  } catch (e) {
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
-    logger.error(`Queue DB save failed: ${e.message}`);
-    throw e;
+  for (let attempt = 0; attempt <= QUEUE_SAVE_RETRY_COUNT; attempt++) {
+    const tmp = `${DB_PATH}.${process.pid}.${Date.now()}.${attempt}.tmp`;
+    try {
+      const data = db.export();
+      fs.writeFileSync(tmp, Buffer.from(data), { mode: 0o600 });
+      fs.renameSync(tmp, DB_PATH);
+      dirty = false;
+      logger.info(`Queue DB saved: ${DB_PATH}`);
+      return true;
+    } catch (e) {
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+      if (attempt < QUEUE_SAVE_RETRY_COUNT) {
+        logger.warn(`Queue DB save attempt ${attempt + 1}/${QUEUE_SAVE_RETRY_COUNT + 1} failed (${e.code || 'io_error'}); retrying`);
+        continue;
+      }
+      logger.error(`Queue DB save failed: ${e.message}`);
+      throw e;
+    }
   }
+  return false;
 }
 
 function withTransaction(fn) {

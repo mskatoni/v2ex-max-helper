@@ -10,8 +10,10 @@ const runner = String.raw`
 const https = require('https');
 const { EventEmitter } = require('events');
 const mode = process.env.MOCK_NOTIFY_MODE;
+let requestCount = 0;
 
 https.request = (options, callback) => {
+  requestCount++;
   const req = new EventEmitter();
   let timeoutHandler = null;
   req.write = () => {};
@@ -46,7 +48,7 @@ https.request = (options, callback) => {
 };
 
 require('./reader/notify').sendMessage('local notification test')
-  .then(() => console.log('done'))
+  .then(() => console.log('done\nrequests:' + requestCount))
   .catch((error) => { console.error(error.message); process.exitCode = 1; });
 `;
 
@@ -85,6 +87,12 @@ function assertNoCredentialEcho(result) {
   assert.doesNotMatch(output, /test-token-private|123456789|open-apis\/bot\/v2\/hook/);
 }
 
+function requestCount(result) {
+  const match = result.stdout.match(/requests:(\d+)/);
+  assert.ok(match, result.stdout);
+  return Number(match[1]);
+}
+
 test('Telegram notification handles 2xx, 4xx, 5xx, timeout, and network errors locally', () => {
   for (const mode of ['200', '400', '500', 'timeout', 'network', 'large']) {
     const result = run('Telegram', mode);
@@ -93,6 +101,7 @@ test('Telegram notification handles 2xx, 4xx, 5xx, timeout, and network errors l
     assertNoCredentialEcho(result);
     if (mode === '200') assert.doesNotMatch(result.stderr, /推送失败/);
     else assert.match(result.stderr, /Telegram 推送失败/);
+    assert.equal(requestCount(result), ['500', 'timeout', 'network', 'large'].includes(mode) ? 4 : 1);
   }
 });
 
@@ -104,6 +113,7 @@ test('Feishu notification handles 2xx and failure paths without leaking its webh
     assertNoCredentialEcho(result);
     if (mode === '200') assert.doesNotMatch(result.stderr, /推送失败/);
     else assert.match(result.stderr, /Feishu 推送失败/);
+    assert.equal(requestCount(result), ['500', 'timeout', 'network', 'large'].includes(mode) ? 4 : 1);
   }
 });
 

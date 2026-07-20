@@ -31,6 +31,10 @@ const MIN_READ_COUNT    = 250;    // 每日最低阅读量（且需两次余额�
 const MAX_CHANGE_COUNT  = 2;      // 余额变化上限（活跃度两次）
 const QUEUE_REFILL_THRESHOLD = 150;// 队列低于此数时补充
 const DEADLINE_LOCAL_HOUR = 14;   // 本机时间 14:00 超时退出
+const RECOVERABLE_RETRY_COUNT = 3;
+const RECOVERABLE_RETRY_BASE_MS = 3000;
+const LOGIN_PROBE_RETRY_COUNT = 3;
+const LOGIN_PROBE_RETRY_BASE_MS = 5000;
 const cfg = config.getConfig();
 const PROFILE_LIST = config.parseProfileList();
 const BEHAVIOR = behavior.resolve(cfg.profile);
@@ -71,12 +75,17 @@ let browserStarted = false;
 let activeStats = null;
 let activeStartTime = 0;
 
-async function requireBrowserCookie() {
-  const cookie = await browser.getCurrentCookie({ requireContextAuth: true });
-  if (cookie) return cookie;
-  const error = new Error('Chromium 上下文缺少认证 Cookie');
-  error.code = 'SESSION_EXPIRED';
-  throw error;
+async function requireBrowserCookie(options = {}) {
+  const retryCount = options.retryCount === undefined
+    ? RECOVERABLE_RETRY_COUNT
+    : options.retryCount;
+  return retryRecoverable('读取 Chromium 登录态', async () => {
+    const cookie = await browser.getCurrentCookie({ requireContextAuth: true });
+    if (cookie) return cookie;
+    const error = new Error('Chromium 上下文缺少认证 Cookie');
+    error.code = 'SESSION_EXPIRED';
+    throw error;
+  }, { retryCount });
 }
 
 // ========== 锁文件 ==========
@@ -125,15 +134,12 @@ async function shutdown(reason, stats, exitCode = 0, options = {}) {
   // 退出前最后一次余额检查（保证余额日志始终最新）
   if (exitCode === 0 && !isDryRun && browserStarted) {
     try {
-      const cookie = await requireBrowserCookie();
-      if (cookie) {
-        stats.changed = await balance.check(cookie);
-        const balanceStatus = balance.getLastStatus();
-        if (balanceStatus && balanceStatus.ok) {
-          logger.info('退出前余额已更新');
-        } else {
-          logger.warn(`退出前余额未更新: ${(balanceStatus && balanceStatus.message) || '状态未知'}`);
-        }
+      const result = await checkBalanceWithRetries('退出前余额更新');
+      stats.changed = result.changes;
+      if (result.status && result.status.ok) {
+        logger.info('退出前余额已更新');
+      } else {
+        logger.warn(`退出前余额未更新: ${(result.status && result.status.message) || '状态未知'}`);
       }
     } catch (e) {
       logger.warn(`退出前余额更新失败: ${e.message}`);
@@ -192,9 +198,13 @@ async function shutdown(reason, stats, exitCode = 0, options = {}) {
 }
 
 async function verifyAndBindProfile(cookie) {
-  const result = await profileAuth.verifyAndCompare(cfg, cookie, {
+  const result = await retryRecoverable('验证 Profile 登录态', () => profileAuth.verifyAndCompare(cfg, cookie, {
     userAgent: FP.userAgent,
     acceptLanguage: FP.acceptLanguage,
+  }), {
+    shouldRetryResult: value => !value.ok,
+    getResultCode: value => value.code || 'auth_unverified',
+    isRetryableError: isRecoverableNetworkError,
   });
   if (!result.ok) throw new Error(`Profile ${cfg.profile} 认证失败: ${result.message}`);
   if (result.identityState === 'different') {
@@ -262,11 +272,19 @@ async function main() {
     queueInitialized = true;
     queue.cleanup();
 
-    await browser.launch(false);
+    await retryRecoverable('启动 Chromium', () => browser.launch(false), {
+      isRetryableError: isRecoverableBrowserStartError,
+    });
     browserStarted = true;
-    const browserCookie = await requireBrowserCookie();
+    await requireBrowserCookie();
 
-    const balanceState = await balance.init(browserCookie);
+    const balanceState = await retryRecoverable('读取余额基线', async () => {
+      const freshCookie = await requireBrowserCookie({ retryCount: 0 });
+      return balance.init(freshCookie);
+    }, {
+      shouldRetryResult: value => !value.ok,
+      getResultCode: value => value.code || 'balance_unavailable',
+    });
     if (!balanceState.ok && balanceState.fatal) {
       logger.error(`无法获取余额基线: ${balanceState.message}`);
       await notify.notifySessionExpired();
@@ -284,7 +302,7 @@ async function main() {
     // 初始填充队列（忽略冷却）
     if (queue.size() < QUEUE_REFILL_THRESHOLD) {
       logger.info('初始填充队列...');
-      const urls = await fetcher.fetchAllForce(browserCookie);
+      const urls = await fetchQueueUrls(true, '初始队列抓取');
       queue.add(urls);
     }
 
@@ -312,8 +330,7 @@ async function main() {
     // 队列为空时才补充（fetchAll 内部有 5 分钟冷却）
     if (!isDryRun && !url) {
       logger.info('队列为空，尝试补充...');
-      const freshCookie = await requireBrowserCookie();
-      const urls = await fetcher.fetchAll(freshCookie);
+      const urls = await fetchQueueUrls(false, '空队列补充');
       if (urls.length > 0) queue.add(urls);
       url = queue.pop();
     }
@@ -339,8 +356,7 @@ async function main() {
       logger.warn('当前失败 URL 已跳过，避免重复触发同一异常帖');
 
       if (stats.consecutiveErrors >= 3) {
-        const freshCookie = await requireBrowserCookie();
-        const loginState = isDryRun ? 'unknown' : await probeLogin(freshCookie);
+        const loginState = isDryRun ? 'unknown' : await probeLogin();
 
         if (loginState === 'logged_in') {
           logger.warn('连续读帖失败，但登录探针通过；重置错误计数并继续换帖');
@@ -349,18 +365,22 @@ async function main() {
         }
 
         stats.elapsed = elapsed(startTime);
+        const probeAttempts = LOGIN_PROBE_RETRY_COUNT + 1;
         const reason = loginState === 'logged_out'
-          ? '连续读帖失败，登录探针确认 Cookie 已失效'
-          : '连续读帖失败，登录探针无法确认状态';
+          ? `连续读帖失败，登录探针连续 ${probeAttempts} 次确认 Cookie 已失效`
+          : `连续读帖失败，登录探针经 ${probeAttempts} 次尝试仍无法确认状态`;
         await shutdown(reason, stats, 1);
       }
     }
 
     // 每 BALANCE_CHECK_INTERVAL 篇检查一次余额
     if (!isDryRun && stats.read > 0 && stats.read % BALANCE_CHECK_INTERVAL === 0) {
-      const freshCookie = await requireBrowserCookie();
-      const changes = await balance.check(freshCookie);
+      const balanceResult = await checkBalanceWithRetries('定期余额检查');
+      const changes = balanceResult.changes;
       stats.changed = changes;
+      if (!balanceResult.status || !balanceResult.status.ok) {
+        logger.warn(`余额检查经 ${RECOVERABLE_RETRY_COUNT} 次重试后仍不可用，将继续阅读`);
+      }
 
       // 停止条件 1：余额变化足够且已读满最低阅读量
       if (changes >= MAX_CHANGE_COUNT && stats.read >= MIN_READ_COUNT) {
@@ -374,8 +394,7 @@ async function main() {
 
     // 每 200 篇主动补充队列（避免等到完全空了）
     if (!isDryRun && stats.read > 0 && stats.read % 200 === 0) {
-      const freshCookie = await requireBrowserCookie();
-      const urls = await fetcher.fetchAll(freshCookie);
+      const urls = await fetchQueueUrls(false, '主动队列补充');
       if (urls.length > 0) queue.add(urls);
     }
 
@@ -396,6 +415,84 @@ function elapsed(start) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function safeRetryCode(error) {
+  const code = String(error && (error.code || error.name) || 'temporary_error');
+  return /^[0-9A-Za-z_.-]{1,64}$/.test(code) ? code : 'temporary_error';
+}
+
+function isRecoverableNetworkError(error) {
+  const code = String(error && error.code || '').toUpperCase();
+  if (['ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'ENETUNREACH', 'EHOSTUNREACH', 'EPIPE'].includes(code)) {
+    return true;
+  }
+  const message = String(error && error.message || '');
+  if (/拒绝跨|不安全|路径|身份记录|invalid url/i.test(message)) return false;
+  return true;
+}
+
+function isRecoverableBrowserStartError(error) {
+  const code = String(error && error.code || '').toUpperCase();
+  if (['EACCES', 'EPERM', 'ENOENT', 'EINVAL'].includes(code)) return false;
+  const message = String(error && error.message || '');
+  return !/Cookie 文件不存在或为空|executable doesn't exist|拒绝|不安全|路径无效/i.test(message);
+}
+
+async function retryRecoverable(label, operation, options = {}) {
+  const retryCount = Number.isInteger(options.retryCount) && options.retryCount >= 0
+    ? options.retryCount
+    : RECOVERABLE_RETRY_COUNT;
+  const totalAttempts = retryCount + 1;
+
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    let retryCode = '';
+    try {
+      const value = await operation(attempt);
+      if (!options.shouldRetryResult || !options.shouldRetryResult(value) || attempt === retryCount) {
+        return value;
+      }
+      retryCode = options.getResultCode ? String(options.getResultCode(value) || 'temporary_result') : 'temporary_result';
+    } catch (error) {
+      const retryable = !options.isRetryableError || options.isRetryableError(error);
+      if (!retryable || attempt === retryCount) throw error;
+      retryCode = safeRetryCode(error);
+    }
+
+    const retryNumber = attempt + 1;
+    const delay = Math.min(RECOVERABLE_RETRY_BASE_MS * (2 ** attempt), 12000);
+    logger.warn(`${label}第 ${attempt + 1}/${totalAttempts} 次尝试失败 (${retryCode})，${delay / 1000} 秒后进行第 ${retryNumber}/${retryCount} 次重试`);
+    if (options.onRetry) await options.onRetry(attempt);
+    await sleep(delay);
+  }
+
+  throw new Error(`${label}重试状态异常`);
+}
+
+async function fetchQueueUrls(force, label) {
+  return retryRecoverable(label, async (attempt) => {
+    const cookie = await requireBrowserCookie({ retryCount: 0 });
+    return force || attempt > 0
+      ? fetcher.fetchAllForce(cookie)
+      : fetcher.fetchAll(cookie);
+  });
+}
+
+async function checkBalanceWithRetries(label) {
+  const result = await retryRecoverable(label, async () => {
+    const cookie = await requireBrowserCookie({ retryCount: 0 });
+    const changes = await balance.check(cookie);
+    return { changes, status: balance.getLastStatus() };
+  }, {
+    shouldRetryResult: value => !value.status || !value.status.ok,
+    getResultCode: value => value.status && value.status.code || 'balance_status_missing',
+  });
+  if (result.status && result.status.code === 'logged_out') {
+    const error = new Error('余额页连续确认 V2EX 登录态已失效');
+    error.code = 'SESSION_EXPIRED';
+    throw error;
+  }
+  return result;
+}
 
 function safePostLabel(value) {
   try {
@@ -459,14 +556,35 @@ function probeLoginOnce(cookie) {
   });
 }
 
-async function probeLogin(cookie, attempts = 3) {
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    const state = await probeLoginOnce(cookie);
-    if (state !== 'unknown' || attempt === attempts) return state;
-    logger.warn(`登录探针暂时无响应，5 秒后重试 (${attempt}/${attempts})`);
-    await sleep(5000);
+async function probeLogin(retryCount = LOGIN_PROBE_RETRY_COUNT) {
+  const totalAttempts = retryCount + 1;
+  const states = [];
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+    let state = 'unknown';
+    try {
+      const cookie = await requireBrowserCookie({ retryCount: 0 });
+      state = await probeLoginOnce(cookie);
+    } catch (e) {
+      state = e.code === 'SESSION_EXPIRED' ? 'logged_out' : 'unknown';
+      logger.warn(`登录探针第 ${attempt}/${totalAttempts} 次执行异常 (${e.code || 'unknown'})`);
+    }
+
+    states.push(state);
+    const label = state === 'logged_in'
+      ? '已确认登录'
+      : state === 'logged_out' ? '疑似未登录' : '状态未知';
+    logger.warn(`登录探针第 ${attempt}/${totalAttempts} 次: ${label}`);
+
+    if (state === 'logged_in') return 'logged_in';
+    if (attempt < totalAttempts) {
+      const delay = Math.min(LOGIN_PROBE_RETRY_BASE_MS * (2 ** (attempt - 1)), 20000);
+      logger.warn(`登录状态尚未确认，${delay / 1000} 秒后重试`);
+      await sleep(delay);
+    }
   }
-  return 'unknown';
+
+  return profileAuth.resolveLoginProbeStates(states);
 }
 
 main().catch(async (e) => {

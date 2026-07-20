@@ -4,6 +4,8 @@ const https  = require('https');
 const config = require('../lib/config');
 
 const cfg = config.getConfig();
+const PUSH_RETRY_COUNT = 3;
+const PUSH_RETRY_BASE_MS = 100;
 
 function isTelegramConfigured() {
   // 未配置 Token / Chat ID 时静默跳过推送，不影响主流程
@@ -47,14 +49,45 @@ function isSuccessStatus(statusCode) {
   return Number.isInteger(statusCode) && statusCode >= 200 && statusCode < 300;
 }
 
+function isRetryableStatus(statusCode) {
+  return statusCode === 408 || statusCode === 425 || statusCode === 429 || statusCode >= 500;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function sendWithRetries(channel, operation) {
+  for (let attempt = 0; attempt <= PUSH_RETRY_COUNT; attempt++) {
+    let result;
+    try {
+      result = await operation();
+    } catch (_) {
+      result = { ok: false, retryable: true, detail: 'network error' };
+    }
+    if (result.ok) return;
+    if (!result.retryable || attempt === PUSH_RETRY_COUNT) {
+      warnPushFailure(channel, result.detail);
+      return;
+    }
+    const delay = PUSH_RETRY_BASE_MS * (2 ** attempt);
+    warnPushFailure(channel, `${result.detail}; retry ${attempt + 1}/${PUSH_RETRY_COUNT}`);
+    await sleep(delay);
+  }
+}
+
 function sendTelegram(text) {
   if (!isTelegramConfigured()) return Promise.resolve();
+  return sendWithRetries('Telegram', () => sendTelegramOnce(text));
+}
+
+function sendTelegramOnce(text) {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = () => {
+    const finish = (result) => {
       if (settled) return;
       settled = true;
-      resolve();
+      resolve(result);
     };
     const body = JSON.stringify({ chat_id: cfg.telegram.chatId, text, parse_mode: 'HTML' });
     const req = https.request({
@@ -70,45 +103,48 @@ function sendTelegram(text) {
         if (settled) return;
         received += Buffer.byteLength(chunk);
         if (received > 64 * 1024) {
-          warnPushFailure('Telegram', 'response too large');
+          finish({ ok: false, retryable: true, detail: 'response too large' });
           req.destroy();
-          finish();
           return;
         }
         data += chunk;
       });
       res.on('aborted', () => {
-        warnPushFailure('Telegram', 'response aborted');
-        finish();
+        finish({ ok: false, retryable: true, detail: 'response aborted' });
       });
       res.on('error', () => {
-        warnPushFailure('Telegram', 'response error');
-        finish();
+        finish({ ok: false, retryable: true, detail: 'response error' });
       });
       res.on('end', () => {
         if (settled) return;
         if (!isSuccessStatus(res.statusCode)) {
-          warnPushFailure('Telegram', `HTTP ${res.statusCode || 'unknown'}`);
-        } else {
-          try {
-            if (!JSON.parse(data || '{}').ok) warnPushFailure('Telegram', 'API rejected request');
-          } catch (_) {
-            warnPushFailure('Telegram', 'invalid API response');
-          }
+          finish({
+            ok: false,
+            retryable: isRetryableStatus(res.statusCode),
+            detail: `HTTP ${res.statusCode || 'unknown'}`,
+          });
+          return;
         }
-        finish();
+        try {
+          if (!JSON.parse(data || '{}').ok) {
+            finish({ ok: false, retryable: false, detail: 'API rejected request' });
+            return;
+          }
+        } catch (_) {
+          finish({ ok: false, retryable: true, detail: 'invalid API response' });
+          return;
+        }
+        finish({ ok: true, retryable: false, detail: '' });
       });
     });
     req.on('error', () => {
       if (settled) return;
-      warnPushFailure('Telegram', 'network error');
-      finish();
+      finish({ ok: false, retryable: true, detail: 'network error' });
     });
     req.setTimeout(10000, () => {
       if (settled) return;
-      warnPushFailure('Telegram', 'timeout');
+      finish({ ok: false, retryable: true, detail: 'timeout' });
       req.destroy();
-      finish();
     });
     req.write(body);
     req.end();
@@ -117,22 +153,25 @@ function sendTelegram(text) {
 
 function sendFeishu(text) {
   if (!isFeishuConfigured()) return Promise.resolve();
+  return sendWithRetries('Feishu', () => sendFeishuOnce(text));
+}
+
+function sendFeishuOnce(text) {
   return new Promise((resolve) => {
     let target;
     try {
       target = new URL(cfg.feishu.webhook);
       if (target.protocol !== 'https:' || target.username || target.password) throw new Error('unsafe URL');
     } catch (_) {
-      warnPushFailure('Feishu', 'invalid webhook URL');
-      resolve();
+      resolve({ ok: false, retryable: false, detail: 'invalid webhook URL' });
       return;
     }
 
     let settled = false;
-    const finish = () => {
+    const finish = (result) => {
       if (settled) return;
       settled = true;
-      resolve();
+      resolve(result);
     };
     const body = JSON.stringify({
       msg_type: 'text',
@@ -155,47 +194,50 @@ function sendFeishu(text) {
         if (settled) return;
         received += Buffer.byteLength(chunk);
         if (received > 64 * 1024) {
-          warnPushFailure('Feishu', 'response too large');
+          finish({ ok: false, retryable: true, detail: 'response too large' });
           req.destroy();
-          finish();
           return;
         }
         data += chunk;
       });
       res.on('aborted', () => {
-        warnPushFailure('Feishu', 'response aborted');
-        finish();
+        finish({ ok: false, retryable: true, detail: 'response aborted' });
       });
       res.on('error', () => {
-        warnPushFailure('Feishu', 'response error');
-        finish();
+        finish({ ok: false, retryable: true, detail: 'response error' });
       });
       res.on('end', () => {
         if (settled) return;
         if (!isSuccessStatus(res.statusCode)) {
-          warnPushFailure('Feishu', `HTTP ${res.statusCode || 'unknown'}`);
-        } else {
-          try {
-            const parsed = JSON.parse(data);
-            const code = parsed.code !== undefined ? parsed.code : parsed.StatusCode;
-            if (code === undefined || Number(code) !== 0) warnPushFailure('Feishu', 'API rejected request');
-          } catch (_) {
-            warnPushFailure('Feishu', 'invalid API response');
-          }
+          finish({
+            ok: false,
+            retryable: isRetryableStatus(res.statusCode),
+            detail: `HTTP ${res.statusCode || 'unknown'}`,
+          });
+          return;
         }
-        finish();
+        try {
+          const parsed = JSON.parse(data);
+          const code = parsed.code !== undefined ? parsed.code : parsed.StatusCode;
+          if (code === undefined || Number(code) !== 0) {
+            finish({ ok: false, retryable: false, detail: 'API rejected request' });
+            return;
+          }
+        } catch (_) {
+          finish({ ok: false, retryable: true, detail: 'invalid API response' });
+          return;
+        }
+        finish({ ok: true, retryable: false, detail: '' });
       });
     });
     req.on('error', () => {
       if (settled) return;
-      warnPushFailure('Feishu', 'network error');
-      finish();
+      finish({ ok: false, retryable: true, detail: 'network error' });
     });
     req.setTimeout(10000, () => {
       if (settled) return;
-      warnPushFailure('Feishu', 'timeout');
+      finish({ ok: false, retryable: true, detail: 'timeout' });
       req.destroy();
-      finish();
     });
     req.write(body);
     req.end();
@@ -226,7 +268,7 @@ async function notifyReaderError(stats) {
   const reason = stats.reason || '连续 3 次失败';
   const hint = reason.includes('Cookie')
     ? 'Cookie 已确认失效，请更新'
-    : '已跳过异常帖子，请查看日志确认网络/CF/重定向状态';
+    : '已完成单帖和登录探针重试，请查看日志确认网络/CF/重定向状态';
   await sendMessage(
     `⚠️ <b>V2EX 阅读中止</b>\n` +
     `❌ ${escapeHtml(reason)}\n` +

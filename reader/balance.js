@@ -16,6 +16,7 @@ const BALANCE_STATUS = cfg.balanceStatus;
 const HOST = 'www.v2ex.com';
 const BALANCE_ORIGIN = `https://${HOST}`;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+let lastStatus = null;
 
 const HEADERS = {
   'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -31,21 +32,24 @@ function ensureDataDir() {
 }
 
 function writeBalanceStatus(status) {
+  lastStatus = {
+    time: new Date().toISOString(),
+    ...status,
+  };
   try {
     ensureDataDir();
-    config.writeFileAtomic(BALANCE_STATUS, JSON.stringify({
-      time: new Date().toISOString(),
-      ...status,
-    }, null, 2), { mode: 0o600 });
+    config.writeFileAtomic(BALANCE_STATUS, JSON.stringify(lastStatus, null, 2), { mode: 0o600 });
   } catch (e) {
     logger.warn(`Balance status write failed: ${e.message}`);
   }
 }
 
 function getLastStatus() {
+  if (lastStatus) return { ...lastStatus };
   try {
     if (!fs.existsSync(BALANCE_STATUS)) return null;
-    return JSON.parse(fs.readFileSync(BALANCE_STATUS, 'utf8'));
+    lastStatus = JSON.parse(fs.readFileSync(BALANCE_STATUS, 'utf8'));
+    return { ...lastStatus };
   } catch (_) {
     return null;
   }

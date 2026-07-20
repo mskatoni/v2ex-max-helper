@@ -45,7 +45,27 @@ test('Chromium disables QUIC only when the explicit proxy gate is enabled', () =
 
 test('navigation timeouts rebuild the page before the next post', () => {
   assert.equal(browser.shouldResetPage(new Error('page.goto: Timeout 30000ms exceeded.')), true);
+  assert.equal(browser.shouldResetPage(new Error('page.goto: net::ERR_CONNECTION_RESET')), true);
   assert.equal(browser.shouldResetPage(new Error('ordinary content error')), false);
+});
+
+test('reader allows three retries for transient post, probe, and supporting I/O failures', () => {
+  const browserSource = fs.readFileSync(path.resolve(__dirname, '..', 'reader', 'browser.js'), 'utf8');
+  const mainSource = fs.readFileSync(path.resolve(__dirname, '..', 'reader', 'main.js'), 'utf8');
+  const notifySource = fs.readFileSync(path.resolve(__dirname, '..', 'reader', 'notify.js'), 'utf8');
+  const queueSource = fs.readFileSync(path.resolve(__dirname, '..', 'reader', 'queue.js'), 'utf8');
+  assert.match(browserSource, /const READ_POST_RETRY_COUNT = 3;/);
+  assert.match(browserSource, /const BROWSER_IO_RETRY_COUNT = 3;/);
+  assert.match(browserSource, /attempt <= READ_POST_RETRY_COUNT/);
+  assert.match(mainSource, /const RECOVERABLE_RETRY_COUNT = 3;/);
+  assert.match(mainSource, /const LOGIN_PROBE_RETRY_COUNT = 3;/);
+  assert.match(mainSource, /const totalAttempts = retryCount \+ 1;/);
+  assert.match(mainSource, /async function fetchQueueUrls\(force, label\)/);
+  assert.match(mainSource, /async function checkBalanceWithRetries\(label\)/);
+  assert.match(mainSource, /result\.status\.code === 'logged_out'[\s\S]{0,180}error\.code = 'SESSION_EXPIRED'/);
+  assert.match(mainSource, /resolveLoginProbeStates\(states\)/);
+  assert.match(notifySource, /const PUSH_RETRY_COUNT = 3;/);
+  assert.match(queueSource, /const QUEUE_SAVE_RETRY_COUNT = 3;/);
 });
 
 test('post navigation accepts only credential-free V2EX topic URLs', () => {
@@ -92,7 +112,7 @@ test('reader runtime never falls back to disk after Chromium starts', () => {
   const calls = [...main.matchAll(/browser\.getCurrentCookie\(([^)]*)\)/g)];
   assert.equal(calls.length, 1);
   assert.match(calls[0][1], /requireContextAuth:\s*true/);
-  assert.match(main, /async function requireBrowserCookie\(\)/);
+  assert.match(main, /async function requireBrowserCookie\(options = \{\}\)/);
   assert.match(main, /error\.code = 'SESSION_EXPIRED'/);
   assert.match(main, /await notify\.notifyReaderError\(stats\)/);
 });

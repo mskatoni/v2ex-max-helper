@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.4.10
+ * Version: v1.4.11
  *
  * 用法：
  *   保存 Cookie：
@@ -32,10 +32,11 @@ const profileLock = require('../lib/profile-lock');
 const fingerprint = require('../reader/fingerprint');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.4.10';
+const SCRIPT_VERSION = 'v1.4.11';
 const HOST           = 'www.v2ex.com';
 const COOKIE_ORIGIN  = `https://${HOST}`;
-const MAX_RETRY      = 3;
+const MAX_RETRIES    = 3;
+const MAX_ATTEMPTS   = MAX_RETRIES + 1;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 const cfg = config.getConfig();
@@ -554,10 +555,12 @@ function logField(label, value) {
 function sep() { log('------------------------------------'); }
 
 // ========== 保活心跳 ==========
-async function doPing() {
-  log(`🏓 V2EX Ping Start`);
-  log(`Time     : ${tsNow()}`);
-  sep();
+async function doPing(attempt = 0) {
+  if (attempt === 0) {
+    log(`🏓 V2EX Ping Start`);
+    log(`Time     : ${tsNow()}`);
+    sep();
+  }
   const cookie = readCookie();
   if (!cookie) {
     log('⚠️  无 Cookie，跳过保活');
@@ -573,16 +576,27 @@ async function doPing() {
         log('❌ Cookie 已失效（保活检测）');
         await notify('V2EX ⚠️ Cookie 失效', '请重新登录 V2EX 并更新 Cookie，签到将中断！');
         log('📢 告警已发送（如已配置推送）');
+        process.exitCode = 1;
       } else {
+        if (attempt < MAX_RETRIES) {
+          log(`⚠️  保活页无法确认登录状态 (${status.code})，3 秒后重试 (${attempt + 1}/${MAX_RETRIES})`);
+          await sleep(3000);
+          return doPing(attempt + 1);
+        }
         log(`⚠️  保活页无法确认登录状态 (${status.code})，本次不判定 Cookie 失效`);
+        process.exitCode = 1;
       }
-      process.exitCode = 1;
     } else {
       // 关键：把服务端下发的续期 Cookie 写回，实现登录态自动刷新
       refreshCookieFromResponse(cookie, setCookies);
       log('✅ Session 正常，保活成功');
     }
   } catch (e) {
+    if (attempt < MAX_RETRIES) {
+      log(`⚠️  保活请求失败，3 秒后重试 (${attempt + 1}/${MAX_RETRIES})`);
+      await sleep(3000);
+      return doPing(attempt + 1);
+    }
     log(`⚠️  保活请求失败: ${e.message}`);
     process.exitCode = 1;
   }
@@ -607,7 +621,7 @@ async function doCheckin(attempt = 0) {
   }
 
   try {
-    logField('Action', `签到尝试 ${attempt + 1}/${MAX_RETRY}`);
+    logField('Action', `签到尝试 ${attempt + 1}/${MAX_ATTEMPTS}`);
     const info = await getOnce(cookie);
     let activeCookie = info.cookie || readCookie() || cookie;
 
@@ -632,7 +646,7 @@ async function doCheckin(attempt = 0) {
     }
 
     if (!info.once) {
-      if (attempt + 1 < MAX_RETRY) {
+      if (attempt + 1 < MAX_ATTEMPTS) {
         log('once 码未找到，3 秒后重试...');
         await sleep(3000);
         return doCheckin(attempt + 1);
@@ -662,7 +676,7 @@ async function doCheckin(attempt = 0) {
     log(`📊 Summary\nSuccess    : 1\n🎯 Result  : 签到成功`);
 
   } catch (e) {
-    if (attempt + 1 < MAX_RETRY) {
+    if (attempt + 1 < MAX_ATTEMPTS) {
       log(`网络错误: ${e.message}，3 秒后重试...`);
       await sleep(3000);
       return doCheckin(attempt + 1);
@@ -676,11 +690,36 @@ async function doCheckin(attempt = 0) {
 // ========== 入口 ==========
 const args = process.argv.slice(2);
 
+function isRecoverableAuthError(error) {
+  const code = String(error && error.code || '').toUpperCase();
+  if (['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'ENETUNREACH', 'EHOSTUNREACH', 'EPIPE'].includes(code)) {
+    return true;
+  }
+  const message = String(error && error.message || '');
+  if (/拒绝跨|不安全|路径|身份记录|invalid url/i.test(message)) return false;
+  return true;
+}
+
+async function verifyProfileCookie(cookie, options, label) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const result = await profileAuth.verifyAndCompare(cfg, cookie, options);
+      if (result.ok || attempt === MAX_RETRIES) return result;
+      log(`${label}暂时失败 (${result.code || 'auth_unverified'})，3 秒后重试 (${attempt + 1}/${MAX_RETRIES})`);
+    } catch (e) {
+      if (!isRecoverableAuthError(e) || attempt === MAX_RETRIES) throw e;
+      log(`${label}网络异常，3 秒后重试 (${attempt + 1}/${MAX_RETRIES})`);
+    }
+    await sleep(3000);
+  }
+  throw new Error(`${label}重试状态异常`);
+}
+
 async function verifyExistingIdentity(cookie) {
-  const result = await profileAuth.verifyAndCompare(cfg, cookie, {
+  const result = await verifyProfileCookie(cookie, {
     userAgent: COMMON_HEADERS['User-Agent'],
     acceptLanguage: COMMON_HEADERS['Accept-Language'],
-  });
+  }, 'Profile 登录态验证');
   if (!result.ok) throw new Error(`Profile ${cfg.profile} 认证失败: ${result.message}`);
   if (result.identityState === 'different') {
     throw new Error(`Profile ${cfg.profile} 的 Cookie 与已绑定账号不一致，请通过 Telegram 显式换绑`);
@@ -697,7 +736,7 @@ async function saveCookieSafely(rawCookie) {
     userAgent: COMMON_HEADERS['User-Agent'],
     acceptLanguage: COMMON_HEADERS['Accept-Language'],
   };
-  const result = await profileAuth.verifyAndCompare(cfg, candidate, verifyOptions);
+  const result = await verifyProfileCookie(candidate, verifyOptions, 'Cookie 验证');
   if (!result.ok) throw new Error(`Cookie 验证失败: ${result.message}`);
   if (result.identityState === 'different') {
     throw new Error(`Profile ${cfg.profile} 已绑定其他账号，请通过 Telegram 显式换绑`);

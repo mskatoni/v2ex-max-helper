@@ -26,6 +26,10 @@ const MIB = 1024 * 1024;
 const DISK_CACHE_LIMIT_BYTES = 64 * MIB;
 const MEDIA_CACHE_LIMIT_BYTES = 16 * MIB;
 const CACHE_PRUNE_THRESHOLD_BYTES = 128 * MIB;
+const READ_POST_RETRY_COUNT = 3;
+const READ_POST_RETRY_BASE_MS = 5000;
+const BROWSER_IO_RETRY_COUNT = 3;
+const BROWSER_IO_RETRY_BASE_MS = 1000;
 const CACHE_PATHS = [
   path.join('Default', 'Cache'),
   path.join('Default', 'Code Cache'),
@@ -197,64 +201,69 @@ async function launch(dryRun = false) {
     throw new Error(`Cookie 文件不存在或为空: ${COOKIE_FILE}`);
   }
 
-  const { chromium } = require('playwright');
+  try {
+    const { chromium } = require('playwright');
 
-  // 确保 Chrome profile 目录存在
-  fs.mkdirSync(USER_DATA_DIR, { recursive: true });
-  pruneBrowserCacheWithLog();
+    // 确保 Chrome profile 目录存在
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    pruneBrowserCacheWithLog();
 
-  logger.info('浏览器启动中...');
-  logger.info('浏览器指纹已按当前 profile 注入');
-  logger.info(`行为参数 profile=${PROFILE} dwell=${BEHAVIOR.dwellMin}-${BEHAVIOR.dwellMax}/${BEHAVIOR.dwellLong}ms gap=${BEHAVIOR.humanGapMin}-${BEHAVIOR.humanGapMax}ms settle=${BEHAVIOR.memorySettleMs}ms`);
-  if (BEHAVIOR.usesLegacyGap) {
-    logger.warn('检测到 READ_GAP_MIN/MAX 旧变量，已作为 READ_HUMAN_GAP_MIN/MAX 兼容处理');
+    logger.info('浏览器启动中...');
+    logger.info('浏览器指纹已按当前 profile 注入');
+    logger.info(`行为参数 profile=${PROFILE} dwell=${BEHAVIOR.dwellMin}-${BEHAVIOR.dwellMax}/${BEHAVIOR.dwellLong}ms gap=${BEHAVIOR.humanGapMin}-${BEHAVIOR.humanGapMax}ms settle=${BEHAVIOR.memorySettleMs}ms`);
+    if (BEHAVIOR.usesLegacyGap) {
+      logger.warn('检测到 READ_GAP_MIN/MAX 旧变量，已作为 READ_HUMAN_GAP_MIN/MAX 兼容处理');
+    }
+
+    const launchOptions = {
+      executablePath: process.env.CHROME_BIN || undefined,
+      headless: process.env.HEADLESS !== 'false',
+      args: buildLaunchArgs(),
+      ignoreHTTPSErrors: false,
+      userAgent:  FP.userAgent,
+      locale:     FP.locale,
+      timezoneId: FP.timezoneId,
+      viewport:   FP.viewport,
+      deviceScaleFactor: 1,
+      extraHTTPHeaders: {
+        'Accept-Language': FP.acceptLanguage,
+      },
+    };
+
+    const proxy = secureProxy.getPlaywrightProxy();
+    if (proxy) {
+      launchOptions.proxy = proxy;
+      logger.info(`浏览器启用本机代理: ${secureProxy.redactProxyUrl(proxy.server)}`);
+    }
+
+    ctx = await chromium.launchPersistentContext(USER_DATA_DIR, launchOptions);
+
+    // 注入指纹隔离脚本（webdriver 隐藏 + navigator/WebGL 伪装）
+    await ctx.addInitScript(fingerprint.buildInitScript(FP), {
+      navPlatform:         FP.navPlatform,
+      hardwareConcurrency: FP.hardwareConcurrency,
+      deviceMemory:        FP.deviceMemory,
+      languages:           FP.languages,
+      webglVendor:         FP.webglVendor,
+      webglRenderer:       FP.webglRenderer,
+    });
+
+    // 注入 Cookies
+    const cookies = parseCookieString(cookieStr);
+    // Cookie 文件是当前 profile 登录态的唯一来源，避免 persistent context 残留旧账号凭证。
+    await ctx.clearCookies();
+    await ctx.addCookies(cookies);
+    logger.info(`已注入 ${cookies.length} 条 Cookie`);
+
+    // 使用已有 page 或新建
+    const pages = ctx.pages();
+    page = pages.length > 0 ? pages[0] : await ctx.newPage();
+
+    logger.ok('浏览器已就绪');
+  } catch (e) {
+    await discardContext();
+    throw e;
   }
-
-  const launchOptions = {
-    executablePath: process.env.CHROME_BIN || undefined,
-    headless: process.env.HEADLESS !== 'false',
-    args: buildLaunchArgs(),
-    ignoreHTTPSErrors: false,
-    userAgent:  FP.userAgent,
-    locale:     FP.locale,
-    timezoneId: FP.timezoneId,
-    viewport:   FP.viewport,
-    deviceScaleFactor: 1,
-    extraHTTPHeaders: {
-      'Accept-Language': FP.acceptLanguage,
-    },
-  };
-
-  const proxy = secureProxy.getPlaywrightProxy();
-  if (proxy) {
-    launchOptions.proxy = proxy;
-    logger.info(`浏览器启用本机代理: ${secureProxy.redactProxyUrl(proxy.server)}`);
-  }
-
-  ctx = await chromium.launchPersistentContext(USER_DATA_DIR, launchOptions);
-
-  // 注入指纹隔离脚本（webdriver 隐藏 + navigator/WebGL 伪装）
-  await ctx.addInitScript(fingerprint.buildInitScript(FP), {
-    navPlatform:         FP.navPlatform,
-    hardwareConcurrency: FP.hardwareConcurrency,
-    deviceMemory:        FP.deviceMemory,
-    languages:           FP.languages,
-    webglVendor:         FP.webglVendor,
-    webglRenderer:       FP.webglRenderer,
-  });
-
-  // 注入 Cookies
-  const cookies = parseCookieString(cookieStr);
-  // Cookie 文件是当前 profile 登录态的唯一来源，避免 persistent context 残留旧账号凭证。
-  await ctx.clearCookies();
-  await ctx.addCookies(cookies);
-  logger.info(`已注入 ${cookies.length} 条 Cookie`);
-
-  // 使用已有 page 或新建
-  const pages = ctx.pages();
-  page = pages.length > 0 ? pages[0] : await ctx.newPage();
-
-  logger.ok('浏览器已就绪');
 }
 
 // 读取一篇帖子（随机偏态停留 + 随机滚动 + 帖子间随机间隔）
@@ -266,8 +275,34 @@ async function readPost(url) {
   }
 
   let target;
+  try { target = normalizePostUrl(url); } catch (e) {
+    logger.warn(`读帖失败: ${e.message} → [invalid post URL]`);
+    return false;
+  }
+
+  for (let attempt = 0; attempt <= READ_POST_RETRY_COUNT; attempt++) {
+    const result = await readPostOnce(target);
+    if (result.ok) {
+      if (attempt > 0) logger.ok(`读帖重试成功（第 ${attempt}/${READ_POST_RETRY_COUNT} 次重试）`);
+      return true;
+    }
+    if (!result.retryable || attempt === READ_POST_RETRY_COUNT) {
+      if (result.retryable) logger.warn(`当前帖子已完成 ${READ_POST_RETRY_COUNT} 次重试，准备跳过`);
+      return false;
+    }
+
+    if (result.resetPage) await resetPage();
+    const retryNumber = attempt + 1;
+    const delay = Math.min(READ_POST_RETRY_BASE_MS * (2 ** attempt), 20000);
+    logger.warn(`${result.reason}，${delay / 1000} 秒后进行第 ${retryNumber}/${READ_POST_RETRY_COUNT} 次重试`);
+    await sleep(delay);
+  }
+
+  return false;
+}
+
+async function readPostOnce(target) {
   try {
-    target = normalizePostUrl(url);
     logger.info(`→ ${target.pathname}`);
     const navigationResponse = await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
     if (!isV2exOrigin(page.url())) throw new Error('导航离开 V2EX，已拒绝继续处理');
@@ -277,7 +312,9 @@ async function readPost(url) {
     if (isCF) {
       logger.warn('Cloudflare 挑战中，等待最多 60 秒...');
       const passed = await waitForCloudflare();
-      if (!passed) return false;
+      if (!passed) {
+        return { ok: false, retryable: true, resetPage: true, reason: 'Cloudflare 挑战未通过' };
+      }
     }
     const finalUrl = new URL(page.url());
     if (finalUrl.origin !== V2EX_ORIGIN || finalUrl.pathname !== target.pathname) {
@@ -292,7 +329,12 @@ async function readPost(url) {
     const authState = profileAuth.diagnoseHomePage({ statusCode: 200, body: content });
     if (!authState.ok) {
       logger.error(`帖子页无法确认当前登录账号 (${authState.code || 'unknown'})`);
-      return false;
+      return {
+        ok: false,
+        retryable: authState.code !== 'logged_out',
+        resetPage: false,
+        reason: '帖子页登录状态暂时无法确认',
+      };
     }
 
     // 随机停留时长（偏态分布：多数偏短，偶尔长读）
@@ -308,14 +350,15 @@ async function readPost(url) {
     if (BEHAVIOR.memorySettleMs > 0) await sleep(BEHAVIOR.memorySettleMs);
     await sleep(randomHumanGapMs());
 
-    return true;
+    return { ok: true, retryable: false, resetPage: false, reason: '' };
   } catch (e) {
-    const safeTarget = target ? target.pathname : '[invalid post URL]';
-    logger.warn(`读帖失败: ${e.message} → ${safeTarget}`);
-    if (shouldResetPage(e)) {
-      await resetPage();
-    }
-    return false;
+    logger.warn(`读帖失败: ${e.message} → ${target.pathname}`);
+    return {
+      ok: false,
+      retryable: true,
+      resetPage: shouldResetPage(e),
+      reason: '网络或页面导航异常',
+    };
   }
 }
 
@@ -345,7 +388,10 @@ function shouldResetPage(error) {
   return msg.includes('Timeout') ||
          msg.includes('ERR_TOO_MANY_REDIRECTS') ||
          msg.includes('ERR_HTTP_RESPONSE_CODE_FAILURE') ||
+         msg.includes('net::ERR_') ||
          msg.includes('Navigation to') ||
+         msg.includes('Target page, context or browser has been closed') ||
+         msg.includes('page.goto:') ||
          msg.includes('chrome-error://');
 }
 
@@ -356,12 +402,22 @@ async function resetPage() {
       await page.close({ runBeforeUnload: false });
     }
   } catch (_) {}
-  try {
-    page = await ctx.newPage();
-    logger.warn('已重建浏览器页面，后续将换帖继续');
-  } catch (e) {
-    logger.warn(`重建浏览器页面失败: ${e.message}`);
+  for (let attempt = 0; attempt <= BROWSER_IO_RETRY_COUNT; attempt++) {
+    try {
+      page = await ctx.newPage();
+      logger.warn('已重建浏览器页面，后续将重试或换帖继续');
+      return true;
+    } catch (e) {
+      if (attempt === BROWSER_IO_RETRY_COUNT) {
+        logger.warn(`重建浏览器页面经 ${BROWSER_IO_RETRY_COUNT} 次重试后仍失败: ${e.message}`);
+        return false;
+      }
+      const delay = BROWSER_IO_RETRY_BASE_MS * (2 ** attempt);
+      logger.warn(`重建浏览器页面失败，${delay / 1000} 秒后重试 (${attempt + 1}/${BROWSER_IO_RETRY_COUNT})`);
+      await sleep(delay);
+    }
   }
+  return false;
 }
 
 // 停留期间分多次随机向下滚动，模拟阅读时的视线移动
@@ -409,20 +465,31 @@ async function waitForCloudflare(timeout = 60000) {
 
 // 将 Playwright context 的最新 Cookie 写回文件
 async function syncCookies(options = {}) {
-  if (!ctx) return;
-  try {
-    const cookies = await ctx.cookies();
-    const str     = serializeCookies(cookies);
-    if (!str) return;
-    if (!hasCookieKey(str, 'A2')) {
-      logger.warn('Cookie 同步跳过：浏览器上下文缺少 A2，避免覆盖现有登录态');
-      return;
+  if (!ctx) return false;
+  for (let attempt = 0; attempt <= BROWSER_IO_RETRY_COUNT; attempt++) {
+    try {
+      const cookies = await ctx.cookies();
+      const str     = serializeCookies(cookies);
+      if (!str) return false;
+      if (!hasCookieKey(str, 'A2')) {
+        logger.warn('Cookie 同步跳过：浏览器上下文缺少 A2，避免覆盖现有登录态');
+        return false;
+      }
+      atomicWriteCookie(str);
+      return true;
+    } catch (e) {
+      if (attempt < BROWSER_IO_RETRY_COUNT) {
+        const delay = BROWSER_IO_RETRY_BASE_MS * (2 ** attempt);
+        logger.warn(`Cookie 同步失败，${delay / 1000} 秒后重试 (${attempt + 1}/${BROWSER_IO_RETRY_COUNT})`);
+        await sleep(delay);
+        continue;
+      }
+      if (options.throwOnError) throw e;
+      logger.warn(`Cookie 同步经 ${BROWSER_IO_RETRY_COUNT} 次重试后仍失败: ${e.message}`);
+      return false;
     }
-    atomicWriteCookie(str);
-  } catch (e) {
-    if (options.throwOnError) throw e;
-    logger.warn(`Cookie 同步失败: ${e.message}`);
   }
+  return false;
 }
 
 function hasCookieKey(cookieStr, key) {
@@ -468,19 +535,43 @@ async function close(options = {}) {
       failure = e;
       logger.warn(`浏览器关闭前 Cookie 同步失败: ${e.message}`);
     }
-    try {
-      await ctx.close();
-      closed = true;
-    } catch (e) {
-      failure = failure || e;
-      logger.warn(`关闭浏览器时出错: ${e.message}`);
+    let closeFailure = null;
+    for (let attempt = 0; attempt <= BROWSER_IO_RETRY_COUNT; attempt++) {
+      try {
+        await ctx.close();
+        closed = true;
+        closeFailure = null;
+        break;
+      } catch (e) {
+        closeFailure = e;
+        if (attempt === BROWSER_IO_RETRY_COUNT) {
+          logger.warn(`关闭浏览器经 ${BROWSER_IO_RETRY_COUNT} 次重试后仍失败: ${e.message}`);
+          break;
+        }
+        const delay = BROWSER_IO_RETRY_BASE_MS * (2 ** attempt);
+        logger.warn(`关闭浏览器失败，${delay / 1000} 秒后重试 (${attempt + 1}/${BROWSER_IO_RETRY_COUNT})`);
+        await sleep(delay);
+      }
     }
+    failure = failure || closeFailure;
   }
   ctx = null;
   page = null;
   if (closed) logger.info('浏览器已关闭');
   if (closed) pruneBrowserCacheWithLog();
   if (failure && options.throwOnError) throw failure;
+}
+
+async function discardContext() {
+  const current = ctx;
+  ctx = null;
+  page = null;
+  if (!current) return;
+  try {
+    await current.close();
+  } catch (e) {
+    logger.warn(`清理未完成的浏览器启动状态失败: ${e.message}`);
+  }
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }

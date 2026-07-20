@@ -107,6 +107,14 @@ test('ping reports missing or invalid credentials as a failed process', () => {
   assert.match(body, /Cookie 已失效（保活检测）[\s\S]{0,300}process\.exitCode = 1/);
 });
 
+test('checkin and keepalive perform three retries for recoverable failures', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'checkin', 'v2ex-checkin.js'), 'utf8');
+  assert.match(source, /const MAX_RETRIES\s+= 3;/);
+  assert.match(source, /const MAX_ATTEMPTS\s+= MAX_RETRIES \+ 1;/);
+  assert.match(source, /async function doPing\(attempt = 0\)/);
+  assert.match(source, /attempt \+ 1 < MAX_ATTEMPTS/);
+});
+
 test('checkin notifications keep Telegram credentials out of query strings', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'checkin', 'v2ex-checkin.js'), 'utf8');
   const start = source.indexOf('function sendTelegram');

@@ -67,10 +67,12 @@ test('queue save failures are reported and a later flush can recover the committ
       const q=require('./reader/queue');
       await q.init();
       const rename=fs.renameSync;
-      fs.renameSync=()=>{throw new Error('simulated rename failure')};
+      let attempts=0;
+      fs.renameSync=()=>{attempts++;throw new Error('simulated rename failure')};
       try { q.add(['https://example.invalid/recover']); }
       catch (e) { console.log('EXPECTED:'+e.message); }
       finally { fs.renameSync=rename; }
+      console.log('ATTEMPTS:'+attempts);
       q.flush();
       q.close();
     })().catch(e=>{console.error(e);process.exit(1)})`;
@@ -78,6 +80,7 @@ test('queue save failures are reported and a later flush can recover the committ
     assert.equal(failed.status, 0, failed.stderr);
     assert.match(`${failed.stdout}\n${failed.stderr}`, /Queue DB save failed: simulated rename failure/);
     assert.match(failed.stdout, /EXPECTED:simulated rename failure/);
+    assert.match(failed.stdout, /ATTEMPTS:4/);
     assert.deepEqual(readStats(runQueue(dir, 'acc1', reader)), { total: 1, readable: 1, exhausted: 0 });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
