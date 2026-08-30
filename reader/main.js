@@ -356,6 +356,13 @@ async function main() {
       logger.warn('当前失败 URL 已跳过，避免重复触发同一异常帖');
 
       if (stats.consecutiveErrors >= 3) {
+        // 若为浏览器/CDP 持续无响应（看门狗触发），登录探针无法反映浏览器状态，直接退出让 systemd/timer 恢复
+        const hangStreak = isDryRun ? 0 : browser.getHangStreak();
+        if (hangStreak >= 3) {
+          stats.elapsed = elapsed(startTime);
+          await shutdown(`连续 ${hangStreak} 次读帖触发看门狗（浏览器无响应），退出等待下次调度`, stats, 1);
+        }
+
         const loginState = isDryRun ? 'unknown' : await probeLogin();
 
         if (loginState === 'logged_in') {

@@ -30,6 +30,28 @@ const READ_POST_RETRY_COUNT = 3;
 const READ_POST_RETRY_BASE_MS = 5000;
 const BROWSER_IO_RETRY_COUNT = 3;
 const BROWSER_IO_RETRY_BASE_MS = 1000;
+// CDP/浏览器单次调用超时（ms）。防止底层连接挂死时 Playwright 默认超时失效导致进程永久卡死。
+const READ_CDP_TIMEOUT_MS = parseInt(process.env.READ_CDP_TIMEOUT_MS || '60000', 10) || 60000;
+// 单帖阅读整体看门狗（ms）。覆盖停留、滚动、Cookie 同步等全部步骤，超时即丢弃页面重建。
+const READ_POST_WATCHDOG_MS = parseInt(process.env.READ_POST_WATCHDOG_MS || '300000', 10) || 300000;
+
+// 给可能挂起的浏览器/CDP 调用加超时（纯 JS 定时器，不依赖 CDP 协议状态，必然能触发）
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label}超时（${(ms / 1000).toFixed(0)}s）`);
+      err.code = 'CDP_TIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  return Promise.race([promise, timeout]);
+}
+
+// 连续触发看门狗（浏览器无响应）的次数；main.js 据此决定是否退出
+let hangStreak = 0;
+function getHangStreak() { return hangStreak; }
 const CACHE_PATHS = [
   path.join('Default', 'Cache'),
   path.join('Default', 'Code Cache'),
@@ -280,6 +302,17 @@ async function readPost(url) {
     return false;
   }
 
+  try {
+    return await withTimeout(readPostLoop(target), READ_POST_WATCHDOG_MS, '单帖阅读看门狗');
+  } catch (e) {
+    logger.error(`单帖阅读看门狗触发，疑似浏览器无响应: ${e.message}`);
+    hangStreak++;
+    await resetPage();
+    return false;
+  }
+}
+
+async function readPostLoop(target) {
   for (let attempt = 0; attempt <= READ_POST_RETRY_COUNT; attempt++) {
     const result = await readPostOnce(target);
     if (result.ok) {
@@ -325,7 +358,7 @@ async function readPostOnce(target) {
     }
 
     // 检测是否登录
-    const content = await page.content();
+    const content = await withTimeout(page.content(), READ_CDP_TIMEOUT_MS, '读取页面内容');
     const authState = profileAuth.diagnoseHomePage({ statusCode: 200, body: content });
     if (!authState.ok) {
       logger.error(`帖子页无法确认当前登录账号 (${authState.code || 'unknown'})`);
@@ -384,6 +417,7 @@ function randomHumanGapMs() {
 }
 
 function shouldResetPage(error) {
+  if (error && error.code === 'CDP_TIMEOUT') return true;
   const msg = String(error && error.message || '');
   return msg.includes('Timeout') ||
          msg.includes('ERR_TOO_MANY_REDIRECTS') ||
@@ -399,12 +433,12 @@ async function resetPage() {
   if (!ctx) return;
   try {
     if (page && !page.isClosed()) {
-      await page.close({ runBeforeUnload: false });
+      await withTimeout(page.close({ runBeforeUnload: false }), READ_CDP_TIMEOUT_MS, '关闭页面');
     }
   } catch (_) {}
   for (let attempt = 0; attempt <= BROWSER_IO_RETRY_COUNT; attempt++) {
     try {
-      page = await ctx.newPage();
+      page = await withTimeout(ctx.newPage(), READ_CDP_TIMEOUT_MS, '新建页面');
       logger.warn('已重建浏览器页面，后续将重试或换帖继续');
       return true;
     } catch (e) {
@@ -431,7 +465,7 @@ async function dwellWithScroll(totalMs) {
     await sleep(wait);
     try {
       const dy = randInt(150, 600);
-      await page.evaluate((y) => window.scrollBy({ top: y, behavior: 'smooth' }), dy);
+      await withTimeout(page.evaluate((y) => window.scrollBy({ top: y, behavior: 'smooth' }), dy), READ_CDP_TIMEOUT_MS, '页面滚动');
     } catch (_) { /* 滚动失败不影响停留 */ }
     if (remaining <= 0) break;
   }
@@ -440,7 +474,7 @@ async function dwellWithScroll(totalMs) {
 // 检测是否出现 Cloudflare 挑战
 async function detectCloudflareChallenge() {
   try {
-    const title = await page.title();
+    const title = await withTimeout(page.title(), READ_CDP_TIMEOUT_MS, '读取页面标题');
     const url   = page.url();
     return title.includes('Just a moment') ||
            title.includes('Attention Required') ||
@@ -468,7 +502,7 @@ async function syncCookies(options = {}) {
   if (!ctx) return false;
   for (let attempt = 0; attempt <= BROWSER_IO_RETRY_COUNT; attempt++) {
     try {
-      const cookies = await ctx.cookies();
+      const cookies = await withTimeout(ctx.cookies(), READ_CDP_TIMEOUT_MS, '同步 Cookie');
       const str     = serializeCookies(cookies);
       if (!str) return false;
       if (!hasCookieKey(str, 'A2')) {
@@ -510,7 +544,7 @@ function atomicWriteCookie(cookieStr) {
 async function getCurrentCookie(options = {}) {
   if (ctx) {
     try {
-      const cookies = await ctx.cookies();
+      const cookies = await withTimeout(ctx.cookies(), READ_CDP_TIMEOUT_MS, '读取 Cookie');
       const str = serializeCookies(cookies);
       if (str && hasCookieKey(str, 'A2')) return str;
       if (str) {
@@ -586,6 +620,7 @@ module.exports = {
   getCurrentCookie,
   syncCookies,
   close,
+  getHangStreak,
   getProfileInfo,
   buildLaunchArgs,
   pruneBrowserCache,
