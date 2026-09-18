@@ -54,8 +54,27 @@ function bundledChromiumVersion() {
   return '';
 }
 
-// UA 主版本必须与 Playwright 实际携带的 Chromium 一致，避免长期写死后产生明显矛盾。
-const CHROME_VERSION = bundledChromiumVersion();
+// UA 主版本取自 Playwright 实际携带的 Chromium，避免长期写死后产生明显矛盾。
+// 但 Playwright 的 Chromium 长期领先于 Chrome 稳定版，把「尚未发布」的版本号写进 UA
+// 会被 Cloudflare 判定为自动化客户端，触发托管挑战
+// （HTTP 403 + cf-mitigated: challenge + "Just a moment..."），
+// 导致 V2EX 首页/余额页认证探针 100% 失败、reader 启动即崩。
+// 因此主版本必须裁到已知安全上限，可用 V2EX_UA_CHROME_MAX 覆盖。
+// 实测（2026-09-18）：Chrome/140 及以上触发挑战，Chrome/139 及以下正常通过。
+const DEFAULT_UA_CHROME_MAX_MAJOR = 139;
+const UA_CHROME_MAX_MAJOR = (() => {
+  const raw = parseInt(process.env.V2EX_UA_CHROME_MAX || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_UA_CHROME_MAX_MAJOR;
+})();
+
+// 低于上限时保留自带 Chromium 的真实版本，高于上限时裁到上限
+function resolveUaChromeVersion(bundled = bundledChromiumVersion()) {
+  const major = parseInt(String(bundled).split('.')[0], 10);
+  if (!Number.isFinite(major) || major <= 0) return '';
+  return `${Math.min(major, UA_CHROME_MAX_MAJOR)}.0.0.0`;
+}
+
+const CHROME_VERSION = resolveUaChromeVersion();
 
 // 平台维度：UA 片段 + navigator.platform + UA-CH platform
 const PLATFORMS = [
@@ -196,4 +215,10 @@ function buildInitScript(fp) {
   };
 }
 
-module.exports = { generate, buildInitScript, bundledChromiumVersion };
+module.exports = {
+  generate,
+  buildInitScript,
+  bundledChromiumVersion,
+  resolveUaChromeVersion,
+  UA_CHROME_MAX_MAJOR,
+};
