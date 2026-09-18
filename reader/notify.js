@@ -287,10 +287,40 @@ async function notifySessionExpired() {
 }
 
 // 余额变化（活跃度奖励）
-async function notifyBalanceChanged(from, to, count) {
+// 奖励可能以铜币、银币或金币任一面额发放，因此必须报出完整面额构成与逐项增减：
+// 只报铜币差值时，一笔"银币 +1 / 铜币 -66"的奖励会显示成铜币减少，看不出是奖励。
+const COIN_FIELDS = [['gold', '金币'], ['silver', '银币'], ['copper', '铜币']];
+
+function toCoinNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function formatCoinSnapshot(coins) {
+  if (!coins) return '未知';
+  const parts = [];
+  for (const [key, label] of COIN_FIELDS) {
+    const value = toCoinNumber(coins[key]);
+    if (key === 'copper' || value !== 0) parts.push(`${value} ${label}`);
+  }
+  return parts.join(' ');
+}
+
+function formatCoinDelta(prev, next) {
+  if (!prev || !next) return '未知';
+  const parts = [];
+  for (const [key, label] of COIN_FIELDS) {
+    const diff = toCoinNumber(next[key]) - toCoinNumber(prev[key]);
+    if (diff !== 0) parts.push(`${label} ${diff > 0 ? '+' : ''}${diff}`);
+  }
+  return parts.length > 0 ? parts.join(' ') : '无变化';
+}
+
+async function notifyBalanceChanged(prev, next, count) {
   await sendMessage(
     `💰 <b>V2EX 活跃度奖励</b>\n` +
-    `铜币: ${escapeHtml(from)} → ${escapeHtml(to)} (+${escapeHtml(to - from)})\n` +
+    `余额: ${escapeHtml(formatCoinSnapshot(prev))} → ${escapeHtml(formatCoinSnapshot(next))}\n` +
+    `变动: ${escapeHtml(formatCoinDelta(prev, next))}\n` +
     `今日第 ${escapeHtml(count)} 次奖励`
   );
 }
