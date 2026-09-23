@@ -206,7 +206,11 @@ async function verifyAndBindProfile(cookie) {
     getResultCode: value => value.code || 'auth_unverified',
     isRetryableError: isRecoverableNetworkError,
   });
-  if (!result.ok) throw new Error(`Profile ${cfg.profile} 认证失败: ${result.message}`);
+  if (!result.ok) {
+    const error = new Error(`Profile ${cfg.profile} 认证失败: ${result.message}`);
+    if (result.code === 'cloudflare_challenge') error.code = 'CLOUDFLARE_CHALLENGE';
+    throw error;
+  }
   if (result.identityState === 'different') {
     throw new Error(`Profile ${cfg.profile} 的 Cookie 与已绑定 V2EX 账号不一致，请通过 Telegram 显式换绑`);
   }
@@ -547,7 +551,13 @@ function probeLoginOnce(cookie) {
       res.on('aborted', () => finish('unknown'));
       res.on('error', () => finish('unknown'));
       res.on('end', () => {
-        if (settled || res.statusCode !== 200) return finish('unknown');
+        if (settled) return;
+        if (res.statusCode !== 200) {
+          if (profileAuth.isCloudflareChallenge({ statusCode: res.statusCode, body, headers: res.headers })) {
+            logger.warn('登录探针被 Cloudflare 托管挑战拦截（HTTP 403），属于指纹/IP 问题而非登录态失效');
+          }
+          return finish('unknown');
+        }
         const diagnosis = profileAuth.diagnoseHomePage({ statusCode: res.statusCode, body });
         if (diagnosis.ok) return finish('logged_in');
         if (diagnosis.code === 'logged_out') return finish('logged_out');
@@ -607,7 +617,9 @@ main().catch(async (e) => {
     stats.elapsed = activeStartTime ? elapsed(activeStartTime) : '0s';
     stats.reason = e.code === 'SESSION_EXPIRED'
       ? 'Chromium 登录态已失效，请更新 Cookie'
-      : '阅读进程遇到未捕获错误，请查看服务器日志';
+      : e.code === 'CLOUDFLARE_CHALLENGE'
+        ? 'Cloudflare 托管挑战拦截认证探针，当前浏览器指纹或出口 IP 被判定为自动化客户端'
+        : '阅读进程遇到未捕获错误，请查看服务器日志';
     try { await notify.notifyReaderError(stats); } catch (_) {}
   }
   process.exit(1);

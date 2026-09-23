@@ -268,7 +268,9 @@ async function notifyReaderError(stats) {
   const reason = stats.reason || '连续 3 次失败';
   const hint = reason.includes('Cookie')
     ? 'Cookie 已确认失效，请更新'
-    : '已完成单帖和登录探针重试，请查看日志确认网络/CF/重定向状态';
+    : reason.includes('Cloudflare')
+      ? '浏览器指纹或出口 IP 被 Cloudflare 判定为自动化客户端，请检查 UA 主版本（V2EX_UA_CHROME_MAX）与代理节点'
+      : '已完成单帖和登录探针重试，请查看日志确认网络/CF/重定向状态';
   await sendMessage(
     `⚠️ <b>V2EX 阅读中止</b>\n` +
     `❌ ${escapeHtml(reason)}\n` +

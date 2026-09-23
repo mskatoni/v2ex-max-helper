@@ -8,11 +8,23 @@ const test = require('node:test');
 const browser = require('../reader/browser');
 const fingerprint = require('../reader/fingerprint');
 
-test('fingerprint user agent follows the bundled Playwright Chromium version', () => {
+test('fingerprint user agent never claims a Chrome version ahead of stable', () => {
   const fp = fingerprint.generate('test-profile');
   assert.match(fp.chromeVersion, /^\d+\.0\.0\.0$/);
   assert.match(fp.userAgent, new RegExp(`Chrome/${fp.majorVersion}\\.`));
-  assert.equal(fp.chromeVersion, fingerprint.bundledChromiumVersion());
+  assert.equal(fp.chromeVersion, fingerprint.resolveUaChromeVersion());
+  // Playwright 自带的 Chromium 常领先于 Chrome 稳定版，直接用它的版本号会被
+  // Cloudflare 判定为机器人（HTTP 403 托管挑战），必须裁到安全上限。
+  assert.ok(Number(fp.majorVersion) <= fingerprint.UA_CHROME_MAX_MAJOR);
+});
+
+test('UA Chrome version tracks bundled Chromium when it is not ahead of stable', () => {
+  assert.equal(fingerprint.resolveUaChromeVersion('120.0.0.0'), '120.0.0.0');
+  assert.equal(
+    fingerprint.resolveUaChromeVersion('999.0.0.0'),
+    `${fingerprint.UA_CHROME_MAX_MAJOR}.0.0.0`
+  );
+  assert.equal(fingerprint.resolveUaChromeVersion(''), '');
 });
 
 test('Docker keeps only runtime data writable without copying the full app layer', () => {

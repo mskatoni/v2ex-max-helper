@@ -73,6 +73,42 @@ test('login probe aggregation requires repeated logged-out results', () => {
   assert.equal(auth.resolveLoginProbeStates([]), 'unknown');
 });
 
+test('Cloudflare managed challenge is reported as its own state, not a login failure', () => {
+  const challenge = {
+    statusCode: 403,
+    headers: { 'cf-mitigated': 'challenge', server: 'cloudflare' },
+    body: '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body></body></html>',
+  };
+  assert.equal(auth.isCloudflareChallenge(challenge), true);
+
+  // 挑战页既不是登录态失效，也不是普通 HTTP 异常，必须单独归类，
+  // 否则会被上层误报成「未捕获错误」，掩盖 UA/指纹被判定为机器人的真实原因。
+  assert.equal(auth.diagnoseHomePage(challenge).code, 'cloudflare_challenge');
+  assert.equal(auth.diagnoseAuthPage(challenge).code, 'cloudflare_challenge');
+
+  // 仅凭 body 也要能识别（部分边缘节点不返回 cf-mitigated）
+  assert.equal(auth.isCloudflareChallenge({
+    statusCode: 403,
+    body: '<title>Just a moment...</title>',
+  }), true);
+
+  // 普通 403 不能被误判成 Cloudflare 挑战
+  assert.equal(auth.isCloudflareChallenge({ statusCode: 403, body: '<title>Forbidden</title>' }), false);
+  assert.equal(auth.diagnoseHomePage({ statusCode: 403, body: 'forbidden' }).code, 'auth_home_http_status');
+});
+
+test('verifyCookie surfaces a Cloudflare challenge instead of a generic auth error', async () => {
+  const result = await auth.verifyCookie('A2=test', {
+    requestPage: async () => ({
+      statusCode: 403,
+      headers: { 'cf-mitigated': 'challenge' },
+      body: '<title>Just a moment...</title>',
+    }),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'cloudflare_challenge');
+});
+
 test('a sign-in string does not override explicit authenticated navigation', () => {
   const page = auth.diagnoseHomePage({
     statusCode: 200,
